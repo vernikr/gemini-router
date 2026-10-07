@@ -41,8 +41,12 @@ res: RouterResult = await router.complete(
         max_output_tokens=8192,
         kind="single|chunk|consolidate|count" = "single",
         request_id=None, source="cli", overflow="off|lite|lite+gemma",
+        wait=True,                    # wait out minute-scale gates (RPM/TPM/short cooldown,
+                                      # ≤ wait.max_s), countdown via `waiting` events;
+                                      # daily RPD resets are NEVER waited on
         model=None),                  # pin → skips chain fallback
-    on_event=callable | None)         # RouterEvent(stage, pct, model, key_id, detail, ts)
+    on_event=callable | None)         # RouterEvent(stage, pct, model, key_id, wait_s, detail, ts)
+                                      # stages: routing|waiting|dispatch|retry|switch|overflow|ok|quota_exhausted
 
 res.text, res.model, res.key_id, res.tokens_in, res.tokens_out
 res.latency_s, res.cached, res.overflow_tier, res.events, res.quota_after
@@ -70,7 +74,8 @@ via `gemini-router prune` and by frontends' daily task.
 Env: `GEMINI_API_KEYS`/`GEMINI_API_KEY_1..10`, `GEMINI_ROUTER_STATE`,
 `GEMINI_ROUTER_CONFIG` (yaml). YAML keys: `chain`, `overflow_tiers`,
 `limits_per_key_model {rpd,rpm,tpm}`, `limits_overrides`, `quota_day_tz`,
-`retry {max,backoff_base_s,provider_timeout_s,request_delay_s}`, `models_refresh_h`,
+`retry {max,backoff_base_s,provider_timeout_s,request_delay_s}`,
+`wait {enabled_default,max_s,poll_s}` (FR-C13 semantics), `window_s`, `models_refresh_h`,
 `cache_ttl_h`. Defaults per gemini-mcp `docs/03-architecture.md` §8. Secrets never logged
 (`key_id = sha256(key)[:8]`).
 

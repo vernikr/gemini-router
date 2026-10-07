@@ -15,6 +15,10 @@ consumer on a machine: the [gemini-mcp](https://github.com/vernikr/gemini-mcp) g
 - Key pool (`GEMINI_API_KEYS` / `GEMINI_API_KEY_1..10`), budget-maximizing selection.
 - `thinking_level` per request (Gemini 3.x rules), request cache (0-RPD hits), opt-in
   overflow tiers (`flash-lite → gemma-auto`), event stream for progress frontends.
+- Per-request wait policy for minute-scale gates (RPM/TPM/short cooldowns): default
+  **wait** with countdown events (`waiting`, remaining seconds); `wait=False` skips to
+  the next candidate or returns wait ETAs in the structured error. Daily resets are
+  never waited on.
 - CLI: `gemini-router quota | models | calls | prune | doctor` (rich tables).
 - Deps: `httpx`, `pydantic`, `rich`, stdlib `sqlite3` — **no MCP/web-framework coupling**.
 
