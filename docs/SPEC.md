@@ -1,0 +1,102 @@
+# gemini-router · SPEC (stage 2/3 artifact slice)
+
+Date: 2026-10-08 · Companion docs live in `vernikr/gemini-mcp/docs/01..04` (system-wide
+requirements, architecture, plan). This file is the router's own contract; updated as-built
+each milestone.
+
+## 1. What it is
+
+Quota-aware Gemini Flash router extracted from `tldr-digest/src/llm.py`, generalized:
+
+- cascading model chain with runtime `listModels` validation (default
+  `gemini-3.8-flash → 3.7 → 3.6 → 3.5 → 3-flash-preview-slot`);
+- per **key×model** budgets: RPD (America/Los_Angeles day + rolling 24 h), RPM and TPM
+  (sliding 60 s) — enforced pre-flight, accounted post-fact from `usageMetadata`;
+- key pool (`GEMINI_API_KEYS` / `GEMINI_API_KEY_1..10`); selection prefers the pair with
+  the largest remaining budget;
+- persistent multi-process ledger (SQLite WAL) — the single source of quota truth shared
+  by every consumer on the machine (MCP daemon, stdio sessions, cron jobs, foreign scripts);
+- 429/5xx/4xx taxonomy inherited from tldr-digest (`RETRYABLE_STATUS`,
+  `MODEL_SWITCH_STATUS`, `Retry-After`, backoff+jitter, provider deadline);
+- opt-in overflow tiers (`gemini-3.5-flash-lite`, best `gemma-*`) — never automatic;
+- request cache (hash of model+params+prompt, TTL) — hits spend 0 RPD;
+- event stream (`on_event`) for progress reporting by frontends;
+- `thinking_level` (low|medium|high) per request; 3.x rules applied (no
+  temperature/top_p for Gemini 3.x; `thinking_level` not `thinking_budget`);
+- CLI: `quota`, `models`, `calls`, `prune`, `doctor`; sync facade for legacy callers.
+
+Zero MCP/web-framework deps: `httpx`, `pydantic`, `rich`, stdlib `sqlite3`. Python ≥3.12.
+
+## 2. Public API (v1 contract)
+
+```python
+from gemini_router import Router, RouterRequest, RouterResult, RouterEvent, QuotaExhaustedError
+
+router = Router.from_env()            # env + optional GEMINI_ROUTER_CONFIG yaml
+res: RouterResult = await router.complete(
+    RouterRequest(
+        prompt=str, system=str | None = None,
+        thinking_level="low|medium|high" = "high",
+        output_format="text|json" = "text",
+        max_output_tokens=8192,
+        kind="single|chunk|consolidate|count" = "single",
+        request_id=None, source="cli", overflow="off|lite|lite+gemma",
+        model=None),                  # pin → skips chain fallback
+    on_event=callable | None)         # RouterEvent(stage, pct, model, key_id, detail, ts)
+
+res.text, res.model, res.key_id, res.tokens_in, res.tokens_out
+res.latency_s, res.cached, res.overflow_tier, res.events, res.quota_after
+await router.count_tokens(text, model=None) -> int
+await router.quota_table() -> list[QuotaRow]   # key_id, model, rpd_left, rpm_wait_s,
+                                               # tpm_wait_s, cooldown_until, recommended
+router.complete_sync(...)                      # blocking facade (tldr-digest migration)
+```
+
+Errors: `QuotaExhaustedError` carries the machine-readable payload
+(per-model rpd_left/rpm_wait_s/tpm_wait_s/cooldown_until, reset_eta_pt, hint) — frontends
+surface it as-is. `RouterError` base for everything else (network, http 4xx, parse).
+
+## 3. Ledger (SQLite, `GEMINI_ROUTER_STATE`, default `/opt/apps/shared/gemini-router/state.db`)
+
+Tables `calls`, `cooldowns`, `cache`, `meta` — full DDL and accounting rules:
+gemini-mcp `docs/03-architecture.md` §3 (single canonical definition).
+Rules summary: WAL + busy_timeout 5 s; TPM pre-flight writes a `status='planned'` row,
+upgraded after the call; RPD counts `ok|quota|http5xx` attempts (conservative),
+not client-validation 4xx/network; PT-midnight + rolling-24h dual gate; retention prune
+via `gemini-router prune` and by frontends' daily task.
+
+## 4. Config
+
+Env: `GEMINI_API_KEYS`/`GEMINI_API_KEY_1..10`, `GEMINI_ROUTER_STATE`,
+`GEMINI_ROUTER_CONFIG` (yaml). YAML keys: `chain`, `overflow_tiers`,
+`limits_per_key_model {rpd,rpm,tpm}`, `limits_overrides`, `quota_day_tz`,
+`retry {max,backoff_base_s,provider_timeout_s,request_delay_s}`, `models_refresh_h`,
+`cache_ttl_h`. Defaults per gemini-mcp `docs/03-architecture.md` §8. Secrets never logged
+(`key_id = sha256(key)[:8]`).
+
+## 5. Integration guide (external consumers)
+
+```bash
+uv add "gemini-router @ git+https://github.com/vernikr/gemini-router.git@v1.0.0"
+# private repo: export UV_INDEX / use gh auth or a deploy key; see README
+```
+
+Service-style consumption (no Python): REST `POST /v1/complete`, `GET /v1/quota` on the
+gemini-mcp daemon (localhost:8790, bearer) — same ledger, same rules.
+
+## 6. Extraction mapping from tldr-digest/src/llm.py
+
+| tldr-digest | router | Change |
+|---|---|---|
+| `DEFAULT_MODEL_PRIORITY`/`llm_model_priority` | `config.chain` | Gemini-only in v1; groq/openrouter stay in tldr until a provider abstraction is justified |
+| `_resolve_models`/`_list_models`/`_best_available` | `routing.resolve_chain` | + refresh interval, + preview-slot heuristics |
+| `RETRYABLE_STATUS`/`MODEL_SWITCH_STATUS`/`_parse_retry_after`/backoff | `routing` | ported as-is |
+| `Provider.can_call/register_call` (in-memory) | `ledger` queries | persistent, per key×model, + TPM |
+| `_call_gemini` | `gemini.generate` | async httpx, thinking_level, usageMetadata accounting |
+| `extract_json` | `gemini.extract_json` | ported as-is |
+| `complete_json` | `complete(output_format="json")` | superset |
+
+## 7. Versioning & CI
+
+SemVer; tags `v*`; gemini-mcp pins a tag. CI: ruff + pytest (respx mocks, no network) on
+push/PR (free runners). Conventional Commits.

@@ -1,0 +1,44 @@
+# gemini-router
+
+Quota-aware **Gemini Flash router** as a standalone, reusable module — extracted and
+generalized from [`tldr-digest/src/llm.py`](https://github.com/vernikr/tldr-digest).
+
+One persistent ledger (SQLite WAL) = the single source of quota truth shared by every
+consumer on a machine: the [gemini-mcp](https://github.com/vernikr/gemini-mcp) gateway,
+`tldr-digest` cron runs, CLI calls, foreign scripts.
+
+- Cascading chain with runtime `listModels` validation (default
+  `gemini-3.8-flash → 3.7 → 3.6 → 3.5 → 3-flash-preview-slot`; config-overridable).
+- Per **key×model** budgets: RPD (Pacific-time day + rolling 24 h), RPM, TPM (sliding
+  60 s) — pre-flight enforced, accounted from `usageMetadata`; conservative 429 handling
+  with cooldowns and `Retry-After`.
+- Key pool (`GEMINI_API_KEYS` / `GEMINI_API_KEY_1..10`), budget-maximizing selection.
+- `thinking_level` per request (Gemini 3.x rules), request cache (0-RPD hits), opt-in
+  overflow tiers (`flash-lite → gemma-auto`), event stream for progress frontends.
+- CLI: `gemini-router quota | models | calls | prune | doctor` (rich tables).
+- Deps: `httpx`, `pydantic`, `rich`, stdlib `sqlite3` — **no MCP/web-framework coupling**.
+
+## Status
+
+**Spec complete; implementation starts at M1 of the
+[gemini-mcp plan](https://github.com/vernikr/gemini-mcp/blob/main/docs/04-plan.md).**
+Contract: [`docs/SPEC.md`](docs/SPEC.md).
+
+## Planned usage
+
+```python
+from gemini_router import Router, RouterRequest
+router = Router.from_env()
+res = await router.complete(RouterRequest(prompt=..., thinking_level="high"),
+                            on_event=print)
+```
+
+```bash
+uv add "gemini-router @ git+https://github.com/vernikr/gemini-router.git@v1.0.0"
+gemini-router quota        # RPD left / RPM & TPM windows / cooldowns / next recommendation
+```
+
+Service-style (no Python): REST `/v1/complete` + `/v1/quota` on the gemini-mcp daemon.
+
+Conventions: English in files, Conventional Commits, SemVer tags `v*` (gemini-mcp pins
+a tag), CI = ruff + pytest with mocked HTTP (see `AGENTS.md`).
