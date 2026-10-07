@@ -24,9 +24,9 @@ consumer on a machine: the [gemini-mcp](https://github.com/vernikr/gemini-mcp) g
 
 ## Status
 
-**Spec complete; implementation starts at M1 of the
-[gemini-mcp plan](https://github.com/vernikr/gemini-mcp/blob/main/docs/04-plan.md).**
-Contract: [`docs/SPEC.md`](docs/SPEC.md).
+**v0.1.0 implemented** (milestone M1 of the
+[gemini-mcp plan](https://github.com/vernikr/gemini-mcp/blob/main/docs/04-plan.md)):
+library + CLI, 43 tests green, CI on push. Contract: [`docs/SPEC.md`](docs/SPEC.md).
 
 ## Planned usage
 

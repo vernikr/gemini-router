@@ -73,10 +73,11 @@ via `gemini-router prune` and by frontends' daily task.
 
 Env: `GEMINI_API_KEYS`/`GEMINI_API_KEY_1..10`, `GEMINI_ROUTER_STATE`,
 `GEMINI_ROUTER_CONFIG` (yaml). YAML keys: `chain`, `overflow_tiers`,
-`limits_per_key_model {rpd,rpm,tpm}`, `limits_overrides`, `quota_day_tz`,
-`retry {max,backoff_base_s,provider_timeout_s,request_delay_s}`,
-`wait {enabled_default,max_s,poll_s}` (FR-C13 semantics), `window_s`, `models_refresh_h`,
-`cache_ttl_h`. Defaults per gemini-mcp `docs/03-architecture.md` §8. Secrets never logged
+`limits_per_key_model {rpd,rpm,tpm}`, `overflow_limits {rpd,rpm,tpm}`, `limits_overrides`,
+`quota_day_tz`, `retry {max,backoff_base_s,jitter_max_s,provider_timeout_s,request_delay_s}`,
+`wait {enabled_default,max_s,poll_s}` (FR-C13 semantics), `window_s`, `planned_ttl_s`,
+`models_refresh_h`, `cache_ttl_h`, `state_path`, `base_url`, `temperature` (pre-3.x models
+only), `max_output_tokens_default`, `chars_per_token`. Defaults per gemini-mcp `docs/03-architecture.md` §8. Secrets never logged
 (`key_id = sha256(key)[:8]`).
 
 ## 5. Integration guide (external consumers)
@@ -105,3 +106,15 @@ gemini-mcp daemon (localhost:8790, bearer) — same ledger, same rules.
 
 SemVer; tags `v*`; gemini-mcp pins a tag. CI: ruff + pytest (respx mocks, no network) on
 push/PR (free runners). Conventional Commits.
+
+## 8. As-built notes
+
+- v0.1.0 (M1): full contract above implemented; 43 tests green (ledger dual-gate RPD,
+  planned-row TPM windows, wait policy incl. cap and countdown events, cache +
+  request_id idempotency, overflow lite→gemma, live 429-day cooldown, multi-key pool,
+  countTokens spends no RPD, pinned-model handling).
+- `extract_json` improvement over the tldr original: when several JSON candidates match,
+  the earliest starting in the text wins (fixes nested `{…[…]…}` extraction).
+- Ledger statuses: `planned|ok|quota|http4xx|http5xx|network|blocked|skipped`;
+  RPD-conservative set = `ok,quota,http5xx,blocked` (D3).
+- CLI exit codes: 0 ok, 1 doctor failed, 2 config/usage error.
