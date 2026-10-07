@@ -49,6 +49,8 @@ class RouterResult:
     latency_s: float = 0.0
     cached: bool = False
     overflow_tier: int = 0
+    finish_reason: str | None = None         # v0.1.1: live-smoke finding (starvation diag)
+    tokens_thought: int | None = None
     events: list[RouterEvent] = field(default_factory=list)
     quota_after: list[dict] = field(default_factory=list)
     request_id: str | None = None
@@ -422,11 +424,13 @@ class Router:
                 self.ledger.cache_put(h, req.request_id, model, gr.text, tin, gr.tokens_out)
             emit("ok", model=model, key_id=kid,
                  detail={"tokens_in": tin, "tokens_out": gr.tokens_out,
+                         "tokens_thought": gr.tokens_thought,
                          "latency_s": round(ms / 1000, 1), "finish": gr.finish_reason})
             return RouterResult(text=gr.text, model=model, key_id=kid, tokens_in=tin,
                                 tokens_out=gr.tokens_out, latency_s=ms / 1000,
                                 overflow_tier=tier, request_id=req.request_id,
-                                row_id=row_id), "ok"
+                                row_id=row_id, finish_reason=gr.finish_reason,
+                                tokens_thought=gr.tokens_thought), "ok"
 
     def _resolve_err(self, row_id: int, e: GeminiHTTPError, ms: int) -> None:
         status = ("http5xx" if (e.status or 0) >= 500 else

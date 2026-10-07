@@ -19,6 +19,7 @@ class GenResult:
     tokens_in: int | None
     tokens_out: int | None
     finish_reason: str | None
+    tokens_thought: int | None = None        # 3.x thinking tokens (count toward limits)
 
 
 def is_gemini3(model: str) -> bool:
@@ -104,12 +105,15 @@ class GeminiClient:
             block = (data.get("promptFeedback") or {}).get("blockReason", "no candidates")
             raise RouterError(f"response blocked/empty: {block}")
         c = candidates[0]
-        text = "".join(p.get("text", "") for p in (c.get("content") or {}).get("parts", []))
+        parts = (c.get("content") or {}).get("parts", [])
+        # 3.x thinking: internal thought parts (thought=true) never join the visible text
+        text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
         usage = data.get("usageMetadata") or {}
         return GenResult(text=text,
                          tokens_in=usage.get("promptTokenCount"),
                          tokens_out=usage.get("candidatesTokenCount"),
-                         finish_reason=c.get("finishReason"))
+                         finish_reason=c.get("finishReason"),
+                         tokens_thought=usage.get("thoughtsTokenCount"))
 
     # ------------------------------------------------------------------
     @staticmethod

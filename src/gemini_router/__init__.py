@@ -12,7 +12,7 @@ from .gemini import GeminiClient, GenResult, extract_json, is_gemini3
 from .ledger import Ledger, iso, pt_midnight_ts
 from .routing import Router, RouterRequest, RouterResult, cache_hash, gates_for, pick_gemma
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "Router", "RouterRequest", "RouterResult", "RouterEvent",

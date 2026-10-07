@@ -51,7 +51,7 @@ class Config(BaseModel):
     base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     api_keys: list[str] = Field(default_factory=list)
     temperature: float | None = None           # applied to pre-3.x models only
-    max_output_tokens_default: int = 8192
+    max_output_tokens_default: int = 32768   # cap only; 3.x thinking tokens count toward it
     chars_per_token: int = 4                   # estimate when countTokens not provided
 
     @classmethod

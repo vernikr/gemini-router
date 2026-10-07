@@ -94,3 +94,45 @@ def test_extract_json(raw, expected):
 def test_extract_json_garbage():
     with pytest.raises(RouterError):
         extract_json("no json here")
+
+
+# ---------------------------------------------------------------- v0.1.1 (live smoke)
+def _raw(payload: dict) -> httpx.Response:
+    return httpx.Response(200, json=payload)
+
+
+async def test_thought_parts_filtered(mock_api, tmp_path):
+    """3.x thinking parts (thought=true) are internal — never joined into visible text."""
+    cfg = make_config(tmp_path)
+    payload = {"candidates": [{"content": {"parts": [
+                   {"thought": True, "text": "internal reasoning"},
+                   {"text": "OK"}]},
+               "finishReason": "STOP"}],
+               "usageMetadata": {"promptTokenCount": 8, "candidatesTokenCount": 1,
+                                 "thoughtsTokenCount": 12}}
+    mock_api.post(f"{BASE}/models/gemini-3.8-flash:generateContent").mock(
+        return_value=_raw(payload))
+    client = GeminiClient(cfg)
+    gr = await client.generate("k1", "gemini-3.8-flash", prompt="p", thinking_level="low")
+    await client.aclose()
+    assert gr.text == "OK"
+    assert gr.tokens_thought == 12 and gr.tokens_out == 1
+    assert gr.finish_reason == "STOP"
+
+
+async def test_thinking_starvation_surfaces(mock_api, tmp_path):
+    """VPS smoke 2026-10-08: maxOutputTokens counts thinking tokens — a 16-token cap
+    left zero visible text. Must surface as empty text + MAX_TOKENS, not silently vanish."""
+    cfg = make_config(tmp_path)
+    payload = {"candidates": [{"content": {"parts": [
+                   {"thought": True, "text": "all budget went to thinking"}]},
+               "finishReason": "MAX_TOKENS"}],
+               "usageMetadata": {"promptTokenCount": 8, "thoughtsTokenCount": 16}}
+    mock_api.post(f"{BASE}/models/gemini-3.8-flash:generateContent").mock(
+        return_value=_raw(payload))
+    client = GeminiClient(cfg)
+    gr = await client.generate("k1", "gemini-3.8-flash", prompt="p",
+                               thinking_level="low", max_output_tokens=16)
+    await client.aclose()
+    assert gr.text == "" and gr.finish_reason == "MAX_TOKENS"
+    assert gr.tokens_out is None and gr.tokens_thought == 16

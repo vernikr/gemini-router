@@ -109,6 +109,12 @@ push/PR (free runners). Conventional Commits.
 
 ## 8. As-built notes
 
+- v0.1.1 (2026-10-08, live VPS smoke): **thinking-token starvation** discovered —
+  in 3.x models `maxOutputTokens` counts thinking tokens, so a tiny cap (16) yields
+  empty visible text and no `candidatesTokenCount`. Fixes: thought parts
+  (`thought=true`) never join visible text; `GenResult`/`RouterResult` carry
+  `finish_reason` + `tokens_thought`; `max_output_tokens_default` 8192→32768
+  (cap only, no spend implication). 45 tests green.
 - v0.1.0 (M1): full contract above implemented; 43 tests green (ledger dual-gate RPD,
   planned-row TPM windows, wait policy incl. cap and countdown events, cache +
   request_id idempotency, overflow lite→gemma, live 429-day cooldown, multi-key pool,
