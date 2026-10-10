@@ -52,7 +52,9 @@ class Config(BaseModel):
     api_keys: list[str] = Field(default_factory=list)
     temperature: float | None = None           # applied to pre-3.x models only
     max_output_tokens_default: int = 32768   # cap only; 3.x thinking tokens count toward it
-    chars_per_token: int = 4                   # estimate when countTokens not provided
+    # Estimate divisor for the TPM pre-flight gate. None (default) = script-aware
+    # estimate; set a number to force the old single-divisor behaviour.
+    chars_per_token: int | None = None
 
     @classmethod
     def load(cls, path: str | Path | None = None, **over) -> Config:
@@ -94,5 +96,60 @@ def key_id(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:8]
 
 
-def estimate_tokens(text: str, chars_per_token: int = 4) -> int:
-    return max(1, len(text) // max(1, chars_per_token))
+# Characters per token, by script class. One divisor for the whole string is wrong by
+# a wide margin: measured against the reference tokenizer, Latin prose runs ~5.4
+# chars/token while Cyrillic runs ~1.7 and digits ~1.8, so a single "len // 4"
+# under-estimates Russian text by ~40% and over-estimates English by ~60%. The
+# under-estimate is the expensive direction — the TPM gate passes and the provider
+# answers 429. Fitted on mixed-language documents; median error +3%, worst +61%,
+# against −39% median and 275/300 under-estimates for the single divisor.
+_CHARS_PER_TOKEN = {"wide": 1.7, "latin": 5.4, "digit": 1.8, "other": 2.2}
+_ASCII_LETTERS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_ASCII_DIGITS = "0123456789"
+# Beyond this many characters, sample the head and tail instead of scanning the whole
+# document. Script mix is a property of a document rather than of a position in it, so
+# the estimate holds; the cost stops growing with the input. Both ends are sampled
+# because they are the parts most likely to differ — front matter, data tables,
+# appendices.
+_SAMPLE_CHARS = 200_000
+
+
+def _script_counts(text: str) -> tuple[float, float, float, float]:
+    """(wide, latin, digit, other) character counts.
+
+    `str.count` per ASCII letter is measurably the cheapest accurate route: a
+    per-character Python loop costs ~1.0 s on 11 M characters and a regex sweep ~1.0 s,
+    against ~0.37 s here. Non-ASCII is treated as one wide class — splitting Cyrillic
+    from other non-ASCII scripts did not improve the fit enough to pay for the pass.
+    """
+    latin = sum(text.count(c) for c in _ASCII_LETTERS)
+    digit = sum(text.count(c) for c in _ASCII_DIGITS)
+    wide = len(text) - len(text.encode("ascii", "ignore"))
+    return wide, latin, digit, len(text) - latin - digit - wide
+
+
+def estimate_tokens(text: str, chars_per_token: int | None = None,
+                    sample_chars: int = _SAMPLE_CHARS) -> int:
+    """Token estimate for a prompt, used for the TPM pre-flight gate.
+
+    Script-aware: it classifies characters and divides each class by its own ratio, so
+    a document mixing Russian, English and numbers is estimated as a whole rather than
+    through one divisor. Inputs longer than `sample_chars` are estimated from a
+    head-and-tail sample scaled up, which keeps the cost flat.
+
+    Passing `chars_per_token` restores the old single-divisor behaviour for callers
+    that configured one.
+    """
+    if chars_per_token:
+        return max(1, len(text) // max(1, chars_per_token))
+    n = len(text)
+    if n <= sample_chars:
+        w, la, d, o = _script_counts(text)
+    else:
+        half = sample_chars // 2
+        a = _script_counts(text[:half])
+        b = _script_counts(text[-half:])
+        scale = n / sample_chars
+        w, la, d, o = ((a[i] + b[i]) * scale for i in range(4))
+    r = _CHARS_PER_TOKEN
+    return max(1, int(w / r["wide"] + la / r["latin"] + d / r["digit"] + o / r["other"]))

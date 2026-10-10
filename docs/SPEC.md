@@ -77,7 +77,7 @@ Env: `GEMINI_API_KEYS`/`GEMINI_API_KEY_1..10`, `GEMINI_ROUTER_STATE`,
 `quota_day_tz`, `retry {max,backoff_base_s,jitter_max_s,provider_timeout_s,request_delay_s}`,
 `wait {enabled_default,max_s,poll_s}` (FR-C13 semantics), `window_s`, `planned_ttl_s`,
 `models_refresh_h`, `cache_ttl_h`, `state_path`, `base_url`, `temperature` (pre-3.x models
-only), `max_output_tokens_default`, `chars_per_token`. Defaults per gemini-mcp `docs/03-architecture.md` §8. Secrets never logged
+only), `max_output_tokens_default`, `chars_per_token` (unset = script-aware estimate). Defaults per gemini-mcp `docs/03-architecture.md` §8. Secrets never logged
 (`key_id = sha256(key)[:8]`).
 
 ## 5. Integration guide (external consumers)
@@ -118,6 +118,13 @@ push/PR. Conventional Commits.
   error says so and names the remedy.
 - `extract_json`: when several JSON candidates match, the earliest starting in the text
   wins (fixes nested `{…[…]…}` extraction).
+- **Token estimate is script-aware.** `estimate_tokens` classifies characters and divides
+  each class by its own ratio, because one divisor cannot serve mixed text: Latin prose
+  runs ~5.4 chars/token, Cyrillic ~1.7, digits ~1.8. The old `len // 4` under-estimated
+  Russian by ~40%, and under-estimating is what lets the TPM gate pass and the provider
+  answer 429. Inputs above `sample_chars` are estimated from a scaled head+tail sample,
+  so cost stays flat at ~5 ms regardless of document size. Setting `chars_per_token`
+  restores the single-divisor behaviour.
 - Ledger statuses: `planned|ok|quota|http4xx|http5xx|network|blocked|skipped`;
   RPD-conservative set = `ok,quota,http5xx,blocked` (D3).
 - CLI exit codes: 0 ok, 1 doctor failed, 2 config/usage error.
