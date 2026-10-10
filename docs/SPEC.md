@@ -1,6 +1,6 @@
 # gemini-router · SPEC
 
-The router's own contract. Companion docs live in `vernikr/gemini-mcp/docs/01..04`
+The router's own contract. Companion docs live in `vernikr/gemini-mcp/docs/02` + `docs/03`
 (system-wide requirements, architecture, plan).
 
 ## 1. What it is

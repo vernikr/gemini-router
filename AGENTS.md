@@ -6,7 +6,7 @@ with functional changes). Repo-specific rules:
 
 ## Context
 - Contract: `docs/SPEC.md`; system-wide requirements/architecture/plan live in
-  `vernikr/gemini-mcp/docs/01..04`. Keep SPEC.md true to the code.
+  `vernikr/gemini-mcp/docs/02-requirements.md` + `docs/03-architecture.md`. Keep SPEC.md true to the code.
 - This library MUST stay dependency-light (`httpx`, `pydantic`, `rich`, stdlib) and
   MCP-agnostic — it is consumed by gemini-mcp, tldr-digest (sync facade) and outsiders.
 - All quota truth = SQLite ledger (`GEMINI_ROUTER_STATE`); no in-memory-only counters.

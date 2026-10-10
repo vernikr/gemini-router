@@ -3,6 +3,7 @@ cross-process sharing (FR-C3/C7/C10)."""
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 from gemini_router import Ledger, pt_midnight_ts
 from gemini_router.config import key_id
@@ -100,3 +101,19 @@ def test_cross_instance_sharing(tmp_path):
     day = pt_midnight_ts("America/Los_Angeles", now)
     assert b.rpd_spent("ab", "m", day, now - 86400) == (1, 1)
     assert b.calls_tail(5)[0]["source"] == "daemon"
+
+
+def test_vacuum_reclaims_file_space(tmp_path):
+    """DELETE alone leaves the file at full size — the retention cap needs VACUUM."""
+    led = Ledger(tmp_path / "s.db")
+    now = time.time()
+    for _ in range(4000):
+        rid = led.plan(key_id="k", model="m", kind="single", est_tokens=10,
+                       request_id=None, source="mcp", now=now - 90 * 86400)
+        led.resolve(rid, "ok", tokens_in=10, tokens_out=10)
+    before = Path(led.path).stat().st_size
+    led.prune(audit_keep_days=1, now=now)
+    assert led.stats()["calls"] == 0
+    assert Path(led.path).stat().st_size == before          # rows gone, file unchanged
+    led.vacuum()
+    assert Path(led.path).stat().st_size < before / 4       # space actually reclaimed

@@ -215,6 +215,19 @@ class Ledger:
         return {"calls_pruned": 0 if dry else n_calls, "cache_pruned": 0 if dry else n_cache,
                 "calls_would_prune": n_calls, "cache_would_prune": n_cache}
 
+    def vacuum(self) -> None:
+        """Reclaim file space. DELETE alone never shrinks a SQLite file, so a
+        retention prune that empties tables leaves a size cap unreachable.
+
+        VACUUM cannot run inside a transaction, and under WAL its result stays in the
+        write-ahead log until a checkpoint — without the TRUNCATE the main file keeps
+        its old size.
+        """
+        with self._lock:
+            self._conn.commit()
+            self._conn.execute("VACUUM")
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
     def stats(self) -> dict:
         with self._lock:
             calls = self._conn.execute("SELECT COUNT(*) FROM calls").fetchone()[0]
