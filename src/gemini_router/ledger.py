@@ -3,7 +3,9 @@
 Single source of truth: budgets are SQL queries over `calls`, never in-memory counters
 (D1). WAL + busy_timeout make daemon, stdio sessions and cron jobs share one file (D5).
 Accounting rules (D3, FR-C2/C7):
-- RPD (PT-day + rolling-24h dual gate) counts kind != 'count' with status in RPD_STATUSES.
+- RPD (PT-day + rolling-24h dual gate) counts kind != 'count' with status in RPD_STATUSES,
+  plus 'planned' rows younger than planned_ttl_s: an in-flight request is spend, so
+  callers sharing this file cannot all pass the same check and overshoot the day.
 - RPM/TPM sliding windows count WINDOW_STATUSES; 'planned' rows expire after planned_ttl_s.
 - TPM pre-flight writes a 'planned' row (upgraded in place after the call) to close the
   countTokens→send race between processes (D2).
@@ -100,14 +102,21 @@ class Ledger:
                  quota_error and quota_error[:500], retry_after_s, row_id))
 
     def rpd_spent(self, key_id: str, model: str, day_start: float,
-                  roll_start: float) -> tuple[int, int]:
+                  roll_start: float, planned_min: float | None = None) -> tuple[int, int]:
+        """Daily and rolling spend. A fresh `planned` row counts as spent: the request is
+        already on its way, so leaving it out lets concurrent callers sharing this
+        database all pass the check and overshoot the day. Rows older than `planned_min`
+        are abandoned attempts that never reached the provider."""
         since = min(day_start, roll_start)
+        spent = "(status IN ({})".format(",".join("?" * len(RPD_STATUSES)))
+        spent += (" OR (status='planned' AND ts>=?))" if planned_min is not None else ")")
         q = ("SELECT SUM(ts>=?), SUM(ts>=?) FROM calls WHERE key_id=? AND model=? "
-             "AND kind!='count' AND status IN ({}) AND ts>=?").format(
-            ",".join("?" * len(RPD_STATUSES)))
+             "AND kind!='count' AND ts>=? AND " + spent)
+        params = [day_start, roll_start, key_id, model, since, *RPD_STATUSES]
+        if planned_min is not None:
+            params.append(planned_min)
         with self._lock:
-            row = self._conn.execute(
-                q, (day_start, roll_start, key_id, model, *RPD_STATUSES, since)).fetchone()
+            row = self._conn.execute(q, params).fetchone()
         return int(row[0] or 0), int(row[1] or 0)
 
     def window_usage(self, key_id: str, model: str, win_start: float,
@@ -133,8 +142,9 @@ class Ledger:
         absent; callers fall back to zeros.
         """
         rpd_q = ("SELECT key_id, model, SUM(ts>=?), SUM(ts>=?) FROM calls "
-                 "WHERE kind!='count' AND status IN ({}) AND ts>=? "
-                 "GROUP BY key_id, model").format(",".join("?" * len(RPD_STATUSES)))
+                 "WHERE kind!='count' AND ts>=? AND (status IN ({}) OR "
+                 "(status='planned' AND ts>=?)) GROUP BY key_id, model").format(
+            ",".join("?" * len(RPD_STATUSES)))
         win_q = ("SELECT key_id, model, COUNT(*), COALESCE(SUM(tokens_in),0), MIN(ts) "
                  "FROM calls WHERE kind!='count' AND ts>=? AND (status IN ({}) OR "
                  "(status='planned' AND ts>=?)) GROUP BY key_id, model").format(
@@ -143,7 +153,8 @@ class Ledger:
         with self._lock:
             spent = {(r[0], r[1]): (int(r[2] or 0), int(r[3] or 0))
                      for r in self._conn.execute(
-                         rpd_q, (day_start, roll_start, *RPD_STATUSES, since))}
+                         rpd_q, (day_start, roll_start, since, *RPD_STATUSES,
+                                 planned_min))}
             window = {(r[0], r[1]): (int(r[2]), int(r[3]), r[4])
                       for r in self._conn.execute(
                           win_q, (win_start, *RPD_STATUSES, planned_min))}

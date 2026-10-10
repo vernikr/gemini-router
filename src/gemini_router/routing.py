@@ -90,7 +90,7 @@ def gates_for(cfg: Config, ledger: Ledger, model: str, key: str,
     kid = key_id(key)
     return gates_from(cfg, model, kid,
                       ledger.rpd_spent(kid, model, pt_midnight_ts(cfg.quota_day_tz, now),
-                                       now - 86400),
+                                       now - 86400, now - cfg.planned_ttl_s),
                       ledger.window_usage(kid, model, now - cfg.window_s,
                                           now - cfg.planned_ttl_s),
                       ledger.cooldown(kid, model, now), est_tokens, now)

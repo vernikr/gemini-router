@@ -126,5 +126,8 @@ push/PR. Conventional Commits.
   so cost stays flat at ~5 ms regardless of document size. Setting `chars_per_token`
   restores the single-divisor behaviour.
 - Ledger statuses: `planned|ok|quota|http4xx|http5xx|network|blocked|skipped`;
-  RPD-conservative set = `ok,quota,http5xx,blocked` (D3).
+  RPD-conservative set = `ok,quota,http5xx,blocked` plus in-flight `planned` rows (D3).
+  An in-flight request counts as spent so processes sharing one state file cannot all
+  clear the day's gate; rows older than `planned_ttl_s` are abandoned attempts and stop
+  counting, so a caller that died mid-request does not eat a day's budget forever.
 - CLI exit codes: 0 ok, 1 doctor failed, 2 config/usage error.

@@ -5,8 +5,10 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+from conftest import make_config
 from gemini_router import Ledger, pt_midnight_ts
-from gemini_router.config import key_id
+from gemini_router.config import Limits, key_id
+from gemini_router.routing import gates_for
 
 
 def test_plan_counts_in_window_not_rpd(tmp_path):
@@ -15,11 +17,14 @@ def test_plan_counts_in_window_not_rpd(tmp_path):
     rid = led.plan(key_id="ab", model="m", kind="single", est_tokens=100,
                    request_id=None, source="t", now=now)
     day = pt_midnight_ts("America/Los_Angeles", now)
-    assert led.rpd_spent("ab", "m", day, now - 86400) == (0, 0)       # planned ≠ spent
+    # without a planned_min cutoff nothing is treated as in flight
+    assert led.rpd_spent("ab", "m", day, now - 86400) == (0, 0)
+    # with one, the in-flight row is spend — the request is already on its way
+    assert led.rpd_spent("ab", "m", day, now - 86400, now - 300) == (1, 1)
     calls, toks, oldest = led.window_usage("ab", "m", now - 60, now - 300)
     assert (calls, toks) == (1, 100)                                   # planned blocks TPM
     led.resolve(rid, "ok", http_status=200, tokens_in=90, tokens_out=7, latency_ms=5)
-    assert led.rpd_spent("ab", "m", day, now - 86400) == (1, 1)
+    assert led.rpd_spent("ab", "m", day, now - 86400, now - 300) == (1, 1)   # not double
     calls, toks, _ = led.window_usage("ab", "m", now - 60, now - 300)
     assert (calls, toks) == (1, 90)                                    # upgraded in place
 
@@ -149,7 +154,7 @@ def test_gate_snapshot_matches_the_per_pair_accessors(tmp_path):
     for k in keys:
         for m in models:
             assert snap["spent"].get((k, m), (0, 0)) == led.rpd_spent(
-                k, m, day_start, roll_start)
+                k, m, day_start, roll_start, planned_min)
             assert snap["window"].get((k, m), (0, 0, None)) == led.window_usage(
                 k, m, win_start, planned_min)
             assert snap["cooldown"].get((k, m)) == led.cooldown(k, m, now)
@@ -157,3 +162,39 @@ def test_gate_snapshot_matches_the_per_pair_accessors(tmp_path):
     assert checked == 12
     # a pair with no history at all is absent from the snapshot, and reads as zeros
     assert snap["spent"].get((key_id("nobody"), "m1"), (0, 0)) == (0, 0)
+
+
+def test_in_flight_rows_stop_a_second_caller_from_overshooting_the_day(tmp_path):
+    """The race 2.6 was about: two callers share one database, the first is mid-flight,
+    and the second must see that request as spent rather than pass the same gate."""
+    cfg = make_config(tmp_path, state_path=str(tmp_path / "s.db"),
+                      limits_per_key_model=Limits(rpd=2, rpm=100, tpm=10_000))
+    led = Ledger(cfg.state_path)
+    key, model = cfg.api_keys[0], cfg.chain[0]   # in the chain, so rpd=2 applies
+    now = time.time()
+
+    def spent() -> int:
+        g = gates_for(cfg, led, model, key, now=now)
+        return g["rpd_limit"] - g["rpd_left"]
+
+    assert spent() == 0
+    led.plan(key_id=key_id(key), model=model, kind="single", est_tokens=10,
+             request_id=None, source="first", now=now)
+    assert spent() == 1                        # in flight, and already counted
+    led.plan(key_id=key_id(key), model=model, kind="single", est_tokens=10,
+             request_id=None, source="second", now=now)
+    assert spent() == 2
+    g = gates_for(cfg, led, model, key, now=now)
+    assert g["rpd_left"] == 0                  # a third caller is now blocked
+
+
+def test_an_abandoned_attempt_stops_counting_against_the_day(tmp_path):
+    """A row stuck in `planned` is a caller that died before reaching the provider.
+    It must not eat a day's budget forever — it ages out after planned_ttl_s."""
+    led = Ledger(tmp_path / "s.db")
+    now = time.time()
+    old = now - 400
+    led.plan(key_id="ab", model="m", kind="single", est_tokens=100,
+             request_id=None, source="dead", now=old)
+    day = pt_midnight_ts("America/Los_Angeles", now)
+    assert led.rpd_spent("ab", "m", day, now - 86400, now - 300) == (0, 0)
