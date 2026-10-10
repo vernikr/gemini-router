@@ -123,6 +123,35 @@ class Ledger:
                 q, (key_id, model, win_start, *RPD_STATUSES, planned_min)).fetchone()
         return int(row[0]), int(row[1]), row[2]
 
+    def gate_snapshot(self, *, day_start: float, roll_start: float, win_start: float,
+                      planned_min: float, now: float) -> dict:
+        """Every gate input for every key×model pair, in three queries.
+
+        The per-pair accessors cost a round trip each, and the budget tables ask for
+        them once per pair — so a table over sixty pairs meant 180 queries on a path
+        that runs per tool call and per chunk. Pairs with no history are simply
+        absent; callers fall back to zeros.
+        """
+        rpd_q = ("SELECT key_id, model, SUM(ts>=?), SUM(ts>=?) FROM calls "
+                 "WHERE kind!='count' AND status IN ({}) AND ts>=? "
+                 "GROUP BY key_id, model").format(",".join("?" * len(RPD_STATUSES)))
+        win_q = ("SELECT key_id, model, COUNT(*), COALESCE(SUM(tokens_in),0), MIN(ts) "
+                 "FROM calls WHERE kind!='count' AND ts>=? AND (status IN ({}) OR "
+                 "(status='planned' AND ts>=?)) GROUP BY key_id, model").format(
+            ",".join("?" * len(RPD_STATUSES)))
+        since = min(day_start, roll_start)
+        with self._lock:
+            spent = {(r[0], r[1]): (int(r[2] or 0), int(r[3] or 0))
+                     for r in self._conn.execute(
+                         rpd_q, (day_start, roll_start, *RPD_STATUSES, since))}
+            window = {(r[0], r[1]): (int(r[2]), int(r[3]), r[4])
+                      for r in self._conn.execute(
+                          win_q, (win_start, *RPD_STATUSES, planned_min))}
+            cooldowns = {(r[0], r[1]): r[2] for r in self._conn.execute(
+                "SELECT key_id, model, until_ts FROM cooldowns WHERE until_ts>?",
+                (now,))}
+        return {"spent": spent, "window": window, "cooldown": cooldowns}
+
     def last_call_ts(self, key_id: str, model: str) -> float | None:
         with self._lock:
             row = self._conn.execute(
@@ -146,12 +175,14 @@ class Ledger:
 
     # ---------------------------------------------------------------- cooldowns
     def cooldown(self, key_id: str, model: str, now: float | None = None) -> float | None:
+        """Live cooldown deadline, or None. A pure read: this sits on the hot path
+        (every budget check for every key×model pair), so it must not write. Expired
+        rows are filtered here and reclaimed by prune()."""
         now = now or time.time()
-        with self._lock, self._conn:
-            self._conn.execute("DELETE FROM cooldowns WHERE until_ts<=?", (now,))
+        with self._lock:
             row = self._conn.execute(
-                "SELECT until_ts FROM cooldowns WHERE key_id=? AND model=?",
-                (key_id, model)).fetchone()
+                "SELECT until_ts FROM cooldowns WHERE key_id=? AND model=? AND until_ts>?",
+                (key_id, model, now)).fetchone()
         return row[0] if row else None
 
     def set_cooldown(self, key_id: str, model: str, until_ts: float, reason: str) -> None:

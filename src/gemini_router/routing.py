@@ -57,21 +57,18 @@ class RouterResult:
     row_id: int | None = None
 
 
-def gates_for(cfg: Config, ledger: Ledger, model: str, key: str,
-              est_tokens: int = 0, now: float | None = None) -> dict:
-    """Budget gates for one key×model pair (FR-C2). wait_s>0 means a minute-scale gate
-    (RPM/TPM/cooldown) — waitable per FR-C13; rpd_left==0 means day-scale — never waited."""
-    now = now or time.time()
-    kid = key_id(key)
+def gates_from(cfg: Config, model: str, kid: str, spent: tuple[int, int],
+               window: tuple[int, int, float | None], cd: float | None,
+               est_tokens: int, now: float) -> dict:
+    """The gate arithmetic (FR-C2), fed either by the per-pair ledger accessors or by
+    a Ledger.gate_snapshot. wait_s>0 means a minute-scale gate (RPM/TPM/cooldown) —
+    waitable per FR-C13; rpd_left==0 means day-scale — never waited."""
     lim = cfg.limits_for(model)
-    day_start = pt_midnight_ts(cfg.quota_day_tz, now)
-    spent_day, spent_roll = ledger.rpd_spent(kid, model, day_start, now - 86400)
-    calls, toks, oldest = ledger.window_usage(
-        kid, model, now - cfg.window_s, now - cfg.planned_ttl_s)
+    spent_day, spent_roll = spent
+    calls, toks, oldest = window
     expire_in = max(0.0, oldest + cfg.window_s - now) if oldest is not None else 0.0
     rpm_wait = expire_in if (lim.rpm and calls >= lim.rpm) else 0.0
     tpm_wait = expire_in if (est_tokens and lim.tpm and toks + est_tokens > lim.tpm) else 0.0
-    cd = ledger.cooldown(kid, model, now)
     cd_wait = max(0.0, cd - now) if cd else 0.0
     waits = {"rpm": rpm_wait, "tpm": tpm_wait, "cooldown": cd_wait}
     wait_s = max(waits.values())
@@ -84,6 +81,19 @@ def gates_for(cfg: Config, ledger: Ledger, model: str, key: str,
             "rpm_wait_s": round(rpm_wait, 1), "tpm_wait_s": round(tpm_wait, 1),
             "cooldown_until": cd, "wait_s": round(wait_s, 1),
             "reason": max(waits, key=waits.get) if wait_s > 0 else None}
+
+
+def gates_for(cfg: Config, ledger: Ledger, model: str, key: str,
+              est_tokens: int = 0, now: float | None = None) -> dict:
+    """Budget gates for one key×model pair, read straight from the ledger."""
+    now = now or time.time()
+    kid = key_id(key)
+    return gates_from(cfg, model, kid,
+                      ledger.rpd_spent(kid, model, pt_midnight_ts(cfg.quota_day_tz, now),
+                                       now - 86400),
+                      ledger.window_usage(kid, model, now - cfg.window_s,
+                                          now - cfg.planned_ttl_s),
+                      ledger.cooldown(kid, model, now), est_tokens, now)
 
 
 def cache_hash(model: str, req: RouterRequest, mot: int) -> str:
@@ -142,12 +152,26 @@ class Router:
         except Exception:  # noqa: BLE001
             return {}
 
+    def _snapshot(self, now: float) -> dict:
+        return self.ledger.gate_snapshot(
+            day_start=pt_midnight_ts(self.cfg.quota_day_tz, now), roll_start=now - 86400,
+            win_start=now - self.cfg.window_s, planned_min=now - self.cfg.planned_ttl_s,
+            now=now)
+
+    def _gates_from_snap(self, snap: dict, model: str, key: str, now: float) -> dict:
+        kid = key_id(key)
+        return gates_from(self.cfg, model, kid,
+                          snap["spent"].get((kid, model), (0, 0)),
+                          snap["window"].get((kid, model), (0, 0, None)),
+                          snap["cooldown"].get((kid, model)), 0, now)
+
     def quota_table(self, now: float | None = None) -> list[dict]:
         """Per key×model budget rows for chain + literal overflow tiers (BR3)."""
         now = now or self._now()
         models = list(dict.fromkeys(
             self.cfg.chain + [m for m in self.cfg.overflow_tiers if m != "gemma-auto"]))
-        rows = [gates_for(self.cfg, self.ledger, m, k, 0, now)
+        snap = self._snapshot(now)
+        rows = [self._gates_from_snap(snap, m, k, now)
                 for m in models for k in self.cfg.api_keys]
         rec = next((r for r in rows if r["rpd_left"] > 0 and r["wait_s"] <= 0), None)
         for r in rows:
@@ -158,9 +182,10 @@ class Router:
                       now: float | None = None) -> list[dict]:
         """Per-model aggregation across keys — for result meta and FR-B8 payloads."""
         now = now or self._now()
-        out = []
+        out, snap = [], None
         for model in dict.fromkeys(models or self.cfg.chain):
-            gs = [gates_for(self.cfg, self.ledger, model, k, 0, now) for k in self.cfg.api_keys]
+            snap = self._snapshot(now) if snap is None else snap
+            gs = [self._gates_from_snap(snap, model, k, now) for k in self.cfg.api_keys]
             out.append({"model": model, "rpd_left": sum(g["rpd_left"] for g in gs),
                         "rpm_wait_s": min((g["rpm_wait_s"] for g in gs), default=0),
                         "tpm_wait_s": min((g["tpm_wait_s"] for g in gs), default=0),
