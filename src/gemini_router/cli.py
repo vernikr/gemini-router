@@ -111,8 +111,9 @@ def cmd_prune(args, cfg: Config | None = None) -> int:
 
 
 def cmd_doctor(args, cfg: Config | None = None) -> int:
+    """Exit code names the failure, so a script can act on it without parsing prose:
+    0 ok · 3 no keys · 4 state file unusable · 5 no reachable chain."""
     cfg = cfg if cfg is not None else _load_cfg(args)
-    ok = True
     console.print(f"[bold]gemini-router {__version__} doctor[/bold]")
     if not Path(cfg.state_path).exists():
         console.print(f"  state: {cfg.state_path} (not created yet — no calls recorded)")
@@ -122,7 +123,7 @@ def cmd_doctor(args, cfg: Config | None = None) -> int:
             console.print(f"  state stats: {Ledger(cfg.state_path).stats()}")
         except Exception as e:  # noqa: BLE001
             console.print(f"  [red]state unusable: {e}[/red]")
-            return 1
+            return 4
     if cfg.api_keys:
         from .config import key_id
         console.print(f"  keys: {len(cfg.api_keys)} → "
@@ -130,7 +131,8 @@ def cmd_doctor(args, cfg: Config | None = None) -> int:
     else:
         console.print("  [red]no API keys configured "
                       "(GEMINI_API_KEYS / GEMINI_API_KEY_1..10)[/red]")
-        ok = False
+        console.print("[red]FAILED[/red] — nothing to route with")
+        return 3
     tz_now = pt_midnight_ts(cfg.quota_day_tz)
     console.print(f"  quota day ({cfg.quota_day_tz}): resets in "
                   f"{(pt_midnight_ts(cfg.quota_day_tz, days_ahead=1) - tz_now) / 3600:.1f} h "
@@ -139,23 +141,38 @@ def cmd_doctor(args, cfg: Config | None = None) -> int:
     console.print(f"  limits/key×model: {cfg.limits_per_key_model.model_dump()} · "
                   f"overflow: {cfg.overflow_limits.model_dump()} · "
                   f"wait: {cfg.wait.model_dump()}")
-    if not args.offline and cfg.api_keys:
-        async def _probe() -> None:
-            r = _router(cfg)
-            try:
-                avail = await r.availability()
-                for kid, models in avail.items():
-                    if models is None:
-                        console.print(f"  [yellow]key {kid}: listModels failed (offline?)[/yellow]")
-                    else:
-                        have = [m for m in cfg.chain if m in models]
-                        console.print(f"  key {kid}: {len(models)} models live; chain available: "
-                                      + (", ".join(have) or "[red]NONE[/red]"))
-            finally:
-                await r.aclose()
-        asyncio.run(_probe())
-    console.print("[green]OK[/green]" if ok else "[red]FAILED[/red]")
-    return 0 if ok else 1
+    if args.offline:
+        console.print("[green]OK[/green] (offline — connectivity not checked)")
+        return 0
+
+    live = 0
+    chain_live = False
+
+    async def _probe() -> None:
+        nonlocal live, chain_live
+        r = _router(cfg)
+        try:
+            for kid, models in (await r.availability()).items():
+                if models is None:
+                    console.print(f"  [yellow]key {kid}: listModels failed "
+                                  "(offline, or the key is refused)[/yellow]")
+                    continue
+                live += 1
+                have = [m for m in cfg.chain if m in models]
+                chain_live = chain_live or bool(have)
+                console.print(f"  key {kid}: {len(models)} models live; chain available: "
+                              + (", ".join(have) or "[red]NONE[/red]"))
+        finally:
+            await r.aclose()
+
+    asyncio.run(_probe())
+    if not chain_live:
+        console.print("[red]FAILED[/red] — no configured chain model is reachable on any "
+                      f"key ({live} key(s) answered); check the keys, or `chain` against "
+                      "the live model list")
+        return 5
+    console.print("[green]OK[/green]")
+    return 0
 
 
 _COMMANDS = {"quota": cmd_quota, "models": cmd_models, "calls": cmd_calls,

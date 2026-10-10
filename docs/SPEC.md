@@ -130,4 +130,7 @@ push/PR. Conventional Commits.
   An in-flight request counts as spent so processes sharing one state file cannot all
   clear the day's gate; rows older than `planned_ttl_s` are abandoned attempts and stop
   counting, so a caller that died mid-request does not eat a day's budget forever.
-- CLI exit codes: 0 ok, 1 doctor failed, 2 config/usage error.
+- CLI exit codes: `0` ok · `2` config/usage error · `doctor` names its failure so a
+  script can act without parsing prose: `3` no API keys, `4` state file unusable,
+  `5` no configured chain model reachable on any key. `gemini-mcp` passes these through
+  and adds `6` for an unwritable log directory.

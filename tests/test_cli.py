@@ -56,3 +56,19 @@ def test_no_keys_is_clear_error(tmp_path, monkeypatch, capsys):
     rc = main(["--state", str(tmp_path / "s.db"), "quota"])
     out = capsys.readouterr().out
     assert rc == 2 and "no api keys" in out.lower()
+
+
+def test_doctor_exit_codes_name_the_failure(tmp_path, monkeypatch, capsys):
+    """A script has to be able to act on the failure without parsing the prose."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GEMINI_ROUTER_STATE", str(tmp_path / "state.db"))
+    db = tmp_path / "state.db"
+
+    monkeypatch.delenv("GEMINI_API_KEYS", raising=False)
+    assert main(["doctor", "--offline"]) == 3          # nothing to route with
+
+    monkeypatch.setenv("GEMINI_API_KEYS", "AIzaSyDUMMYdummy1234567890ab")
+    assert main(["doctor", "--offline"]) == 0          # config is fine, connectivity skipped
+
+    db.write_text("not a database")
+    assert main(["doctor", "--offline"]) == 4          # state file unreadable
