@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
@@ -27,7 +28,8 @@ def _router(cfg: Config) -> Router:
     return Router(cfg, ledger=Ledger(cfg.state_path))
 
 
-def cmd_quota(cfg: Config, args) -> int:
+def cmd_quota(args, cfg: Config | None = None) -> int:
+    cfg = cfg if cfg is not None else _load_cfg(args)
     rows = _router(cfg).quota_table()
     if args.json:
         print(json.dumps(rows, indent=1, default=str))
@@ -51,7 +53,8 @@ def cmd_quota(cfg: Config, args) -> int:
     return 0
 
 
-def cmd_models(cfg: Config, args) -> int:
+def cmd_models(args, cfg: Config | None = None) -> int:
+    cfg = cfg if cfg is not None else _load_cfg(args)
     async def _run() -> dict:
         r = _router(cfg)
         try:
@@ -76,7 +79,8 @@ def cmd_models(cfg: Config, args) -> int:
     return 0
 
 
-def cmd_calls(cfg: Config, args) -> int:
+def cmd_calls(args, cfg: Config | None = None) -> int:
+    cfg = cfg if cfg is not None else _load_cfg(args)
     rows = Ledger(cfg.state_path).calls_tail(
         args.n, model=args.model, status=args.status, source=args.source,
         request_id=args.request_id)
@@ -98,23 +102,27 @@ def cmd_calls(cfg: Config, args) -> int:
     return 0
 
 
-def cmd_prune(cfg: Config, args) -> int:
+def cmd_prune(args, cfg: Config | None = None) -> int:
+    cfg = cfg if cfg is not None else _load_cfg(args)
     res = Ledger(cfg.state_path).prune(
         audit_keep_days=args.audit_days, cache_ttl_s=cfg.cache_ttl_h * 3600, dry=args.dry)
     console.print(("DRY " if args.dry else "") + json.dumps(res))
     return 0
 
 
-def cmd_doctor(cfg: Config, args) -> int:
+def cmd_doctor(args, cfg: Config | None = None) -> int:
+    cfg = cfg if cfg is not None else _load_cfg(args)
     ok = True
     console.print(f"[bold]gemini-router {__version__} doctor[/bold]")
-    console.print(f"  state: {cfg.state_path}")
-    try:
-        led = Ledger(cfg.state_path)
-        console.print(f"  state stats: {led.stats()}")
-    except Exception as e:  # noqa: BLE001
-        console.print(f"  [red]state unusable: {e}[/red]")
-        return 1
+    if not Path(cfg.state_path).exists():
+        console.print(f"  state: {cfg.state_path} (not created yet — no calls recorded)")
+    else:
+        console.print(f"  state: {cfg.state_path}")
+        try:
+            console.print(f"  state stats: {Ledger(cfg.state_path).stats()}")
+        except Exception as e:  # noqa: BLE001
+            console.print(f"  [red]state unusable: {e}[/red]")
+            return 1
     if cfg.api_keys:
         from .config import key_id
         console.print(f"  keys: {len(cfg.api_keys)} → "
@@ -150,6 +158,10 @@ def cmd_doctor(cfg: Config, args) -> int:
     return 0 if ok else 1
 
 
+_COMMANDS = {"quota": cmd_quota, "models": cmd_models, "calls": cmd_calls,
+             "prune": cmd_prune, "doctor": cmd_doctor}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="gemini-router",
                                  description="Quota-aware Gemini Flash router CLI")
@@ -175,11 +187,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--offline", action="store_true")
 
     args = ap.parse_args(argv)
-    handlers = {"quota": cmd_quota, "models": cmd_models, "calls": cmd_calls,
-                "prune": cmd_prune, "doctor": cmd_doctor}
     try:
-        cfg = _load_cfg(args)
-        return handlers[args.cmd](cfg, args)
+        return _COMMANDS[args.cmd](args)
     except RouterError as e:
         console.print(f"[red]error:[/red] {e}")
         return 2
