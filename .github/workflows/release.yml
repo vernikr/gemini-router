@@ -1,0 +1,36 @@
+name: release
+# Publish on tag v*: test → PyPI via trusted publishing (OIDC — no API token in
+# secrets), same pattern as gemini-mcp/.github/workflows/release.yml. One-time store
+# setup: gemini-mcp docs/09-ci.md §1 (PyPI trusted publisher + a `pypi` environment).
+# Until that is done the `pypi` job fails on tags and nothing else breaks — publish
+# manually and re-run the job for the record.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --extra dev
+      - run: uv run ruff check src tests
+      - run: uv run pytest -q
+  pypi:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: pypi                     # matches the PyPI trusted-publisher config
+    permissions:
+      contents: read                      # job-level permissions REPLACE workflow-level
+      id-token: write                     # the OIDC handshake with PyPI needs both
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Lockstep guard — pyproject version must equal the tag
+        run: grep -q "^version = \"${GITHUB_REF_NAME#v}\"$" pyproject.toml
+      - run: rm -rf dist && uv build      # dist hygiene: never ship stale artifacts
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true             # re-tag/re-run safe
