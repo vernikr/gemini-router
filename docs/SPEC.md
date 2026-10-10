@@ -1,8 +1,7 @@
-# gemini-router · SPEC (stage 2/3 artifact slice)
+# gemini-router · SPEC
 
-Date: 2026-10-08 · Companion docs live in `vernikr/gemini-mcp/docs/01..04` (system-wide
-requirements, architecture, plan). This file is the router's own contract; updated as-built
-each milestone.
+The router's own contract. Companion docs live in `vernikr/gemini-mcp/docs/01..04`
+(system-wide requirements, architecture, plan).
 
 ## 1. What it is
 
@@ -27,7 +26,7 @@ Quota-aware Gemini Flash router extracted from `tldr-digest/src/llm.py`, general
 
 Zero MCP/web-framework deps: `httpx`, `pydantic`, `rich`, stdlib `sqlite3`. Python ≥3.12.
 
-## 2. Public API (v1 contract)
+## 2. Public API
 
 ```python
 from gemini_router import Router, RouterRequest, RouterResult, RouterEvent, QuotaExhaustedError
@@ -46,7 +45,8 @@ res: RouterResult = await router.complete(
                                       # daily RPD resets are NEVER waited on
         model=None),                  # pin → skips chain fallback
     on_event=callable | None)         # RouterEvent(stage, pct, model, key_id, wait_s, detail, ts)
-                                      # stages: routing|waiting|dispatch|retry|switch|overflow|ok|quota_exhausted
+                                      # stages: routing|waiting|pacing|dispatch|retry|
+                                      #         switch|overflow|ok|quota_exhausted
 
 res.text, res.model, res.key_id, res.tokens_in, res.tokens_out
 res.latency_s, res.cached, res.overflow_tier, res.events, res.quota_after
@@ -83,8 +83,7 @@ only), `max_output_tokens_default`, `chars_per_token`. Defaults per gemini-mcp `
 ## 5. Integration guide (external consumers)
 
 ```bash
-uv add "gemini-router @ git+https://github.com/vernikr/gemini-router.git@v1.0.0"
-# private repo: export UV_INDEX / use gh auth or a deploy key; see README
+uv add gemini-router      # PyPI
 ```
 
 Service-style consumption (no Python): REST `POST /v1/complete`, `GET /v1/quota` on the
@@ -105,22 +104,20 @@ gemini-mcp daemon (localhost:8790, bearer) — same ledger, same rules.
 ## 7. Versioning & CI
 
 SemVer; tags `v*`; gemini-mcp pins a tag. CI: ruff + pytest (respx mocks, no network) on
-push/PR (free runners). Conventional Commits.
+push/PR. Conventional Commits.
 
-## 8. As-built notes
+## 8. Semantics worth knowing
 
-- v0.1.1 (2026-10-08, live VPS smoke): **thinking-token starvation** discovered —
-  in 3.x models `maxOutputTokens` counts thinking tokens, so a tiny cap (16) yields
-  empty visible text and no `candidatesTokenCount`. Fixes: thought parts
-  (`thought=true`) never join visible text; `GenResult`/`RouterResult` carry
-  `finish_reason` + `tokens_thought`; `max_output_tokens_default` 8192→32768
-  (cap only, no spend implication). 45 tests green.
-- v0.1.0 (M1): full contract above implemented; 43 tests green (ledger dual-gate RPD,
-  planned-row TPM windows, wait policy incl. cap and countdown events, cache +
-  request_id idempotency, overflow lite→gemma, live 429-day cooldown, multi-key pool,
-  countTokens spends no RPD, pinned-model handling).
-- `extract_json` improvement over the tldr original: when several JSON candidates match,
-  the earliest starting in the text wins (fixes nested `{…[…]…}` extraction).
+- **Thinking-token starvation:** in 3.x models `maxOutputTokens` counts thinking tokens,
+  so a tiny cap yields empty visible text and no `candidatesTokenCount`. Therefore
+  thought parts (`thought=true`) never join the visible text, `GenResult`/`RouterResult`
+  carry `finish_reason` + `tokens_thought`, and `max_output_tokens_default` is a cap
+  only (no spend implication).
+- **Refused keys:** HTTP 401 marks the *key* dead, not the model — the key is dropped for
+  the rest of the request and the pool continues; if every configured key is refused the
+  error says so and names the remedy.
+- `extract_json`: when several JSON candidates match, the earliest starting in the text
+  wins (fixes nested `{…[…]…}` extraction).
 - Ledger statuses: `planned|ok|quota|http4xx|http5xx|network|blocked|skipped`;
   RPD-conservative set = `ok,quota,http5xx,blocked` (D3).
 - CLI exit codes: 0 ok, 1 doctor failed, 2 config/usage error.

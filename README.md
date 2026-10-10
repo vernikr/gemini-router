@@ -22,24 +22,22 @@ consumer on a machine: the [gemini-mcp](https://github.com/vernikr/gemini-mcp) g
 - CLI: `gemini-router quota | models | calls | prune | doctor` (rich tables).
 - Deps: `httpx`, `pydantic`, `rich`, stdlib `sqlite3` — **no MCP/web-framework coupling**.
 
-## Status
+Contract: [`docs/SPEC.md`](docs/SPEC.md).
 
-**v0.1.1 implemented** (milestone M1 of the
-[gemini-mcp plan](https://github.com/vernikr/gemini-mcp/blob/main/docs/04-plan.md)):
-library + CLI, 45 tests green, CI on push. Contract: [`docs/SPEC.md`](docs/SPEC.md).
+## Install
 
-## Planned usage
+```bash
+uv add gemini-router          # PyPI
+gemini-router quota           # RPD left / RPM & TPM windows / cooldowns / recommendation
+```
+
+## Usage
 
 ```python
 from gemini_router import Router, RouterRequest
 router = Router.from_env()
 res = await router.complete(RouterRequest(prompt=..., thinking_level="high"),
                             on_event=print)
-```
-
-```bash
-uv add "gemini-router @ git+https://github.com/vernikr/gemini-router.git@v1.0.0"
-gemini-router quota        # RPD left / RPM & TPM windows / cooldowns / next recommendation
 ```
 
 Service-style (no Python): REST `/v1/complete` + `/v1/quota` on the gemini-mcp daemon.

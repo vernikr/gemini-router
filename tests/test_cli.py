@@ -17,7 +17,8 @@ def env(tmp_path, monkeypatch):
     return tmp_path
 
 
-def test_quota_json(env, capsys):
+@pytest.mark.usefixtures("env")
+def test_quota_json(capsys):
     assert main(["quota", "--json"]) == 0
     rows = json.loads(capsys.readouterr().out)
     assert len(rows) >= 4                                      # chain models × 2 keys
@@ -25,20 +26,23 @@ def test_quota_json(env, capsys):
     assert sum(1 for r in rows if r["recommended"]) == 1
 
 
-def test_doctor_offline(env, capsys):
+@pytest.mark.usefixtures("env")
+def test_doctor_offline(capsys):
     assert main(["doctor", "--offline"]) == 0
     out = capsys.readouterr().out
     assert "keys: 2" in out and "OK" in out
 
 
-def test_calls_and_prune(env, capsys):
+@pytest.mark.usefixtures("env")
+def test_calls_and_prune(capsys):
     assert main(["calls", "-n", "5", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == []
     assert main(["prune", "--dry"]) == 0
     assert "DRY" in capsys.readouterr().out
 
 
-def test_models_offline(env, capsys):
+@pytest.mark.usefixtures("env")
+def test_models_offline(capsys):
     assert main(["models", "--offline", "--json"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["chain"] and out["gemma_pick"] is None

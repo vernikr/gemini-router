@@ -10,7 +10,13 @@ from dataclasses import dataclass
 import httpx
 
 from .config import Config
-from .errors import MODEL_SWITCH_STATUS, RETRYABLE_STATUS, GeminiHTTPError, RouterError
+from .errors import (
+    KEY_REJECT_STATUS,
+    MODEL_SWITCH_STATUS,
+    RETRYABLE_STATUS,
+    GeminiHTTPError,
+    RouterError,
+)
 
 
 @dataclass(slots=True)
@@ -128,11 +134,14 @@ class GeminiClient:
             quota_minute = not quota_day
             if retry_after is None:
                 retry_after = 60.0
+        key_rejected = status in KEY_REJECT_STATUS
         retryable = status in RETRYABLE_STATUS or (status == 429 and quota_minute)
-        switch = status in MODEL_SWITCH_STATUS or (status == 429 and quota_day)
+        switch = (status in MODEL_SWITCH_STATUS or (status == 429 and quota_day)
+                  or key_rejected)
         return GeminiHTTPError(f"HTTP {status}: {body}", status=status, retryable=retryable,
                                switch_model=switch, retry_after=retry_after,
-                               quota_day=quota_day, quota_minute=quota_minute)
+                               quota_day=quota_day, quota_minute=quota_minute,
+                               key_rejected=key_rejected)
 
 
 def extract_json(text: str):

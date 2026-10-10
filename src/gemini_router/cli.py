@@ -68,10 +68,11 @@ def cmd_models(cfg: Config, args) -> int:
            "per_key": {k: (sorted(v) if v else "listModels unavailable → trust config")
                        for k, v in avail.items()},
            "missing_from_live": sorted(m for m in cfg.chain if union and m not in union)}
+    blob = json.dumps(out, default=str)
     if args.json:
-        print(json.dumps(out, indent=1))
-        return 0
-    console.print_json(json.dumps(out, indent=1))
+        print(blob)
+    else:
+        console.print_json(blob)
     return 0
 
 

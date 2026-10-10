@@ -224,3 +224,38 @@ async def test_pinned_unavailable_raises(mock_api, tmp_path):
     r = Router(make_config(tmp_path))
     with pytest.raises(RouterError, match="unavailable"):
         await r.complete(req("p", model="gemini-9.9-flash"))
+
+
+async def test_refused_key_falls_through_to_the_next_key(mock_api, tmp_path):
+    """A 401 means the KEY is dead, not the model: the pool keeps going and the dead
+    key is not retried for later models either."""
+    seen: list[str] = []
+
+    def gen(request):
+        key = request.headers["x-goog-api-key"]
+        seen.append(key)
+        if key == "k1":
+            return httpx.Response(401, json={"error": {"message": "API key not valid"}})
+        return gen_resp("ok")
+
+    mock_api.post(url__regex=r".*:generateContent").mock(side_effect=gen)
+    r = Router(make_config(tmp_path, api_keys=["k1", "k2"], chain=[M8, M7]))
+    res = await r.complete(req("hi", wait=False))
+    assert res.text == "ok" and res.key_id == key_id("k2")
+    assert seen == ["k1", "k2"]              # k1 refused once, never retried on M7
+    await r.aclose()
+
+
+async def test_whole_pool_refused_names_the_fix(mock_api, tmp_path):
+    def gen(request):
+        return httpx.Response(401, json={"error": {"message": "API key not valid"}})
+
+    mock_api.post(url__regex=r".*:generateContent").mock(side_effect=gen)
+    r = Router(make_config(tmp_path, api_keys=["k1", "k2"], chain=[M8]))
+    with pytest.raises(RouterError, match="every configured API key was rejected"):
+        await r.complete(req("hi", wait=False))
+    await r.aclose()
+
+
+def test_quota_exhausted_message_has_no_dangling_separator():
+    assert str(QuotaExhaustedError([], "eta")) == "quota exhausted"

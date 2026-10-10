@@ -225,6 +225,7 @@ class Router:
         failures: list[str] = []
         quota_blocked = False
         unavailable: set[str] = set()
+        dead_keys: set[str] = set()
         tried: list[str] = []
 
         for tier, models in self._tier_plan(req, avail):
@@ -234,6 +235,8 @@ class Router:
                 tried.append(model)
                 for key in self._keys_sorted(model):
                     kid = key_id(key)
+                    if kid in dead_keys:
+                        continue
                     s = avail.get(kid)
                     if s is not None and model not in s:
                         if model not in unavailable:
@@ -242,7 +245,8 @@ class Router:
                                  detail={"reason": "unavailable"})
                         continue
                     res, outcome = await self._try_candidate(
-                        req, tier, model, key, est, mot, wait_enabled, deadline, emit, failures)
+                        req, tier, model, key, est, mot, wait_enabled, deadline, emit,
+                        failures, dead_keys)
                     if res is not None:
                         res.events = events
                         res.quota_after = self.model_budgets(tried)
@@ -250,6 +254,10 @@ class Router:
                     if outcome in ("quota", "wait_skip"):
                         quota_blocked = True
 
+        if dead_keys and len(dead_keys) == len({key_id(k) for k in self.cfg.api_keys}):
+            raise RouterError(
+                "every configured API key was rejected by the provider (HTTP 401) — "
+                "rotate GEMINI_API_KEYS / GEMINI_API_KEY_1..10, then retry")
         if req.model and unavailable and not failures:
             raise RouterError(f"pinned model {req.model} is unavailable for all configured keys")
         if quota_blocked or not failures:
@@ -307,7 +315,7 @@ class Router:
 
     async def _try_candidate(self, req: RouterRequest, tier: int, model: str, key: str,
                              est: int, mot: int, wait_enabled: bool, deadline: float,
-                             emit: Emitter, failures: list[str]):
+                             emit: Emitter, failures: list[str], dead_keys: set[str]):
         cfg = self.cfg
         kid = key_id(key)
         g = self._gates(model, key, est)
@@ -371,6 +379,13 @@ class Router:
                     self.ledger.set_cooldown(kid, model, until, "rpd_429")
                     emit("switch", model=model, key_id=kid, detail={"reason": "rpd_429"})
                     return None, "quota"
+                if e.key_rejected:                # dead credentials: drop this key only
+                    self._resolve_err(row_id, e, ms)
+                    dead_keys.add(kid)
+                    failures.append(f"{model}: key {kid} rejected (HTTP {e.status})")
+                    emit("switch", model=model, key_id=kid,
+                         detail={"reason": f"key_rejected_{e.status}"})
+                    return None, "key_rejected"
                 if e.retryable and attempt < cfg.retry.max and self._now() < deadline:
                     attempt += 1
                     jitter = random.uniform(0, cfg.retry.jitter_max_s)
