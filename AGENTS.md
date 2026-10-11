@@ -26,6 +26,9 @@ with functional changes). Repo-specific rules:
   reinvent.
 
 ## Docs
+- Worklog lives in the repo that owns the change. A feature spanning both repos splits
+  into a capability plan here and a product plan in the package (or the reverse), each
+  stating its own half once and cross-linking the other.
 - No counters in evergreen docs: no version numbers, dates, test counts or "N green"
   claims. They go stale silently and every one of them is a fact somebody must guard.
   Keep only what a reader cannot get from `pyproject.toml`, `--version` or `pytest`.
