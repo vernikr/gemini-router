@@ -10,8 +10,11 @@ email. Patch 0.3.2 changed the verdict to require a hidden PDF code or image col
 absent from the prompt (generic answers are inconclusive). Its immediate re-run
 stopped at the very first positive control with **HTTP 429**, spending no further
 generation calls. It reported `inconclusive` and emailed that fact; no capability
-change is confirmed. Do not change the router's conservative file gates on the
-basis of the first run.
+change was confirmed by the CI run. A separate, owner-authorized one-off probe on
+the new VPS key later verified Lite/PDF reading (hidden code reproduced) but NOT
+Gemma/PNG support (HTTP 500); see
+`docs/worklog/2026.10.12-third-key-capability-probe/`. Do not change the router's
+fleet-wide conservative file gates until another key independently confirms it.
 
 **Resolution:** let the CI key's provider quota reset. The weekly Monday run is now
 scheduled after Pacific midnight in either season; no immediate manual re-run is

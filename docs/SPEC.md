@@ -212,7 +212,10 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
   *Official* — `ai.google.dev` model pages (fetched 2026-10-11) list PDF as a supported
   input for `gemini-3.5-flash-lite`; the Gemma 4 card lists text and images. The docs and
   practice disagree for lite + PDF at the moment of writing, and both statements stay here
-  on purpose.
+  on purpose. A later key *did* read a hidden code in a Lite/PDF file; the observed
+  support is not yet confirmed across keys. Keep the conservative routing policy
+  until an independent check; dated evidence lives in
+  `docs/worklog/2026.10.12-third-key-capability-probe/`.
 
   Corollary for measurement: **`countTokens` is lenient** — it accepted a PDF part for lite
   and preview while `generateContent` refused it, so a successful count is a price, never a

@@ -47,4 +47,7 @@ PT-midnight's 07:00/08:00 UTC seasonal reset. Corrected to Monday 09:20 UTC in
 provider-side quota may still produce 429. See
 `docs/blockers/b01-capability-canary-quota.md` for the after-reset check. The next
 weekly run is automatic. This is CI-only monitoring;
-no public library API or daemon deployment changes.
+no public library API or daemon deployment changes. An owner-authorized one-off
+VPS probe later confirmed Lite/PDF on a different key; its distinct evidence and
+fleet-wide routing decision gate live in
+`docs/worklog/2026.10.12-third-key-capability-probe/`.
