@@ -29,6 +29,8 @@ with functional changes). Repo-specific rules:
 - Worklog lives in the repo that owns the change. A feature spanning both repos splits
   into a capability plan here and a product plan in the package (or the reverse), each
   stating its own half once and cross-linking the other.
+- Closed iterations move to `docs/worklog/archive/` — history, not contract. Live plans
+  point there by full path; an archived folder keeps its name.
 - No counters in evergreen docs: no version numbers, dates, test counts or "N green"
   claims. They go stale silently and every one of them is a fact somebody must guard.
   Keep only what a reader cannot get from `pyproject.toml`, `--version` or `pytest`.
@@ -41,4 +43,4 @@ real-looking shapes carrying the marker word `DUMMY`; `scripts/check_secrets.py`
 before lint in CI and in the release pipeline and fails on any credential-shaped literal
 without that marker. History: 2026-10-11, two real Gemini keys went into a public test file
 of the sibling repo while the author was writing fixture strings (incident report:
-gemini-mcp `docs/worklog/2026.10.11-secret-in-tests/`).
+gemini-mcp `docs/worklog/archive/2026.10.11-secret-in-tests/`).

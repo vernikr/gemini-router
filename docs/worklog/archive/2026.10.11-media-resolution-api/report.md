@@ -2,7 +2,7 @@
 
 Owed worklog, written on 2026-10-11 at the end of the day; the change shipped the same
 morning. The product half (the HIGH default for every media type, and the CLI's use of it)
-is recorded in `gemini-mcp → docs/worklog/2026.10.11-media-and-cli/report.md`.
+is recorded in `gemini-mcp → docs/worklog/archive/2026.10.11-media-and-cli/report.md`.
 
 ## What the provider offers, and why it had to be an input
 
