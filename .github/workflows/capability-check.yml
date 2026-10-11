@@ -1,0 +1,24 @@
+name: capability-check
+# Weekly canary on a CI key: two tiny generated files, at most four generateContent
+# requests, no retries and no daemon/VPS contact. Positive control failure aborts early.
+# The existing tariff check uses countTokens only; it cannot reveal generateContent 400/500.
+on:
+  schedule:
+    - cron: "43 6 * * 1"          # weekly; tariff check runs first (free countTokens)
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --extra dev
+      - name: Probe Files API generateContent capability
+        run: uv run python -m scripts.capability_check
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}

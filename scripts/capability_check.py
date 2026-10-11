@@ -1,0 +1,153 @@
+"""Weekly Files API capability canary — bounded, standalone, no production ledger.
+
+Unlike countTokens, generateContent actually proves whether a model can read a file.
+One independent credential, two small generated fixtures, exactly one generation
+per case; no router fallback/retry and no key/response text in logs. This is not a
+substitute for the gateway's operational ledger: prefer a separate canary account.
+A shared account would lose at most four daily requests on the weekly run.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+from scripts.tariff_check import one_page_pdf, png, send_mail
+
+from gemini_router.config import Config
+from gemini_router.errors import GeminiHTTPError, RouterError
+from gemini_router.gemini import GeminiClient, UploadedFile, file_parts
+
+# These are explicit CANARY model IDs, not library defaults. A renamed model is a red
+# check needing review, rather than a silent skip (provenance: product worklog §E).
+FLASH = os.environ.get("CAP_FLASH_MODEL", "gemini-3.6-flash")
+LITE = os.environ.get("CAP_LITE_MODEL", "gemini-3.5-flash-lite")
+GEMMA = os.environ.get("CAP_GEMMA_MODEL", "gemma-4-31b-it")
+
+
+@dataclass(frozen=True)
+class Case:
+    label: str
+    model: str
+    media: str
+    expected: str                    # "ok" or "blocked"
+
+
+# Positive controls FIRST, then the documented-vs-measured disagreements. Up to four
+# generateContent calls / week on the dedicated canary key (no repeats on 5xx/429).
+def cases() -> list[Case]:
+    return [Case("flash/pdf", FLASH, "pdf", "ok"),
+            Case("lite/png", LITE, "png", "ok"),
+            Case("lite/pdf", LITE, "pdf", "blocked"),
+            Case("gemma/png", GEMMA, "png", "blocked")]
+
+
+def classify(expected: str, *, status: int | None, answer: str = "") -> str:
+    """Separate a capability change from an outage or exhausted probe credential.
+
+    Only 400/500 are established capability refusals; any 401/403/404/429/503 or
+    network failure means 'inconclusive', not evidence of changed media support.
+    """
+    if status is None and answer.strip():
+        return "match" if expected == "ok" else "drift"
+    if status == 400:
+        return "match" if expected == "blocked" else "drift"
+    if status == 500:
+        return "match" if expected == "blocked" else "inconclusive"
+    return "inconclusive"
+
+
+async def probe_case(client: GeminiClient, key: str, case: Case,
+                     files: dict[str, UploadedFile]) -> tuple[str, str]:
+    up = files[case.media]
+    # countTokens is intentionally NOT the verdict: it accepted a PDF on lite even
+    # though generateContent rejected that very file. One real generation per case.
+    try:
+        result = await client.generate(key, case.model,
+                                       prompt="Answer with one word about the file.",
+                                       thinking_level="low", max_output_tokens=1024,
+                                       file_parts=file_parts([up]))
+    except GeminiHTTPError as e:
+        return classify(case.expected, status=e.status), f"HTTP {e.status}"
+    except RouterError:
+        return "inconclusive", "provider error (not a capability verdict)"
+    return classify(case.expected, status=None, answer=result.text), \
+        ("answer present" if result.text.strip() else "empty answer")
+
+
+async def check(client: GeminiClient, key: str, fixture_dir: Path,
+                matrix: list[Case]) -> list[tuple[Case, str, str]]:
+    files: dict[str, UploadedFile] = {}
+    fixture_dir.mkdir(parents=True, exist_ok=True)
+    fixtures = {"png": ("image/png", png(8, 8)),
+                "pdf": ("application/pdf", one_page_pdf("capability canary"))}
+    try:
+        for media in dict.fromkeys(c.media for c in matrix):
+            mime, blob = fixtures[media]
+            path = fixture_dir / f"canary.{media}"
+            path.write_bytes(blob)
+            up = await client.upload_file(key, path, mime=mime)
+            files[media] = up
+            files[media] = await client.wait_file_active(key, up.name)
+        results = []
+        for case in matrix:
+            verdict, detail = await probe_case(client, key, case, files)
+            results.append((case, verdict, detail))
+            if case.expected == "ok" and verdict != "match":
+                break  # do not spend more quota when a positive control is broken
+        return results
+    finally:
+        for up in files.values():
+            try:
+                await client.delete_file(key, up.name)
+            except RouterError:
+                pass  # deletion is best-effort; provider TTL cleans up on its own
+
+
+def summarize(results: list[tuple[Case, str, str]]) -> tuple[int, str]:
+    lines = [f"{case.label} ({case.model}): expected={case.expected}, "
+             f"observed={detail}, verdict={verdict}"
+             for case, verdict, detail in results]
+    body = "\n".join(lines)
+    if any(verdict == "inconclusive" for _, verdict, _ in results):
+        return 2, body  # do not call provider instability a capability drift
+    if any(verdict == "drift" for _, verdict, _ in results):
+        return 1, body
+    return 0, body
+
+
+async def main() -> int:
+    key = os.environ.get("GEMINI_API_KEY", "")
+    if not key:
+        print("::error::Dedicated GEMINI_API_KEY secret is missing; cannot run "
+              "the capability canary.")
+        return 2
+    cfg = Config(api_keys=[key], chain=[FLASH], state_path=":memory:")
+    client = GeminiClient(cfg)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            results = await check(client, key, Path(tmp), cases())
+        code, body = summarize(results)
+    except Exception as e:  # noqa: BLE001 — unexpected provider/transport failure
+        # Do not print the exception: HTTP library messages can contain URLs/headers.
+        code, body = 2, f"Canary did not finish ({type(e).__name__}); review run logs."
+    finally:
+        await client.aclose()
+    print(body)
+    if code:
+        subject = ("capability drift" if code == 1 else "capability canary inconclusive")
+        print("::error::" + subject)
+        try:
+            send_mail(subject, body)
+        except Exception as e:  # noqa: BLE001 — CI red is the fallback alert
+            print(f"mail failed ({type(e).__name__}); red run remains the alert")
+    else:
+        print("capability matrix matches the measured baseline")
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))
