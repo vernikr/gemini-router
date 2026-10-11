@@ -41,6 +41,10 @@ are inconclusive. Release 0.3.2 and the full battery passed. Its immediate manua
 re-run was stopped by HTTP 429 on the *first* positive control, so it did not
 re-test the suspected drift. It reported `inconclusive` (and mailed that), not a
 capability change. The first email was **provisional and unverified**; the second
-was a truthful quota alert. See `docs/blockers/b01-capability-canary-quota.md` for
-the after-reset check. The next weekly run is automatic. This is CI-only monitoring;
+was a truthful quota alert. The workflow originally ran Monday 06:43 UTC, before
+PT-midnight's 07:00/08:00 UTC seasonal reset. Corrected to Monday 09:20 UTC in
+0.3.3 — after the expected reset in either season. A rolling limit or other
+provider-side quota may still produce 429. See
+`docs/blockers/b01-capability-canary-quota.md` for the after-reset check. The next
+weekly run is automatic. This is CI-only monitoring;
 no public library API or daemon deployment changes.

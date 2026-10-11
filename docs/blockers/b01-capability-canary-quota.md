@@ -13,10 +13,11 @@ generation calls. It reported `inconclusive` and emailed that fact; no capabilit
 change is confirmed. Do not change the router's conservative file gates on the
 basis of the first run.
 
-**Resolution:** let the CI key's provider quota reset; one manually dispatched run
-of `.github/workflows/capability-check.yml` after reset must complete and either
-(1) match the established matrix (archive this blocker), or (2) show verified
-content-backed drift with enough evidence to revise the matrix. If 429 recurs on
-a quiet day, use a dedicated monitoring API key for repo secret `GEMINI_API_KEY`;
+**Resolution:** let the CI key's provider quota reset. The weekly Monday run is now
+scheduled after Pacific midnight in either season; no immediate manual re-run is
+needed. It must either (1) match the established matrix (archive this blocker),
+or (2) show verified content-backed drift with enough evidence to revise the matrix.
+If 429 recurs after reset on a quiet day, use a dedicated monitoring API key for
+repo secret `GEMINI_API_KEY`;
 never switch to a production key merely to make the check green. No repeated
 immediate dispatches: the probe itself spends up to four RPD when healthy.

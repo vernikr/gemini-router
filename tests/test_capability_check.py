@@ -101,3 +101,15 @@ def test_generic_answer_does_not_prove_media_reading():
 
 def test_missing_proof_never_counts_generic_http_200_as_success():
     assert monitor.classify("blocked", status=None, answer="sure") == "inconclusive"
+
+
+def test_weekly_probe_follows_both_pacific_midnight_resets():
+    """PT midnight is 07:00 UTC in summer and 08:00 UTC in winter."""
+    import re
+
+    workflow = (Path(__file__).resolve().parents[1] /
+                ".github/workflows/capability-check.yml").read_text()
+    match = re.search(r'cron:\s*"(\d+) (\d+) \* \* 1"', workflow)
+    assert match, "weekly Monday cron is required"
+    minute, hour = map(int, match.groups())
+    assert 0 <= minute < 60 and 9 <= hour <= 23, "run AFTER the PT day reset"

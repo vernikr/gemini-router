@@ -4,7 +4,7 @@ name: capability-check
 # The existing tariff check uses countTokens only; it cannot reveal generateContent 400/500.
 on:
   schedule:
-    - cron: "43 6 * * 1"          # weekly; tariff check runs first (free countTokens)
+    - cron: "20 9 * * 1"          # after PT-midnight reset in PDT and PST; weekly
   workflow_dispatch: {}
 permissions:
   contents: read
