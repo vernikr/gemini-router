@@ -1,5 +1,11 @@
 name: ci
-on: [push, pull_request]
+# Tags are the release workflow's business: on a tag `release.test` runs the same checks
+# over the same commit, so triggering here too spent a duplicate job per release. Feature
+# branches are covered by the pull_request trigger.
+on:
+  push:
+    branches: [main]
+  pull_request:
 jobs:
   test:
     runs-on: ubuntu-latest
