@@ -4,7 +4,10 @@ Owner's ask (2026-10-11): since image/PDF pricing turned out to be simple and de
 should the server keep its own tariff table for pre-computed estimates — and if so, how do we
 get an explicit signal when the tariff changes and the hardcode starts missing?
 
-**Status: planned, not implemented.** C2 (group packing) is the first consumer.
+**Status: wave 1 of the cross-repo wave plan — sequencing lives in ONE place:
+`vernikr/gemini-mcp → docs/worklog/2026.10.11-remaining-work/plan.md` §Wave plan.**
+This folder documents the library half only; the gateway consumption has its own worklog
+there (`2026.10.11-tariff-drift-signal/`).
 
 ## What "the tariff" is, measured
 
