@@ -55,9 +55,11 @@ class Config(BaseModel):
     api_keys: list[str] = Field(default_factory=list)
     # Models that accept Files API parts in generateContent. None (default) = "learn":
     # a file job stays on the chain and a model that answers 400/500 to file input is
-    # remembered as incapable (measured 2026-10-11: the main gemini-3.x-flash models read
-    # files; gemini-3.5-flash-lite → 500, gemini-3-flash-preview → 400, gemma → 400).
-    file_capable_models: list[str] | None = None
+    # remembered as incapable for that media class. A flat list applies to every class;
+    # a dict narrows per class ({"pdf": [...], "image": [...]}). Measured 2026-10-11:
+    # PDFs serve on the main gemini-3.x-flash models (lite → 500, preview → 400); images
+    # serve on lite and preview too; gemma refuses file_data entirely (inline works).
+    file_capable_models: list[str] | dict[str, list[str]] | None = None
     temperature: float | None = None           # applied to pre-3.x models only
     max_output_tokens_default: int = 32768   # cap only; 3.x thinking tokens count toward it
     # Estimate divisor for the TPM pre-flight gate. None (default) = script-aware

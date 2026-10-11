@@ -398,3 +398,56 @@ async def test_no_file_capable_model_left_names_the_cause(mock_api, tmp_path):
     mock_api.post(url__regex=r".*:generateContent").mock(side_effect=blind)
     with pytest.raises(RouterError, match="can read this file"):
         await router.complete(RouterRequest(prompt="x", est_tokens=50), files=[up])
+
+
+# ------------------------------------------------------------------ per-modality capability
+async def test_capability_is_learned_per_media_class(mock_api, tmp_path):
+    """Preview answers 400 to a PDF part but reads images: a PDF refusal must mark it
+    pdf-incapable only — the next image-only job still offers preview as a candidate."""
+    router, up_pdf = await _prepared(mock_api, tmp_path, chain=("gemini-3-flash-preview",
+                                                                "gemini-3.8-flash"))
+    _mock_upload(mock_api, body={**FILE_INFO, "mimeType": "image/png",
+                                 "name": "files/img1", "uri": f"{BASE}/files/img1"})
+    up_png = await router.upload_file(_blob(tmp_path), mime="image/png")
+    tried: list[str] = []
+
+    def answer(request):
+        model = request.url.path.split("/models/")[1].split(":")[0]
+        tried.append(model)
+        parts = json.loads(request.content)["contents"][0]["parts"]
+        is_pdf = any(p.get("file_data", {}).get("mime_type") == "application/pdf"
+                     for p in parts)
+        if model == "gemini-3-flash-preview" and is_pdf:
+            return httpx.Response(400, json={"error": {"code": 400,
+                "message": "Request contains an invalid argument.",
+                "status": "INVALID_ARGUMENT"}})
+        return gen_resp("analysis")
+
+    mock_api.post(url__regex=r".*:generateContent").mock(side_effect=answer)
+    first = await router.complete(RouterRequest(prompt="pdf q", est_tokens=50),
+                                  files=[up_pdf])
+    assert first.text == "analysis" and tried == ["gemini-3-flash-preview",
+                                                  "gemini-3.8-flash"]
+    tried.clear()
+    second = await router.complete(RouterRequest(prompt="img q", est_tokens=50),
+                                   files=[up_png])
+    # old global memory would have skipped preview here; per-modality keeps it
+    assert second.text == "analysis" and tried == ["gemini-3-flash-preview"]
+
+
+async def test_file_capable_models_map_narrows_per_class(mock_api, tmp_path):
+    _mock_upload(mock_api)
+    router = _router(tmp_path, chain=("gemini-3-flash-preview", "gemini-3.8-flash"),
+                     file_capable_models={"pdf": ["gemini-3.8-flash"],
+                                          "image": ["gemini-3-flash-preview",
+                                                    "gemini-3.8-flash"]})
+    up_pdf = await router.upload_file(_blob(tmp_path), mime="application/pdf")
+    tried: list[str] = []
+
+    def cap(request):
+        tried.append(request.url.path.split("/models/")[1].split(":")[0])
+        return gen_resp("analysis")
+
+    mock_api.post(url__regex=r".*:generateContent").mock(side_effect=cap)
+    await router.complete(RouterRequest(prompt="q", est_tokens=50), files=[up_pdf])
+    assert tried == ["gemini-3.8-flash"]          # preview is image-capable, not pdf-capable

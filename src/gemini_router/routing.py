@@ -25,6 +25,7 @@ from .errors import (
 from .events import RouterEvent
 from .gemini import GeminiClient, UploadedFile, file_parts
 from .ledger import Ledger, iso, pt_midnight_ts
+from .tariffs import media_class
 
 Emitter = Callable[[RouterEvent], None]
 
@@ -142,8 +143,9 @@ class Router:
         self._sleep = sleep or asyncio.sleep
         self._now = now or time.time
         self._avail: tuple[float, dict[str, set[str] | None]] | None = None
-        # Models that answered 400/500 to a file request in this process (see _tier_plan).
-        self._file_incapable: set[str] = set()
+        # Models that answered 400/500 to a file request in this process, per media
+        # class (see _tier_plan): capability is per model × modality, not one flag.
+        self._file_incapable: dict[str, set[str]] = {}
 
     @classmethod
     def from_env(cls, config_path: str | None = None, **over) -> Router:
@@ -320,7 +322,8 @@ class Router:
         dead_keys: set[str] = set()
         tried: list[str] = []
 
-        for tier, models in self._tier_plan(req, avail, bool(files)):
+        fclasses = {media_class(f.mime) for f in files} if files else None
+        for tier, models in self._tier_plan(req, avail, fclasses):
             if tier > 0:
                 emit("overflow", detail={"tier": tier, "models": models})
             for model in models:
@@ -358,10 +361,10 @@ class Router:
         # file under a key that was never the issue (found by test on 2026-10-11).
         if files and not quota_blocked and self._file_incapable:
             raise RouterError(
-                "no model in the chain can read this file: " +
-                ", ".join(sorted(self._file_incapable)) + " answered 400/500 to a file "
-                "request. Measured 2026-10-11: only the main gemini-3.x-flash models accept "
-                "Files API parts — lite, gemma and preview models do not. Put a file-capable "
+                "no model in the chain can read this file: " + self._incapable_note() +
+                " answered 400/500 to a file request. Capability is per model × media "
+                "kind (measured 2026-10-11: PDFs serve on the main flash models; images "
+                "also on lite/preview; gemma takes inline images only). Put a capable "
                 "model in `chain:` (or name the capable ones in `file_capable_models:`).")
         if pins and not failures and not quota_blocked:
             raise RouterError(
@@ -381,8 +384,7 @@ class Router:
                 # Tell the truth about the pool of candidates, not just the quota: on a
                 # file job the "weaker models" the hint offers cannot read the file at all.
                 hint += (" · file jobs can only run on file-capable models (" +
-                         ", ".join(sorted(self._file_incapable)) + " answered 400/500 to "
-                         "file input; lite/gemma/preview do not read files)")
+                         self._incapable_note() + " answered 400/500 to file input)")
             emit("quota_exhausted", detail={"hint": hint})
             raise QuotaExhaustedError(payload, iso(eta), hint=hint, waited=wait_enabled,
                                       failures=failures)
@@ -493,18 +495,30 @@ class Router:
         return list(keys)
 
     # ------------------------------------------------------------------ internals
+    def _incapable_note(self) -> str:
+        """`model (class/class)` pairs for every remembered file refusal, stable order."""
+        by_model: dict[str, list[str]] = {}
+        for cls, models in sorted(self._file_incapable.items()):
+            for m in models:
+                by_model.setdefault(m, []).append(cls)
+        return ", ".join(f"{m} ({'/'.join(cs)})" for m, cs in sorted(by_model.items()))
+
     def _tier_plan(self, req: RouterRequest, avail: dict,
-                   has_files: bool = False) -> list[tuple[int, list[str]]]:
+                   file_classes: set[str] | None = None) -> list[tuple[int, list[str]]]:
         chain = [req.model] if req.model else list(dict.fromkeys(self.cfg.chain))
-        if has_files:
-            # Overflow tiers are a quota device for text; the models in them cannot read
-            # Files API parts, so sending a file job there burns a call and ends in a
-            # misleading "quota exhausted". Measured 2026-10-11: lite → 500, preview → 400,
-            # gemma → 400 on a part the flash models served fine.
-            if self.cfg.file_capable_models:
-                allow = set(self.cfg.file_capable_models)
-                chain = [m for m in chain if m in allow]
-            chain = [m for m in chain if m not in self._file_incapable]
+        if file_classes:
+            # Overflow tiers are a quota device for text; sending a file job there burns
+            # a call and ends in a misleading "quota exhausted". Capability is per model
+            # × modality (measured 2026-10-11, matrix in gemini-mcp worklog §E): pdf via
+            # file_data → 500 on lite, 400 on preview, served by the main flash models;
+            # png → served by lite and preview too, refused by gemma (inline works there).
+            fcm = self.cfg.file_capable_models
+            for cls in sorted(file_classes):
+                allow = fcm.get(cls) if isinstance(fcm, dict) else fcm
+                if allow:
+                    allow = set(allow)
+                    chain = [m for m in chain if m in allow]
+                chain = [m for m in chain if m not in self._file_incapable.get(cls, ())]
             return [(0, chain)]
         tiers = [(0, chain)]
         if req.overflow in ("lite", "lite+gemma"):
@@ -588,7 +602,9 @@ class Router:
             except GeminiHTTPError as e:
                 ms = int((self._now() - t0) * 1000)
                 if files and e.status in (400, 500):
-                    self._file_incapable.add(model)               # cannot read files: remember
+                    # Cannot read (at least) one of these classes: remember per class.
+                    for cls in {media_class(f.mime) for f in files}:
+                        self._file_incapable.setdefault(cls, set()).add(model)
                 if e.quota_day:                                  # FR-C4: live daily 429
                     self.ledger.resolve(row_id, "quota", http_status=e.status, latency_ms=ms,
                                         quota_error=str(e), retry_after_s=e.retry_after)

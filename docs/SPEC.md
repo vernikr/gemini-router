@@ -193,9 +193,10 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
 - **A file job stays on the chain.** The overflow tiers exist for quota reasons on text; a
   file job sent there buys a wasted call and a misleading error, so a request carrying
   `files` never enters a tier, a model that answers 400/500 to a file request is remembered
-  as file-incapable for the process, and a file-blind candidate set produces its own error
-  instead of talking about quota. `file_capable_models:` states the capable models
-  explicitly when an operator prefers that to learning.
+  as incapable *for that media class* (capability is per model × modality), and a
+  file-blind candidate set produces its own error instead of talking about quota.
+  `file_capable_models:` states the capable models explicitly when an operator prefers
+  that to learning — a flat list applies to every media class, a map narrows per class.
 
   **Two sources, deliberately kept apart** (this repo's rule, owner, 2026-10-11):
 
@@ -203,9 +204,9 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
   gemini-mcp `docs/worklog/2026.10.11-remaining-work/plan.md` §E: PDF via `file_data` →
   HTTP 500 on `gemini-3.5-flash-lite`, HTTP 400 on `gemini-3-flash-preview`, OK on
   `gemini-3.6-flash`; PNG via `file_data` → OK on lite and preview, 400 on
-  `gemma-4-31b-it`, whose inline-image path works. So the conservative rule above is right
-  for **PDF** and stricter than necessary for images; the per-modality refinement is a
-  recorded plan item, not something to code against yet.
+  `gemma-4-31b-it`, whose inline-image path works. The router enforces this per modality:
+  a request carrying only images keeps lite/preview as candidates, while a PDF narrows
+  the chain to the models that actually read PDFs.
 
   *Official* — `ai.google.dev` model pages (fetched 2026-10-11) list PDF as a supported
   input for `gemini-3.5-flash-lite`; the Gemma 4 card lists text and images. The docs and
