@@ -3,12 +3,12 @@
 Quota-aware **Gemini Flash router** as a standalone, reusable module — extracted and
 generalized from [`tldr-digest/src/llm.py`](https://github.com/vernikr/tldr-digest).
 
-One persistent ledger (SQLite WAL) = the single source of quota truth shared by every
-consumer on a machine: the [gemini-mcp](https://github.com/vernikr/gemini-mcp) gateway,
-`tldr-digest` cron runs, CLI calls, foreign scripts.
+One persistent ledger (SQLite WAL) lets the [gemini-mcp](https://github.com/vernikr/gemini-mcp)
+gateway and CLI calls share quota truth on a machine. Other programs can join the same
+ledger; `tldr-digest` has **not** been migrated yet.
 
-- Cascading chain with runtime `listModels` validation (default
-  `gemini-3.8-flash → 3.7 → 3.6 → 3.5 → 3-flash-preview-slot`; config-overridable).
+- Cascading chain with runtime `listModels` validation (configurable; the current
+  default lives only in `src/gemini_router/config.py:DEFAULT_CHAIN`).
 - Per **key×model** budgets: RPD (Pacific-time day + rolling 24 h), RPM, TPM (sliding
   60 s) — pre-flight enforced, accounted from `usageMetadata`; conservative 429 handling
   with cooldowns and `Retry-After`.

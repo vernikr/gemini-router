@@ -7,14 +7,15 @@ The router's own contract. Companion docs live in `vernikr/gemini-mcp/docs/02` +
 
 Quota-aware Gemini Flash router extracted from `tldr-digest/src/llm.py`, generalized:
 
-- cascading model chain with runtime `listModels` validation (default
-  `gemini-3.8-flash → 3.7 → 3.6 → 3.5 → 3-flash-preview-slot`);
+- cascading model chain with runtime `listModels` validation (the configurable
+  default lives in `src/gemini_router/config.py:DEFAULT_CHAIN`);
 - per **key×model** budgets: RPD (America/Los_Angeles day + rolling 24 h), RPM and TPM
   (sliding 60 s) — enforced pre-flight, accounted post-fact from `usageMetadata`;
 - key pool (`GEMINI_API_KEYS` / `GEMINI_API_KEY_1..10`); selection prefers the pair with
   the largest remaining budget;
-- persistent multi-process ledger (SQLite WAL) — the single source of quota truth shared
-  by every consumer on the machine (MCP daemon, stdio sessions, cron jobs, foreign scripts);
+- persistent multi-process ledger (SQLite WAL) — shared by connected consumers on
+  the same machine (MCP daemon, stdio sessions, CLI); other programs can join it,
+  but the `tldr-digest` migration is not complete;
 - 429/5xx/4xx taxonomy inherited from tldr-digest (`RETRYABLE_STATUS`,
   `MODEL_SWITCH_STATUS`, `Retry-After`, backoff+jitter, provider deadline);
 - opt-in overflow tiers (`gemini-3.5-flash-lite`, best `gemma-*`) — never automatic;
