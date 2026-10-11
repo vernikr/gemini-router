@@ -436,12 +436,15 @@ class Router:
         raise RouterError(f"no key accepted the upload: {last_err}")
 
     async def count_file_tokens(self, model: str, uri: str, mime: str, *,
-                               key_id: str | None = None) -> int:
+                               key_id: str | None = None,
+                               media_resolution: str | None = None) -> int:
         """Exact cost of a file for a model. Free (FR-C7) and key-agnostic, so any live
-        key answers; a rejected one moves the call to the next."""
+        key answers; a rejected one moves the call to the next. Pass the SAME
+        `media_resolution` the analysis request will use: the count depends on it."""
         for k in self._candidates(1 if key_id else None, key_id, model):
             try:
-                return await self.client.count_file_tokens(k, model, uri, mime)
+                return await self.client.count_file_tokens(k, model, uri, mime,
+                                                           media_resolution)
             except GeminiHTTPError as e:
                 if e.key_rejected or e.switch_model:
                     continue

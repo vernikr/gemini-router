@@ -278,3 +278,58 @@ def test_an_existing_v1_database_migrates_in_place(tmp_path):
     assert led._conn.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()[0] \
         == SCHEMA_VERSION
     led.close()
+
+
+# ------------------------------------------------------------- media resolution level
+async def test_the_level_rides_on_the_part_and_the_measurement(mock_api, tmp_path):
+    """A level pinned on the file must appear in BOTH calls: the count that feeds the TPM
+    gate and the request that spends. Measuring at one level and sending at another makes
+    the gate and the ledger disagree — the exact bug this test exists to prevent."""
+    router, up = await _prepared(mock_api, tmp_path)
+    up = up.with_resolution("high")
+    counted, sent = {}, {}
+
+    mock_api.post(f"{BASE}/models/gemini-3.8-flash:countTokens").mock(
+        side_effect=lambda r: (counted.update(json.loads(r.content)),
+                               httpx.Response(200, json={"totalTokens": 1120}))[1])
+    mock_api.post(f"{BASE}/models/gemini-3.8-flash:generateContent").mock(
+        side_effect=lambda r: (sent.update(json.loads(r.content)), gen_resp("ok"))[1])
+
+    n = await router.count_file_tokens("gemini-3.8-flash", up.uri, up.mime,
+                                       key_id=up.key_id, media_resolution=up.media_resolution)
+    await router.complete(RouterRequest(prompt="q", est_tokens=n + 10), files=[up])
+
+    want = {"level": "MEDIA_RESOLUTION_HIGH"}
+    assert n == 1120
+    assert counted["contents"][0]["parts"][0]["media_resolution"] == want
+    assert sent["contents"][0]["parts"][0]["media_resolution"] == want
+    assert sent["contents"][0]["parts"][1]["text"] == "q"
+
+
+async def test_no_level_means_no_field_and_the_maximum_is_available(mock_api, tmp_path):
+    """Inheriting the provider default stays possible (None/""), and the top level is
+    reachable — the owner's call for PDFs is high, which doubles their per-page cost."""
+    from gemini_router.gemini import RESOLUTION_LEVELS, file_parts, resolution_field
+
+    assert resolution_field(None) is None and resolution_field("") is None
+    assert resolution_field("high") == {"level": "MEDIA_RESOLUTION_HIGH"}
+    assert sorted(RESOLUTION_LEVELS) == ["high", "low", "medium"]
+
+    router, up = await _prepared(mock_api, tmp_path)
+    sent = {}
+    mock_api.post(f"{BASE}/models/gemini-3.8-flash:generateContent").mock(
+        side_effect=lambda r: (sent.update(json.loads(r.content)), gen_resp("ok"))[1])
+    await router.complete(RouterRequest(prompt="q", est_tokens=50), files=[up])
+    assert "media_resolution" not in sent["contents"][0]["parts"][0]
+    assert file_parts([up.with_resolution("low")])[0]["media_resolution"] == {
+        "level": "MEDIA_RESOLUTION_LOW"}
+
+
+async def test_an_unknown_level_fails_before_any_request(mock_api, tmp_path):
+    router, up = await _prepared(mock_api, tmp_path)
+    with pytest.raises(ValueError) as e:
+        up.with_resolution("huge")
+    assert "media resolution must be one of" in str(e.value)
+    with pytest.raises(ValueError):
+        await router.count_file_tokens("gemini-3.8-flash", up.uri, up.mime,
+                                       media_resolution="huge")

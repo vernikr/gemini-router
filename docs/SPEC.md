@@ -63,12 +63,24 @@ up: UploadedFile = await router.upload_file(
     path, mime=None,             # default from the suffix
     model=None,                  # whose serving key to pick; None → chain head
     source="cli", display_name=None, key=None, sha256=None, ready_timeout_s=30.0)
-# UploadedFile: name, uri, mime, size, state, expires_at, sha256, key_id
+# UploadedFile: name, uri, mime, size, state, expires_at, sha256, key_id,
+#               media_resolution ("low" | "medium" | "high" | None = provider default)
+up  = up.with_resolution("high")            # pins the level for measurement AND request
 
-n   = await router.count_file_tokens(model, up.uri, up.mime)      # free (FR-C7)
+n   = await router.count_file_tokens(model, up.uri, up.mime, key_id=up.key_id,
+                                     media_resolution=up.media_resolution)   # free (FR-C7)
 res = await router.complete(RouterRequest(prompt, est_tokens=…), files=[up], …)
 await router.delete_file(up.name)                                 # best-effort
 ```
+
+`media_resolution` sets how hard the provider looks at the media, independently of the
+model's thinking level, and it is the cost lever: measured on `gemini-3.6-flash` (2026-10-11,
+free `countTokens`), an image costs 256 / 529 / 1089 tokens and a PDF page 280 / 560 / 1120
+at low / medium / high — flat per level, independent of pixel count and of byte size, with
+the provider default differing per media type (images high, PDFs medium). Pass the SAME
+level to the count and to the request: measuring at one level and sending at another makes
+the TPM gate and the ledger disagree, which is why `with_resolution()` exists rather than a
+loose keyword.
 
 `complete(..., files=[…])` pins the candidate keys to those the files were uploaded under
 (a file lives in its key's own project) and refuses without `est_tokens`: the TPM gate must

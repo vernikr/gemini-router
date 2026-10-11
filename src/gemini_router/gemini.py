@@ -12,7 +12,7 @@ import json
 import mimetypes
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import httpx
@@ -45,6 +45,15 @@ class UploadedFile:
     expires_at: str | None = None
     sha256: str | None = None
     key_id: str | None = None
+    media_resolution: str | None = None   # "low" | "medium" | "high"; None = provider default
+
+    def with_resolution(self, level: str | None) -> UploadedFile:
+        """A copy that asks the provider to process this media at `level` (None = inherit
+        the provider default). The level is a request-side choice, so it is set here and
+        carried into both the measurement and the analysis request — measuring at one
+        level and sending at another would make the gate and the ledger disagree."""
+        resolution_field(level)          # validate even for None-adjacent typos
+        return replace(self, media_resolution=level)
 
     @classmethod
     def from_api(cls, info: dict, *, mime: str, fallback_size: int = 0) -> UploadedFile:
@@ -151,13 +160,19 @@ class GeminiClient:
                                    f"{timeout_s:.0f}s")
             await asyncio.sleep(poll_s)
 
-    async def count_file_tokens(self, key: str, model: str, uri: str, mime: str) -> int:
+    async def count_file_tokens(self, key: str, model: str, uri: str, mime: str,
+                                media_resolution: str | None = None) -> int:
         """Exact token cost of a file, before anything is sent. A countTokens call: it
-        plans TPM and never draws on RPD (FR-C7)."""
+        plans TPM and never draws on RPD (FR-C7). `media_resolution` must be the level the
+        analysis request will use — the count changes with it (measured: 256/529/1089 for
+        an image at low/medium/high)."""
+        part: dict = {"file_data": {"mime_type": mime, "file_uri": uri}}
+        res = resolution_field(media_resolution)
+        if res:
+            part["media_resolution"] = res
         r = await self._client.post(
             f"{self.cfg.base_url}/models/{model}:countTokens", headers=self._headers(key),
-            json={"contents": [{"parts": [{"file_data": {"mime_type": mime,
-                                                         "file_uri": uri}}]}]})
+            json={"contents": [{"parts": [part]}]})
         if r.status_code >= 400:
             raise self._classify(r)
         return int((r.json() or {}).get("totalTokens") or 0)
@@ -258,9 +273,36 @@ class GeminiClient:
                                key_rejected=key_rejected)
 
 
+# What the provider accepts under a media part. Measured 2026-10-11 on gemini-3.6-flash:
+# an image costs 256/529/1089 tokens at low/medium/high, a PDF page 280/560/1120, and the
+# default differs per media type (images high, PDFs medium) — so pinning a level is what
+# makes cost predictable. One word in, the provider's constant out.
+RESOLUTION_LEVELS = {"low": "MEDIA_RESOLUTION_LOW",
+                     "medium": "MEDIA_RESOLUTION_MEDIUM",
+                     "high": "MEDIA_RESOLUTION_HIGH"}
+
+
+def resolution_field(level: str | None) -> dict | None:
+    """The `media_resolution` part field, or None when the level is inherited."""
+    if level is None or level == "":
+        return None
+    try:
+        return {"level": RESOLUTION_LEVELS[level]}
+    except KeyError:
+        raise ValueError(f"media resolution must be one of "
+                         f"{sorted(RESOLUTION_LEVELS)} (got {level!r})") from None
+
+
 def file_parts(files) -> list[dict]:
     """`file_data` parts for a request, in the order given."""
-    return [{"file_data": {"mime_type": f.mime, "file_uri": f.uri}} for f in files]
+    parts = []
+    for f in files:
+        part: dict = {"file_data": {"mime_type": f.mime, "file_uri": f.uri}}
+        res = resolution_field(getattr(f, "media_resolution", None))
+        if res:
+            part["media_resolution"] = res
+        parts.append(part)
+    return parts
 
 
 def _file_id(name: str) -> str:
