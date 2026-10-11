@@ -27,7 +27,8 @@ from gemini_router.gemini import GenResult, UploadedFile
     ("ok", None, "", "inconclusive"),
 ])
 def test_capability_verdict(expected, status, answer, verdict):
-    assert monitor.classify(expected, status=status, answer=answer) == verdict
+    assert monitor.classify(expected, status=status, answer=answer,
+                            proof="readable") == verdict
 
 
 class DummyClient:
@@ -51,12 +52,14 @@ class DummyClient:
         self.deleted.append(name)
 
     async def generate(self, key, model, **kwargs):
-        self.calls.append((model, kwargs["file_parts"][0]["file_data"]["mime_type"]))
+        mime = kwargs["file_parts"][0]["file_data"]["mime_type"]
+        self.calls.append((model, mime))
         status = self.statuses[len(self.calls) - 1]
         if status:
             raise GeminiHTTPError("test response", status=status)
-        return GenResult(text="visible", tokens_in=1, tokens_out=1,
-                         finish_reason="STOP")
+        return GenResult(text=(monitor.PDF_MARKER if model == monitor.FLASH or
+                               mime == "application/pdf" else monitor.IMAGE_COLOR),
+                         tokens_in=1, tokens_out=1, finish_reason="STOP")
 
 
 async def test_two_fixtures_four_generations_and_cleanup(tmp_path, monkeypatch):
@@ -82,6 +85,19 @@ async def test_positive_control_failure_stops_before_weak_models(tmp_path):
 
 
 def test_changed_capability_is_a_red_drift():
-    case = monitor.Case("lite/pdf", "lite", "pdf", "blocked")
+    case = monitor.Case("lite/pdf", "lite", "pdf", "blocked", monitor.PDF_MARKER)
     code, body = monitor.summarize([(case, "drift", "answer present")])
     assert code == 1 and "lite/pdf" in body
+
+
+def test_generic_answer_does_not_prove_media_reading():
+    assert monitor.classify("blocked", status=None, answer="I see a PDF",
+                            proof=monitor.PDF_MARKER) == "inconclusive"
+    assert monitor.classify("ok", status=None, answer="Zebra 417",
+                            proof=monitor.PDF_MARKER) == "match"
+    assert monitor.classify("blocked", status=None, answer="GREEN",
+                            proof=monitor.IMAGE_COLOR) == "drift"
+
+
+def test_missing_proof_never_counts_generic_http_200_as_success():
+    assert monitor.classify("blocked", status=None, answer="sure") == "inconclusive"

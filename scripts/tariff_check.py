@@ -26,12 +26,12 @@ MODEL = os.environ.get("DRIFT_MODEL", "gemini-3.6-flash")
 
 
 # ------------------------------------------------------------- fixtures (generated)
-def png(width: int, height: int) -> bytes:
+def png(width: int, height: int, rgb: tuple[int, int, int] = (255, 0, 0)) -> bytes:
     def chunk(tag: bytes, data: bytes) -> bytes:
         return (struct.pack(">I", len(data)) + tag + data
                 + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
     ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    raw = b"".join(b"\x00" + b"\xff\x00\x00" * width for _ in range(height))
+    raw = b"".join(b"\x00" + bytes(rgb) * width for _ in range(height))
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
             + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 

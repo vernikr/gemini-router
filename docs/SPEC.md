@@ -216,7 +216,8 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
   Corollary for measurement: **`countTokens` is lenient** — it accepted a PDF part for lite
   and preview while `generateContent` refused it, so a successful count is a price, never a
   capability proof. The scheduled `capability-check.yml` therefore runs a bounded
-  generateContent canary on a CI key, separate from the free `tariff-drift.yml` count.
+  generateContent canary on a CI key and verifies a hidden PDF marker/image color in
+  the answer (not just HTTP 200), separate from the free `tariff-drift.yml` count.
   Drift is an alert for review, never an automatic change to the production gates;
   see this repo's `docs/worklog/2026.10.11-capability-canary/` for its case matrix.
 

@@ -26,6 +26,8 @@ from gemini_router.gemini import GeminiClient, UploadedFile, file_parts
 FLASH = os.environ.get("CAP_FLASH_MODEL", "gemini-3.6-flash")
 LITE = os.environ.get("CAP_LITE_MODEL", "gemini-3.5-flash-lite")
 GEMMA = os.environ.get("CAP_GEMMA_MODEL", "gemma-4-31b-it")
+PDF_MARKER = "ZEBRA-417"  # appears in the fixture, NEVER in the model prompt
+IMAGE_COLOR = "green"    # fixture color, NEVER in the model prompt
 
 
 @dataclass(frozen=True)
@@ -34,24 +36,34 @@ class Case:
     model: str
     media: str
     expected: str                    # "ok" or "blocked"
+    proof: str                       # must occur in answer for a successful read
 
 
 # Positive controls FIRST, then the documented-vs-measured disagreements. Up to four
 # generateContent calls / week on the dedicated canary key (no repeats on 5xx/429).
 def cases() -> list[Case]:
-    return [Case("flash/pdf", FLASH, "pdf", "ok"),
-            Case("lite/png", LITE, "png", "ok"),
-            Case("lite/pdf", LITE, "pdf", "blocked"),
-            Case("gemma/png", GEMMA, "png", "blocked")]
+    return [Case("flash/pdf", FLASH, "pdf", "ok", PDF_MARKER),
+            Case("lite/png", LITE, "png", "ok", IMAGE_COLOR),
+            Case("lite/pdf", LITE, "pdf", "blocked", PDF_MARKER),
+            Case("gemma/png", GEMMA, "png", "blocked", IMAGE_COLOR)]
 
 
-def classify(expected: str, *, status: int | None, answer: str = "") -> str:
+def classify(expected: str, *, status: int | None, answer: str = "",
+             proof: str = "") -> str:
     """Separate a capability change from an outage or exhausted probe credential.
 
     Only 400/500 are established capability refusals; any 401/403/404/429/503 or
     network failure means 'inconclusive', not evidence of changed media support.
     """
     if status is None and answer.strip():
+        # An HTTP 200 with a generic reply does NOT prove the file was read.
+        if not proof:
+            return "inconclusive"
+        import re
+        plain = re.sub(r"[^a-z0-9]", "", answer.casefold())
+        expected_text = re.sub(r"[^a-z0-9]", "", proof.casefold())
+        if expected_text and expected_text not in plain:
+            return "inconclusive"
         return "match" if expected == "ok" else "drift"
     if status == 400:
         return "match" if expected == "blocked" else "drift"
@@ -65,25 +77,30 @@ async def probe_case(client: GeminiClient, key: str, case: Case,
     up = files[case.media]
     # countTokens is intentionally NOT the verdict: it accepted a PDF on lite even
     # though generateContent rejected that very file. One real generation per case.
+    prompt = ("Read the code PRINTED on the PDF page. Return only the code."
+              if case.media == "pdf" else
+              "What is the dominant color filling this image? Reply with one word.")
     try:
         result = await client.generate(key, case.model,
-                                       prompt="Answer with one word about the file.",
+                                       prompt=prompt,
                                        thinking_level="low", max_output_tokens=1024,
                                        file_parts=file_parts([up]))
     except GeminiHTTPError as e:
         return classify(case.expected, status=e.status), f"HTTP {e.status}"
     except RouterError:
         return "inconclusive", "provider error (not a capability verdict)"
-    return classify(case.expected, status=None, answer=result.text), \
-        ("answer present" if result.text.strip() else "empty answer")
+    verdict = classify(case.expected, status=None, answer=result.text,
+                       proof=case.proof)
+    return verdict, ("content verified" if verdict != "inconclusive" else
+                     "answer did not verify file content")
 
 
 async def check(client: GeminiClient, key: str, fixture_dir: Path,
                 matrix: list[Case]) -> list[tuple[Case, str, str]]:
     files: dict[str, UploadedFile] = {}
     fixture_dir.mkdir(parents=True, exist_ok=True)
-    fixtures = {"png": ("image/png", png(8, 8)),
-                "pdf": ("application/pdf", one_page_pdf("capability canary"))}
+    fixtures = {"png": ("image/png", png(64, 64, rgb=(0, 160, 0))),
+                "pdf": ("application/pdf", one_page_pdf(PDF_MARKER))}
     try:
         for media in dict.fromkeys(c.media for c in matrix):
             mime, blob = fixtures[media]
