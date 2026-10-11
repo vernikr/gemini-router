@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
 from gemini_router.cli import main
+from gemini_router.ledger import Ledger
 
 
 @pytest.fixture
@@ -24,6 +26,23 @@ def test_quota_json(capsys):
     assert len(rows) >= 4                                      # chain models × 2 keys
     assert rows[0]["rpd_left"] == rows[0]["rpd_limit"]
     assert sum(1 for r in rows if r["recommended"]) == 1
+
+
+@pytest.mark.usefixtures("env")
+def test_quota_table_and_drift_line(env, capsys):
+    """The rich-table path renders and survives its own row loop (the loop variable
+    once shadowed the router and crashed the drift check), and shows the drift line
+    once the table has been missing."""
+    assert main(["quota"]) == 0
+    out = capsys.readouterr().out
+    assert "Gemini quota" in out and "tariff drift" not in out
+
+    Ledger(os.environ["GEMINI_ROUTER_STATE"]).record_drift(
+        key_id="k1", model="gemini-3.8-flash", media_cls="image", level="high",
+        predicted=1089, measured=2000)
+    assert main(["quota"]) == 0
+    out = capsys.readouterr().out
+    assert "tariff drift" in out and "image/high" in out and "2000" in out
 
 
 @pytest.mark.usefixtures("env")

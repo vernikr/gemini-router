@@ -50,18 +50,18 @@ def cmd_quota(args, cfg: Config | None = None) -> int:
     t = Table(title="Gemini quota (per key×model)", title_style="bold cyan", expand=True)
     for col in ("key", "model", "RPD left", "RPM win", "TPM win", "cooldown", "next"):
         t.add_column(col)
-    for r in rows:
-        wait = f"{r['wait_s']:.0f}s ({r['reason']})" if r["wait_s"] > 0 else "—"
-        style = "green" if r["rpd_left"] > 0 and r["wait_s"] <= 0 else (
-            "yellow" if r["rpd_left"] > 0 else "red")
-        rpm_w = wait if r["reason"] == "rpm" else ""
-        tpm_w = wait if r["reason"] == "tpm" else ""
-        t.add_row(r["key_id"], f"[{style}]{r['model']}[/{style}]",
-                  f"{r['rpd_left']}/{r['rpd_limit']}",
-                  f"{r['rpm_used']}/{r['rpm_limit']} {rpm_w}".strip(),
-                  f"{r['tpm_used']}/{r['tpm_limit']} {tpm_w}".strip(),
-                  iso(r["cooldown_until"])[:19] if r["cooldown_until"] else "—",
-                  "★" if r["recommended"] else "")
+    for row in rows:
+        wait = f"{row['wait_s']:.0f}s ({row['reason']})" if row["wait_s"] > 0 else "—"
+        style = "green" if row["rpd_left"] > 0 and row["wait_s"] <= 0 else (
+            "yellow" if row["rpd_left"] > 0 else "red")
+        rpm_w = wait if row["reason"] == "rpm" else ""
+        tpm_w = wait if row["reason"] == "tpm" else ""
+        t.add_row(row["key_id"], f"[{style}]{row['model']}[/{style}]",
+                  f"{row['rpd_left']}/{row['rpd_limit']}",
+                  f"{row['rpm_used']}/{row['rpm_limit']} {rpm_w}".strip(),
+                  f"{row['tpm_used']}/{row['tpm_limit']} {tpm_w}".strip(),
+                  iso(row["cooldown_until"])[:19] if row["cooldown_until"] else "—",
+                  "★" if row["recommended"] else "")
     console.print(t)
     if line := _drift_line(r.ledger):
         console.print(f"[yellow]tariff drift: {line}[/yellow]")
