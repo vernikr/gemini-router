@@ -226,14 +226,24 @@ async def test_pinned_unavailable_raises(mock_api, tmp_path):
         await r.complete(req("p", model="gemini-9.9-flash"))
 
 
+def _key_and_transport(request: httpx.Request) -> tuple[str, str]:
+    """Which key a request carried, and over which transport (keyauth rotates them)."""
+    if "x-goog-api-key" in request.headers:
+        return request.headers["x-goog-api-key"], "header"
+    if "key" in request.url.params:
+        return request.url.params["key"], "query"
+    return request.headers.get("authorization", "").removeprefix("Bearer "), "bearer"
+
+
 async def test_refused_key_falls_through_to_the_next_key(mock_api, tmp_path):
-    """A 401 means the KEY is dead, not the model: the pool keeps going and the dead
-    key is not retried for later models either."""
-    seen: list[str] = []
+    """A 401 means the KEY is dead, not the model. Each transport is offered once first
+    (a key generation that wants a different transport must get its chance), then the pool
+    moves on — and the dead key is not retried for later models either."""
+    seen: list[tuple[str, str]] = []
 
     def gen(request):
-        key = request.headers["x-goog-api-key"]
-        seen.append(key)
+        key, transport = _key_and_transport(request)
+        seen.append((key, transport))
         if key == "k1":
             return httpx.Response(401, json={"error": {"message": "API key not valid"}})
         return gen_resp("ok")
@@ -242,7 +252,30 @@ async def test_refused_key_falls_through_to_the_next_key(mock_api, tmp_path):
     r = Router(make_config(tmp_path, api_keys=["k1", "k2"], chain=[M8, M7]))
     res = await r.complete(req("hi", wait=False))
     assert res.text == "ok" and res.key_id == key_id("k2")
-    assert seen == ["k1", "k2"]              # k1 refused once, never retried on M7
+    assert seen == [("k1", "header"), ("k1", "query"), ("k1", "bearer"),
+                    ("k2", "header")]        # k1 exhausted its transports, never retried
+    await r.aclose()
+
+
+async def test_key_that_needs_another_transport_still_serves(mock_api, tmp_path):
+    """A pool member whose surface refuses the standard header is not a dead key: the
+    client finds the transport that works, remembers it, and the router serves normally."""
+    key = "AQ.DUMMYrouter_transport_key_0000000000"
+    seen: list[str] = []
+
+    def gen(request):
+        _, transport = _key_and_transport(request)
+        seen.append(transport)
+        if transport == "header":
+            return httpx.Response(401, json={"error": {"message":
+                                  "Request had invalid authentication credentials."}})
+        return gen_resp("via-transport")
+
+    mock_api.post(url__regex=r".*:generateContent").mock(side_effect=gen)
+    r = Router(make_config(tmp_path, api_keys=[key], chain=[M8]))
+    res = await r.complete(req("hi", wait=False))
+    assert res.text == "via-transport" and res.key_id == key_id(key)
+    assert seen == ["header", "query"]       # one rotation, then the request succeeded
     await r.aclose()
 
 

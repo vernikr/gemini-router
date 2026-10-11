@@ -346,8 +346,10 @@ class Router:
 
         if dead_keys and len(dead_keys) == len({key_id(k) for k in self.cfg.api_keys}):
             raise RouterError(
-                "every configured API key was rejected by the provider (HTTP 401) — "
-                "rotate GEMINI_API_KEYS / GEMINI_API_KEY_1..10, then retry")
+                "every configured API key was rejected by the provider (HTTP 401, or a "
+                "leaked-key block) — delete the dead keys in the console and add fresh "
+                "ones: `gemini-mcp keys` shows the pool, `gemini-mcp keys add <key>` "
+                "validates and installs one without touching the unit file by hand")
         if pins and not failures:
             raise RouterError(
                 f"no request pinning a file could run: key(s) {sorted(pins)} cannot serve "

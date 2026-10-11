@@ -26,6 +26,19 @@ class GeminiHTTPError(RouterError):
         self.key_rejected = key_rejected  # this key must not be retried in this request
 
 
+class KeyLeakedError(GeminiHTTPError):
+    """The provider refused the key because it was reported as leaked. No transport helps
+    and no retry helps: delete the key in the console and add a fresh one. The router
+    treats it as a key rejection, so failover moves on to the next key — and when every
+    key answers this way, the operator reads the cause instead of a file-upload failure,
+    which is exactly how a pool-wide outage stayed invisible on 2026-10-11."""
+
+    def __init__(self, message: str, **kw):
+        kw.setdefault("key_rejected", True)
+        kw.setdefault("switch_model", True)
+        super().__init__(message, **kw)
+
+
 class FileUploadFailed(RouterError):
     """The provider marked the upload FAILED, or answered the lifecycle incoherently."""
 

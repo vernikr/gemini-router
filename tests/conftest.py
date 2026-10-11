@@ -4,7 +4,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from gemini_router import Config
+from gemini_router import Config, keyauth
 
 BASE = "https://generativelanguage.googleapis.com/v1beta"
 MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash",
@@ -56,6 +56,15 @@ def route(respx_mock, model: str, resp):
     r = respx_mock.post(f"{BASE}/models/{model}:generateContent")
     r.mock(side_effect=resp if isinstance(resp, list) else lambda request: resp)
     return r
+
+
+@pytest.fixture(autouse=True)
+def _fresh_transport_memory():
+    """keyauth remembers the transport that worked per key fingerprint — process-wide
+    state by design (the daemon benefits), so tests must not inherit it."""
+    keyauth.reset()
+    yield
+    keyauth.reset()
 
 
 @pytest.fixture

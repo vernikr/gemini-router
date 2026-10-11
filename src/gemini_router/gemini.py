@@ -1,6 +1,8 @@
 """Async Gemini API client (v1beta REST). Gemini 3.x rules (docs/01 §3.1):
 thinkingConfig.thinkingLevel instead of thinking_budget; temperature/top_p stripped for
-3.x models. Key goes in the x-goog-api-key header, never in the URL (log hygiene).
+3.x models. Keys travel over the transport that suits them (`keyauth`): the standard
+x-goog-api-key header by default — never in the URL, for log hygiene — with the query and
+bearer forms as fallbacks for key generations whose surface demands them.
 
 File input (spec: docs/SPEC.md §8): resumable upload to `upload_base_url`, then a
 `file_data` part in generateContent. The blob is streamed in chunks and never held twice
@@ -17,6 +19,7 @@ from pathlib import Path
 
 import httpx
 
+from . import keyauth
 from .config import Config
 from .errors import (
     KEY_REJECT_STATUS,
@@ -25,6 +28,7 @@ from .errors import (
     FileNotReady,
     FileUploadFailed,
     GeminiHTTPError,
+    KeyLeakedError,
     RouterError,
 )
 
@@ -98,9 +102,31 @@ class GeminiClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    @staticmethod
-    def _headers(key: str) -> dict:
-        return {"x-goog-api-key": key, "content-type": "application/json"}
+    async def _authed(self, method: str, url: str, *, key: str,
+                      headers: dict | None = None, params: dict | None = None,
+                      **kw) -> httpx.Response:
+        """One request as `key`, over whichever transport that key speaks.
+
+        Starts with the transport that last worked for this key (for the ordinary
+        AIza… key that is the standard header, so nothing about the common path changes),
+        and rotates only when the provider answers an auth-shaped refusal — then the
+        winner is remembered for the process. A leaked-key block ends the rotation
+        immediately: no transport resurrects a revoked credential, and the caller's
+        classifier turns it into KeyLeakedError."""
+        resp: httpx.Response | None = None
+        for transport in keyauth.attempts_for(key):
+            resp = await self._client.request(
+                method, url,
+                headers=keyauth.merge_headers(headers, key, transport),
+                params=keyauth.merge_params(params, key, transport), **kw)
+            if resp.status_code < 400:
+                keyauth.remember(key, transport)
+                return resp
+            if keyauth.leaked(resp.status_code, resp.text):
+                return resp                      # a revoked key: the classifier says so
+            if not keyauth.auth_failure(resp.status_code, resp.text):
+                return resp
+        return resp
 
     # ------------------------------------------------------------- files (SPEC §8)
     async def upload_file(self, key: str, path: str | Path, *, mime: str | None = None,
@@ -112,12 +138,12 @@ class GeminiClient:
         path = Path(path)
         size = path.stat().st_size
         mime = mime or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        start = await self._client.post(
-            f"{self.cfg.upload_base_url}/files", headers=self._headers(key) | {
-                "X-Goog-Upload-Protocol": "resumable",
-                "X-Goog-Upload-Command": "start",
-                "X-Goog-Upload-Header-Content-Length": str(size),
-                "X-Goog-Upload-Header-Content-Type": mime},
+        start = await self._authed(
+            "POST", f"{self.cfg.upload_base_url}/files", key=key,
+            headers={"X-Goog-Upload-Protocol": "resumable",
+                     "X-Goog-Upload-Command": "start",
+                     "X-Goog-Upload-Header-Content-Length": str(size),
+                     "X-Goog-Upload-Header-Content-Type": mime},
             json={"file": {"display_name": display_name or path.name}}, timeout=timeout_s)
         if start.status_code >= 400:
             raise self._classify(start)
@@ -137,8 +163,7 @@ class GeminiClient:
         return UploadedFile.from_api(info, mime=mime, fallback_size=size)
 
     async def file_state(self, key: str, name: str) -> UploadedFile:
-        r = await self._client.get(f"{self.cfg.base_url}/files/{_file_id(name)}",
-                                   headers=self._headers(key))
+        r = await self._authed("GET", f"{self.cfg.base_url}/files/{_file_id(name)}", key=key)
         if r.status_code >= 400:
             raise self._classify(r)
         info = (r.json() or {}) or {}
@@ -170,9 +195,8 @@ class GeminiClient:
         res = resolution_field(media_resolution)
         if res:
             part["media_resolution"] = res
-        r = await self._client.post(
-            f"{self.cfg.base_url}/models/{model}:countTokens", headers=self._headers(key),
-            json={"contents": [{"parts": [part]}]})
+        r = await self._authed("POST", f"{self.cfg.base_url}/models/{model}:countTokens",
+                               key=key, json={"contents": [{"parts": [part]}]})
         if r.status_code >= 400:
             raise self._classify(r)
         return int((r.json() or {}).get("totalTokens") or 0)
@@ -180,8 +204,7 @@ class GeminiClient:
     async def delete_file(self, key: str, name: str) -> None:
         """Best-effort tidy-up when the caller drops its blob. A missing file is a
         success: the provider expires them on its own."""
-        r = await self._client.delete(f"{self.cfg.base_url}/files/{_file_id(name)}",
-                                      headers=self._headers(key))
+        r = await self._authed("DELETE", f"{self.cfg.base_url}/files/{_file_id(name)}", key=key)
         if r.status_code >= 400 and r.status_code != 404:
             raise self._classify(r)
 
@@ -193,8 +216,7 @@ class GeminiClient:
             params: dict = {"pageSize": 1000}
             if page_token:
                 params["pageToken"] = page_token
-            r = await self._client.get(f"{self.cfg.base_url}/models",
-                                       headers=self._headers(key), params=params)
+            r = await self._authed("GET", f"{self.cfg.base_url}/models", key=key, params=params)
             if r.status_code >= 400:
                 raise RouterError(f"listModels HTTP {r.status_code}: {r.text[:200]}")
             data = r.json()
@@ -207,8 +229,8 @@ class GeminiClient:
 
     async def count_tokens(self, key: str, model: str, prompt: str) -> int:
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
-        r = await self._client.post(f"{self.cfg.base_url}/models/{model}:countTokens",
-                                    headers=self._headers(key), json=payload)
+        r = await self._authed("POST", f"{self.cfg.base_url}/models/{model}:countTokens",
+                               key=key, json=payload)
         if r.status_code >= 400:
             raise self._classify(r)
         return int(r.json().get("totalTokens", 0))
@@ -230,8 +252,8 @@ class GeminiClient:
                          "generationConfig": gen}
         if system:
             payload["systemInstruction"] = {"parts": [{"text": system}]}
-        r = await self._client.post(f"{self.cfg.base_url}/models/{model}:generateContent",
-                                    headers=self._headers(key), json=payload)
+        r = await self._authed("POST", f"{self.cfg.base_url}/models/{model}:generateContent",
+                               key=key, json=payload)
         if r.status_code >= 400:
             raise self._classify(r)
         data = r.json()
@@ -263,6 +285,11 @@ class GeminiClient:
             quota_minute = not quota_day
             if retry_after is None:
                 retry_after = 60.0
+        if keyauth.leaked(status, resp.text):
+            return KeyLeakedError(
+                f"HTTP {status}: {body} — the provider has this key on its leaked list; "
+                f"delete it in the console (or AI Studio) and add a fresh one: "
+                f"`gemini-mcp keys add <new key>`", status=status)
         key_rejected = status in KEY_REJECT_STATUS
         retryable = status in RETRYABLE_STATUS or (status == 429 and quota_minute)
         switch = (status in MODEL_SWITCH_STATUS or (status == 429 and quota_day)

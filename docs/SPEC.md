@@ -171,7 +171,10 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
   only (no spend implication).
 - **Refused keys:** HTTP 401 marks the *key* dead, not the model — the key is dropped for
   the rest of the request and the pool continues; if every configured key is refused the
-  error says so and names the remedy.
+  error says so and names the remedy. A key the provider blocked as *leaked* arrives as
+  `KeyLeakedError` (a `GeminiHTTPError` subclass, same failover semantics): retrying or
+  switching transports cannot help a revoked credential, and the operator needs the cause
+  in front of them, not a generic upload failure.
 - `extract_json`: when several JSON candidates match, the earliest starting in the text
   wins (fixes nested `{…[…]…}` extraction).
 - **Token estimate is script-aware.** `estimate_tokens` classifies characters and divides
@@ -201,3 +204,30 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
   script can act without parsing prose: `3` no API keys, `4` state file unusable,
   `5` no configured chain model reachable on any key. `gemini-mcp` passes these through
   and adds `6` for an unwritable log directory.
+
+## 10. Keys and transports (`keyauth`)
+
+Google issues two shapes of Gemini API key today — classic `AIzaSy…` (Standard, Cloud
+Console) and newer `AQ.…` (Auth, AI Studio) — and has changed more than once which surface
+accepts which shape or transport. The library therefore does not assume: every provider
+call goes through `keyauth`, which carries an ordered transport list and starts with the
+one that last worked for that key.
+
+| transport | wire form | when |
+|---|---|---|
+| `header` (default) | `x-goog-api-key: <key>` | everything the library did before — the common path adds no calls |
+| `query` | `?key=<key>` | fallback for surfaces that refuse the header |
+| `bearer` | `Authorization: Bearer <key>` | fallback for surfaces that expect a token |
+
+Rules:
+- **The provider's answer decides, not the key's shape.** A 401 always triggers the next
+  transport; a 400/403 does so only when its body talks about keys/credentials, so a
+  model-permission 403 still means "switch model" and costs nothing extra.
+- **The winner is remembered per key** (process-local, keyed by fingerprint): after one
+  rotation a key costs exactly one request per call, as before.
+- **A leaked-key block is never rotated** — see §9 — and `probe_key()` reports it plainly.
+- `probe_key(key, base_url)` (sync, free: `listModels`) is the same logic for CLIs, so
+  `keys add` / `keys list --check` show the transport the daemon will use. No second
+  implementation to drift.
+- Log hygiene: the default transport keeps keys out of URLs; while a `query`-transport key
+  is in the pool, keep the frontend's log level at INFO (httpx prints URLs at DEBUG).

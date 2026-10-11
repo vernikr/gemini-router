@@ -32,3 +32,13 @@ with functional changes). Repo-specific rules:
 - No counters in evergreen docs: no version numbers, dates, test counts or "N green"
   claims. They go stale silently and every one of them is a fact somebody must guard.
   Keep only what a reader cannot get from `pyproject.toml`, `--version` or `pytest`.
+
+## Secrets
+
+Never write a real key or token into any file here — not even a test fixture, not even
+"just for a moment": this repository is public and its sdist ships `tests/`. Fixtures use
+real-looking shapes carrying the marker word `DUMMY`; `scripts/check_secrets.py` runs
+before lint in CI and in the release pipeline and fails on any credential-shaped literal
+without that marker. History: 2026-10-11, two real Gemini keys went into a public test file
+of the sibling repo while the author was writing fixture strings (incident report:
+gemini-mcp `docs/worklog/2026.10.11-secret-in-tests/`).
