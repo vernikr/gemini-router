@@ -28,3 +28,7 @@ Keep the rollout stable. After quota reset, the scheduled CI canary (which uses 
 DIFFERENT repo secret) can test a second account; if it verifies the hidden code,
 review a per-key capability policy or a narrowly opt-in Lite/PDF fallback with an
 agent-visible ⚠️. Do not automatically rewrite the matrix based on HTTP 200 alone.
+
+Published as documentation/comment-only router patch 0.3.4: 115 tests, ruff and
+secrets guard green; release test/PyPI jobs green. The gateway's deployed routing
+behavior is unchanged.
