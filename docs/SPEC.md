@@ -35,7 +35,7 @@ router = Router.from_env()            # env + optional GEMINI_ROUTER_CONFIG yaml
 res: RouterResult = await router.complete(
     RouterRequest(
         prompt=str, system=str | None = None,
-        thinking_level="low|medium|high" = "high",
+        thinking_level="low|medium|high" = "medium",
         output_format="text|json" = "text",
         max_output_tokens=8192,
         kind="single|chunk|consolidate|count" = "single",

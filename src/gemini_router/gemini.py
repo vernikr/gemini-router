@@ -87,7 +87,7 @@ class GeminiClient:
         return int(r.json().get("totalTokens", 0))
 
     async def generate(self, key: str, model: str, *, prompt: str, system: str | None = None,
-                       thinking_level: str | None = "high", output_format: str = "text",
+                       thinking_level: str | None = "medium", output_format: str = "text",
                        max_output_tokens: int = 8192) -> GenResult:
         gen: dict = {"maxOutputTokens": max_output_tokens}
         if output_format == "json":

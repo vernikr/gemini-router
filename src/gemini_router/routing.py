@@ -27,7 +27,7 @@ Emitter = Callable[[RouterEvent], None]
 class RouterRequest:
     prompt: str
     system: str | None = None
-    thinking_level: str | None = "high"     # low|medium|high; None omits thinkingConfig
+    thinking_level: str | None = "medium"   # low|medium|high; None omits thinkingConfig
     output_format: str = "text"             # text|json
     max_output_tokens: int | None = None    # None → cfg.max_output_tokens_default
     kind: str = "single"                    # single|chunk|consolidate|count
