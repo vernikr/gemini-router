@@ -53,16 +53,30 @@ Because measurement is free and present on every file call, the forecast can be 
 2. **Server-side flag (on demand).** A per-(class, level, model) rolling counter in the
    ledger (`kind='drift'`, non-spending); `gemini-mcp doctor` and `quota` print one line when
    the recent miss rate crosses a threshold. This is what a debugging session reads.
-3. **Scheduled release-time check (durable, and it emails).** A small workflow (`schedule:`
-   weekly + on release) uploads three fixtures — tiny image, 384 px image, 1-page text PDF —
-   and calls `countTokens` on each (free, no RPD), then diffs against the table and fails on
-   drift. **A red workflow is the email**: GitHub already notifies on failed runs, so there is
-   no SMTP path to configure on the VPS, no new credential, and the failure lands in a channel
-   the owner already reads. The check needs one API key as a repo secret (a dedicated spare
-   account is fine — key pool from the `keys` command can supply it).
+3. **Scheduled check with a real email (durable), run from GitHub Actions.** A small workflow
+   (`schedule:` weekly + on release) uploads three fixtures — tiny image, 384 px image, 1-page
+   text PDF — and calls `countTokens` on each (free, no RPD), then diffs against the table and
+   fails on drift. Two notification channels, both already proven in the owner's setup:
+   **the mail path is Gmail SMTP from GitHub Actions** — the same one `tldr-digest` uses
+   (`GMAIL_ADDRESS` / `GMAIL_APP_PASSWORD` / `MAIL_TO` secrets, cron in a workflow), so the
+   drift alert is an ordinary email with the numbers in the subject line; and independently,
+   **a red workflow run** is itself the fallback signal, since GitHub notifies on failures.
+   Correction (owner, 2026-10-11): an earlier draft of this plan said "no mail path exists" —
+   that was wrong. The *VPS* has no MTA (verified: no Postfix/exim unit, nothing listening on
+   25/587), but mail never needed the VPS: it goes out from Actions over Gmail SMTP. The
+   check needs one API key as a repo secret (a dedicated spare account is fine; the `keys`
+   command can manage its pool like any other host).
 
-Why not email straight from the VPS: no mail path exists there, and adding one (SMTP relay +
-credential + its own failure mode) buys nothing the workflow channel does not already give.
+## A second input for the packer (measured 2026-10-11 evening)
+
+Packing groups of files needs to know **which models can read files at all**, because the
+budget is per key × model and only some models accept a Files API part: `gemini-3.5-flash-lite`
+answered 500, `gemini-3-flash-preview` and `gemma-4-31b-it` answered 400, while the same part
+served fine on `gemini-3.6-flash`/`3.8-flash`. Consequence for this design: the forecast table
+is only half of the prediction — the packer must also predict **which model will serve the
+group**, and a model outside the file-capable set cannot be a packing target at all. The
+library enforces this since 0.1.15 (`file_capable_models`, plus a learned per-process set); the
+packer should treat the capable set as its candidate list, not the whole chain.
 
 ## Rules kept
 
