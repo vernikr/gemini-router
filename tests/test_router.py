@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from conftest import BASE, gen_resp, make_config, r429_day, r429_minute, route
+from conftest import BASE, MODELS, gen_resp, make_config, r429_day, r429_minute, route
 from gemini_router import QuotaExhaustedError, Router, RouterError, RouterRequest
 from gemini_router.config import key_id
 
@@ -259,3 +259,29 @@ async def test_whole_pool_refused_names_the_fix(mock_api, tmp_path):
 
 def test_quota_exhausted_message_has_no_dangling_separator():
     assert str(QuotaExhaustedError([], "eta")) == "quota exhausted"
+
+
+async def test_routing_asks_for_the_model_list_once(tmp_path, respx_mock):
+    """Every key on one account tier gets the same model list, so probing N keys buys
+    nothing. 3.4: this was one round trip per key on a path that runs per request."""
+    calls = {"n": 0}
+
+    def _count(request):
+        calls["n"] += 1
+        return httpx.Response(200, json={"models": [{"name": f"models/{m}"}
+                                                   for m in MODELS]})
+
+    respx_mock.get(f"{BASE}/models").mock(side_effect=_count)
+    cfg = make_config(tmp_path, api_keys=["k1", "k2", "k3", "k4"], models_refresh_h=0)
+    r = Router(cfg)
+    try:
+        avail = await r.availability()
+        assert calls["n"] == 1                        # one probe, not four
+        assert set(avail) == {key_id(k) for k in cfg.api_keys}
+        assert all(v is not None for v in avail.values())   # every key still answered
+
+        per = await r.availability_per_key()          # the setup/doctor question
+        assert calls["n"] == 5                        # one per key, as asked
+        assert set(per) == set(avail)
+    finally:
+        await r.aclose()

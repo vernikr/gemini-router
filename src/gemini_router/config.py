@@ -9,8 +9,10 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field
 
-DEFAULT_CHAIN = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
-                 "gemini-3.5-flash", "gemini-3-flash-preview"]
+# Deprecated ids are left out even though the API still lists them: gemini-3.5-flash
+# and gemini-3.7-flash are aliases now, every call redirects to 3.6 and 3.8. Routing to
+# an alias means paying for a model nobody can select.
+DEFAULT_CHAIN = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3-flash-preview"]
 DEFAULT_OVERFLOW = ["gemini-3.5-flash-lite", "gemma-auto"]
 
 

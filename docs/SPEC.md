@@ -125,11 +125,22 @@ push/PR. Conventional Commits.
   answer 429. Inputs above `sample_chars` are estimated from a scaled head+tail sample,
   so cost stays flat at ~5 ms regardless of document size. Setting `chars_per_token`
   restores the single-divisor behaviour.
+- **One `listModels` call, not one per key.** The model list is a property of the
+  account tier, so every key on one plan gets the same answer; `availability()` probes
+  the first key and applies the answer to the rest. `availability_per_key()` is the
+  separate question "does *this* key work", used by `doctor`, `models` and the setup
+  wizard. A key is never marked dead by a failed `listModels` — refusing a key is
+  `generateContent`'s job, and one key's failure says nothing about the others.
 - Ledger statuses: `planned|ok|quota|http4xx|http5xx|network|blocked|skipped`;
   RPD-conservative set = `ok,quota,http5xx,blocked` plus in-flight `planned` rows (D3).
   An in-flight request counts as spent so processes sharing one state file cannot all
   clear the day's gate; rows older than `planned_ttl_s` are abandoned attempts and stop
   counting, so a caller that died mid-request does not eat a day's budget forever.
+- **Deprecated model ids stay out of the chain.** `gemini-3.5-flash` redirects to
+  `gemini-3.6-flash` and `gemini-3.7-flash` to `gemini-3.8-flash`; both aliases are
+  still listed by `listModels`, so a chain built from that list would route to models
+  nobody can select and charge the alias's own budget for traffic that lands elsewhere.
+  The chain is the account's real options, newest first.
 - CLI exit codes: `0` ok · `2` config/usage error · `doctor` names its failure so a
   script can act without parsing prose: `3` no API keys, `4` state file unusable,
   `5` no configured chain model reachable on any key. `gemini-mcp` passes these through

@@ -58,7 +58,11 @@ def cmd_models(args, cfg: Config | None = None) -> int:
     async def _run() -> dict:
         r = _router(cfg)
         try:
-            return await r.availability() if not args.offline else {}
+            if args.offline:
+                return {}
+            # per-key: the output has a per_key section, which a shared probe would
+            # fill with one answer copied N times.
+            return await r.availability_per_key()
         finally:
             await r.aclose()
     avail = asyncio.run(_run())
@@ -152,7 +156,9 @@ def cmd_doctor(args, cfg: Config | None = None) -> int:
         nonlocal live, chain_live
         r = _router(cfg)
         try:
-            for kid, models in (await r.availability()).items():
+            # per-key: doctor reports each key separately, and one shared probe would
+            # print the same answer N times as though each key had been checked.
+            for kid, models in (await r.availability_per_key()).items():
                 if models is None:
                     console.print(f"  [yellow]key {kid}: listModels failed "
                                   "(offline, or the key is refused)[/yellow]")

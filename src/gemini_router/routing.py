@@ -133,16 +133,45 @@ class Router:
 
     # ------------------------------------------------------------------ info
     async def availability(self) -> dict[str, set[str] | None]:
-        """key_id → live model set (None = listModels failed → trust config, b04)."""
+        """key_id → live model set (None = listModels failed → trust config, b04).
+
+        One call, not one per key: the model list is a property of the account tier, and
+        every key on one plan gets the same answer, so asking N times buys nothing and
+        costs N round trips on a path that runs per request. The result is still keyed
+        per key so callers keep their shape, and a key whose own liveness matters
+        (setup, doctor) can pass `per_key=True`.
+        """
+        return await self._availability(per_key=False)
+
+    async def availability_per_key(self) -> dict[str, set[str] | None]:
+        """The same probe against every key separately — for checking that each key
+        works at all, which is a different question from what models exist."""
+        return await self._availability(per_key=True)
+
+    async def _availability(self, *, per_key: bool) -> dict[str, set[str] | None]:
         now = self._now()
         if self._avail and now - self._avail[0] < self.cfg.models_refresh_h * 3600:
             return self._avail[1]
+        if not self.cfg.api_keys:
+            self._avail = (now, {})
+            return self._avail[1]
         per: dict[str, set[str] | None] = {}
-        for key in self.cfg.api_keys:
+        keys = self.cfg.api_keys if per_key else self.cfg.api_keys[:1]
+        models: set[str] | None = None
+        for key in keys:
             try:
-                per[key_id(key)] = await self.client.list_models(key)
+                models = await self.client.list_models(key)
             except Exception:  # noqa: BLE001 — offline is survivable (D-b04)
-                per[key_id(key)] = None
+                models = None
+            per[key_id(key)] = models
+            if models is not None and not per_key:
+                break
+        if not per_key:
+            # Every other key gets the same answer: same account tier, same list. A key
+            # is not marked dead here — refusing a key is generateContent's job (2.1),
+            # and listModels failing on one says nothing about the others.
+            for key in self.cfg.api_keys:
+                per.setdefault(key_id(key), models)
         self._avail = (now, per)
         return per
 
