@@ -74,10 +74,10 @@ await router.delete_file(up.name)                                 # best-effort
 ```
 
 `media_resolution` sets how hard the provider looks at the media, independently of the
-model's thinking level, and it is the cost lever: measured on `gemini-3.6-flash` (2026-10-11,
-free `countTokens`), an image costs 256 / 529 / 1089 tokens and a PDF page 280 / 560 / 1120
-at low / medium / high — flat per level, independent of pixel count and of byte size, with
-the provider default differing per media type (images high, PDFs medium). Pass the SAME
+model's thinking level, and it is the cost lever: the per-level prices, the provider
+defaults and their dated provenance live in ONE table — `gemini_router.tariffs.MEDIA_TARIFFS`
+(flat per level, independent of pixel count and byte size; the default differs per class).
+Docs restate none of the numbers. Pass the SAME
 level to the count and to the request: measuring at one level and sending at another makes
 the TPM gate and the ledger disagree, which is why `with_resolution()` exists rather than a
 loose keyword.
@@ -93,6 +93,21 @@ key cannot serve says so, and the caller re-uploads from its own blob.
 Errors: `QuotaExhaustedError` carries the machine-readable payload
 (per-model rpd_left/rpm_wait_s/tpm_wait_s/cooldown_until, reset_eta_pt, hint) — frontends
 surface it as-is. `RouterError` base for everything else (network, http 4xx, parse).
+
+### Tariff forecast and drift (wave 1)
+
+`forecast_media_tokens(mime, *, pages=1, level=None)` is the planning number BEFORE any
+provider round-trip — feasibility, packing math, cost previews. The prices come from the
+single `MEDIA_TARIFFS` table (dated provenance in the module); `level` None/"" means the
+provider default (`DEFAULT_LEVEL`, per class); audio/video raise `TariffNotMeasured` until
+measured. The forecast never replaces measurement: `countTokens` is free and every
+provider-path request keeps measuring.
+
+`check_drift(predicted, measured)` → `{predicted, measured, pct}` when the miss exceeds
+max(5 %, 50 tokens), else None. Hosts turn that into a `meta.cost.drift` field and a
+`Ledger.record_drift(...)` row — kind='drift', counted by no gate, read back via
+`drift_recent()`; `doctor` and `quota` print one line while misses are recent. A miss is
+the signal to re-measure the table, never an error: the request ran on the measured number.
 
 ## 3. Ledger (SQLite, `GEMINI_ROUTER_STATE`, default `/opt/apps/shared/gemini-router/state.db`)
 

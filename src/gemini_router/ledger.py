@@ -14,6 +14,7 @@ Accounting rules (D3, FR-C2/C7):
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -24,7 +25,8 @@ from zoneinfo import ZoneInfo
 
 RPD_STATUSES = ("ok", "quota", "http5xx", "blocked")            # conservative: 429 counts as spent
 WINDOW_STATUSES = RPD_STATUSES + ("planned",)
-NON_SPENDING_KINDS = ("count", "upload")     # provider calls that never draw on model quotas
+# 'drift' is a tariff-forecast miss note, not a provider call at all — same exclusion.
+NON_SPENDING_KINDS = ("count", "upload", "drift")
 SPENDS = "kind NOT IN ({})".format(",".join(f"'{k}'" for k in NON_SPENDING_KINDS))
 # An upload belongs to a key, not a model, but the column is NOT NULL and feeds per-model
 # filters. A sentinel no model id can equal.
@@ -131,6 +133,34 @@ class Ledger:
                 (now, iso(now), request_id, source, "upload", key_id, FILE_ROW_MODEL,
                  "ok", 200, latency_ms, nbytes))
             return int(cur.lastrowid)
+
+    def record_drift(self, *, key_id: str, model: str, media_cls: str, level: str,
+                     predicted: int, measured: int, source: str = "cli",
+                     now: float | None = None) -> int:
+        """A tariff forecast missed: kind='drift', counted by no gate, so honesty about
+        the table costs nothing. class/level/predicted ride in quota_error as JSON."""
+        now = now or time.time()
+        detail = json.dumps({"class": media_cls, "level": level, "predicted": predicted})
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO calls(ts,ts_iso,source,kind,key_id,model,status,tokens_in,"
+                "quota_error) VALUES(?,?,?,?,?,?,?,?,?)",
+                (now, iso(now), source, "drift", key_id, model, "drift", measured, detail))
+            return int(cur.lastrowid)
+
+    def drift_recent(self, hours: float = 24, now: float | None = None) -> list[dict]:
+        """Newest first; the doctor/quota one-line drift signal reads this."""
+        since = (now or time.time()) - hours * 3600
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts, key_id, model, tokens_in, quota_error FROM calls "
+                "WHERE kind='drift' AND ts>=? ORDER BY ts DESC", (since,)).fetchall()
+        out = []
+        for r in rows:
+            d = json.loads(r["quota_error"] or "{}")
+            out.append({"ts": r["ts"], "key_id": r["key_id"], "model": r["model"],
+                        "measured": r["tokens_in"], **d})
+        return out
 
     def rpd_spent(self, key_id: str, model: str, day_start: float,
                   roll_start: float, planned_min: float | None = None) -> tuple[int, int]:

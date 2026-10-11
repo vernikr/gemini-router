@@ -28,9 +28,22 @@ def _router(cfg: Config) -> Router:
     return Router(cfg, ledger=Ledger(cfg.state_path))
 
 
+def _drift_line(ledger: Ledger) -> str | None:
+    """One line when the tariff table has been missing: the reminder to re-measure it."""
+    misses = ledger.drift_recent()
+    if not misses:
+        return None
+    m = misses[0]
+    return (f"{len(misses)} forecast miss(es) in the last 24 h — newest: "
+            f"{m.get('class', '?')}/{m.get('level', '?')} on {m['model']} "
+            f"predicted {m.get('predicted', '?')}, measured {m['measured']}. "
+            "The tariff table in gemini_router.tariffs is stale; re-measure.")
+
+
 def cmd_quota(args, cfg: Config | None = None) -> int:
     cfg = cfg if cfg is not None else _load_cfg(args)
-    rows = _router(cfg).quota_table()
+    r = _router(cfg)
+    rows = r.quota_table()
     if args.json:
         print(json.dumps(rows, indent=1, default=str))
         return 0
@@ -50,6 +63,8 @@ def cmd_quota(args, cfg: Config | None = None) -> int:
                   iso(r["cooldown_until"])[:19] if r["cooldown_until"] else "—",
                   "★" if r["recommended"] else "")
     console.print(t)
+    if line := _drift_line(r.ledger):
+        console.print(f"[yellow]tariff drift: {line}[/yellow]")
     return 0
 
 
@@ -124,10 +139,13 @@ def cmd_doctor(args, cfg: Config | None = None) -> int:
     else:
         console.print(f"  state: {cfg.state_path}")
         try:
-            console.print(f"  state stats: {Ledger(cfg.state_path).stats()}")
+            led = Ledger(cfg.state_path)
+            console.print(f"  state stats: {led.stats()}")
         except Exception as e:  # noqa: BLE001
             console.print(f"  [red]state unusable: {e}[/red]")
             return 4
+        if line := _drift_line(led):
+            console.print(f"  [yellow]tariff drift: {line}[/yellow]")
     if cfg.api_keys:
         from .config import key_id
         console.print(f"  keys: {len(cfg.api_keys)} → "
