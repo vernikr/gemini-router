@@ -1,5 +1,8 @@
 # Capability plan: file input through the provider Files API
 
+**Status: done 2026-10-11, released as 0.1.12** — see `report.md` in this folder for what
+shipped, the evidence, and the two httpx/ACTIVE pitfalls found while building it.
+
 The router's half of the feature whose product rules live in
 `vernikr/gemini-mcp → docs/worklog/2026.10.11-binary-file-support/plan.md`. This file states
 the capability and its interface **once**; the package plan states how the gateway uses it.
@@ -7,22 +10,24 @@ the capability and its interface **once**; the package plan states how the gatew
 ## Interface the package builds on
 
 ```python
-# gemini_router (library)
+# gemini_router (library) — as shipped in 0.1.12
 up = await router.upload_file(path, mime="application/pdf", model="gemini-3.8-flash",
                               source="mcp")          # → UploadedFile
-# UploadedFile: name ("files/<id>"), uri, mime, size, state, expires_at, key_id
+# UploadedFile: name ("files/<id>"), uri, mime, size, state, expires_at, sha256, key_id
 
-n = await router.count_file_tokens("gemini-3.8-flash", up)         # exact, FR-C7-free
-res = await router.complete_file(req, up, req.files)               # key pinned to up.key_id
+n = await router.count_file_tokens("gemini-3.8-flash", up.uri, up.mime, key_id=up.key_id)
+res = await router.complete(req, files=[up])           # keys pinned to up.key_id
 ```
 
 - `upload_file` picks the serving key first (same order `complete()` uses), uploads with
   that key and records the ledger row. The returned `key_id` is what the package pins when
   it sends the analysis request — a file is visible only to the key's own project.
-- `complete_file` adds the file part ahead of the text (the provider's own guidance for
-  single-file prompts) and never selects another key: switching keys would invalidate the
-  reference. On a key-scoped failure the package re-uploads under the next key, which is
-  why the blob stays in the package's inbox rather than the library's memory.
+- `complete(..., files=[...])` adds the file parts ahead of the text (the provider's own
+  guidance for single-file prompts) and pins the candidate keys to the files' keys:
+  switching keys would invalidate the reference. A file-losing key is a package-level
+  decision — it re-uploads under the next key, which is why the blob stays in the package's
+  inbox rather than the library's memory. `est_tokens` is mandatory on that path: the
+  library never measures silently.
 - `count_file_tokens` measures a file before it is sent, so a pack of files can be planned
   the way text chunks are planned. It is a `countTokens` call and does not draw on RPD.
 
