@@ -8,4 +8,4 @@ ledger, though its migration is unfinished. Corrected the claim to distinguish
 current connected consumers from possible future ones. No library/runtime
 behavior changed; docs pushed to main. The gateway's own stale tool description
 is fixed separately: see gemini-mcp
-`docs/worklog/2026.10.11-model-help-hygiene/`.
+`docs/worklog/archive/2026.10.11-model-help-hygiene/`.

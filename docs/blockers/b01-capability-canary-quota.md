@@ -13,7 +13,7 @@ generation calls. It reported `inconclusive` and emailed that fact; no capabilit
 change was confirmed by the CI run. A separate, owner-authorized one-off probe on
 the new VPS key later verified Lite/PDF reading (hidden code reproduced) but NOT
 Gemma/PNG support (HTTP 500); see
-`docs/worklog/2026.10.12-third-key-capability-probe/`. Do not change the router's
+`docs/worklog/archive/2026.10.12-third-key-capability-probe/`. Do not change the router's
 fleet-wide conservative file gates until another key independently confirms it.
 
 **Resolution:** let the CI key's provider quota reset. The weekly Monday run is now

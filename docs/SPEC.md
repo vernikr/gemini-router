@@ -202,7 +202,7 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
   **Two sources, deliberately kept apart** (this repo's rule, owner, 2026-10-11):
 
   *Practice* — measured 2026-10-11 on two keys, matrix in
-  gemini-mcp `docs/worklog/2026.10.11-remaining-work/plan.md` §E: PDF via `file_data` →
+  gemini-mcp `docs/worklog/archive/2026.10.11-remaining-work/plan.md` §E: PDF via `file_data` →
   HTTP 500 on `gemini-3.5-flash-lite`, HTTP 400 on `gemini-3-flash-preview`, OK on
   `gemini-3.6-flash`; PNG via `file_data` → OK on lite and preview, 400 on
   `gemma-4-31b-it`, whose inline-image path works. The router enforces this per modality:
@@ -215,7 +215,7 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
   on purpose. A later key *did* read a hidden code in a Lite/PDF file; the observed
   support is not yet confirmed across keys. Keep the conservative routing policy
   until an independent check; dated evidence lives in
-  `docs/worklog/2026.10.12-third-key-capability-probe/`.
+  `docs/worklog/archive/2026.10.12-third-key-capability-probe/`.
 
   Corollary for measurement: **`countTokens` is lenient** — it accepted a PDF part for lite
   and preview while `generateContent` refused it, so a successful count is a price, never a

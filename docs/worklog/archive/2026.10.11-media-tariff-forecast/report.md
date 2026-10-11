@@ -1,7 +1,7 @@
 # Wave 1 library half closed: tariff forecast, drift detection, scheduled check
 
 Released as **gemini-router 0.2.0** (feat → MINOR). Plan in this folder; the gateway
-consumption half is `vernikr/gemini-mcp → docs/worklog/2026.10.11-tariff-drift-signal/`.
+consumption half is `vernikr/gemini-mcp → docs/worklog/archive/2026.10.11-tariff-drift-signal/`.
 
 ## What changed
 

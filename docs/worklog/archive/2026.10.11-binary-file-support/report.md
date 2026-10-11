@@ -3,7 +3,7 @@
 Released as **gemini-router 0.1.12**. This is the library half of the feature; the product
 half — what the gateway does with the capability and how it was verified live — is released
 as gemini-mcp 0.18.0 / 0.18.1 and recorded in
-`vernikr/gemini-mcp → docs/worklog/2026.10.11-binary-file-support/report.md`.
+`vernikr/gemini-mcp → docs/worklog/archive/2026.10.11-binary-file-support/report.md`.
 
 ## What changed
 

@@ -4,7 +4,7 @@
 shipped, the evidence, and the two httpx/ACTIVE pitfalls found while building it.
 
 The router's half of the feature whose product rules live in
-`vernikr/gemini-mcp → docs/worklog/2026.10.11-binary-file-support/plan.md`. This file states
+`vernikr/gemini-mcp → docs/worklog/archive/2026.10.11-binary-file-support/plan.md`. This file states
 the capability and its interface **once**; the package plan states how the gateway uses it.
 
 ## Interface the package builds on

@@ -6,14 +6,14 @@ get an explicit signal when the tariff changes and the hardcode starts missing?
 
 **Status: done 2026-10-11, shipped as gemini-router 0.2.0 + gemini-mcp-gateway 0.21.0 —
 evidence in `report.md` in this folder.** Wave 1 of the cross-repo wave plan; sequencing
-lives in ONE place: `vernikr/gemini-mcp → docs/worklog/2026.10.11-remaining-work/plan.md`
+lives in ONE place: `vernikr/gemini-mcp → docs/worklog/archive/2026.10.11-remaining-work/plan.md`
 §Wave plan. This folder documents the library half only; the gateway consumption has its
 own worklog there (`2026.10.11-tariff-drift-signal/`).
 
 ## What "the tariff" is, measured
 
 Measured 2026-10-11 on the production key (`gemini-3.6-flash`; probes in
-`vernikr/gemini-mcp → docs/worklog/2026.10.11-binary-file-support/probes/`):
+`vernikr/gemini-mcp → docs/worklog/archive/2026.10.11-binary-file-support/probes/`):
 
 | media | default | low | medium | high |
 |---|---|---|---|---|
@@ -75,7 +75,7 @@ Because measurement is free and present on every file call, the forecast can be 
 
 Packing groups of files needs to know **which models can read which media**, because the
 budget is per key × model and capability turned out to be per model × modality × transport:
-measured 2026-10-11 (full matrix in gemini-mcp `docs/worklog/2026.10.11-remaining-work/plan.md`
+measured 2026-10-11 (full matrix in gemini-mcp `docs/worklog/archive/2026.10.11-remaining-work/plan.md`
 §E), PDF via `file_data` is refused by `gemini-3.5-flash-lite` (500) and
 `gemini-3-flash-preview` (400) while serving on the 3.6/3.8 flash models; PNG serves on lite
 and preview, and `gemma-4-31b-it` refuses `file_data` but accepts inline images. Consequence

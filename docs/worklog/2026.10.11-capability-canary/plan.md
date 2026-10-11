@@ -50,4 +50,4 @@ weekly run is automatic. This is CI-only monitoring;
 no public library API or daemon deployment changes. An owner-authorized one-off
 VPS probe later confirmed Lite/PDF on a different key; its distinct evidence and
 fleet-wide routing decision gate live in
-`docs/worklog/2026.10.12-third-key-capability-probe/`.
+`docs/worklog/archive/2026.10.12-third-key-capability-probe/`.

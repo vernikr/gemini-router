@@ -9,7 +9,7 @@ from __future__ import annotations
 # Tokens per media part by media_resolution level.
 # image: per image, flat across 300x300..4096x4096 px and 2 KB..7 MB
 #   [measured 2026-10-11, gemini-3.6-flash, countTokens + usageMetadata agree,
-#    vernikr/gemini-mcp docs/worklog/2026.10.11-binary-file-support/report.md §0.18.2]
+#    vernikr/gemini-mcp docs/worklog/archive/2026.10.11-binary-file-support/report.md §0.18.2]
 # pdf: per page, text PDF [measured 2026-10-11, same key and sources]
 MEDIA_TARIFFS: dict[str, dict[str, int]] = {
     "image": {"low": 256, "medium": 529, "high": 1089},
