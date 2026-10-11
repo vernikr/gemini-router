@@ -13,3 +13,6 @@ The scheduled CI canary is **not** archived: its GitHub key returned HTTP 429 an
 its independent result is still pending in `docs/worklog/2026.10.11-capability-canary/`
 and `docs/blockers/b01-capability-canary-quota.md`. The trigger-gated Interactions API
 migration also remains in the active worklog.
+
+Archival patch 0.3.5: 115 tests, lint and secrets guard passed; GitHub release
+`38176826461` completed successfully (test and PyPI). No router behavior changed.
