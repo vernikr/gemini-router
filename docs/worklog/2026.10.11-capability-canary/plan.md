@@ -37,6 +37,10 @@ blocked cases and sent a **provisional drift email**. That first script only che
 for non-empty text and could not prove it was grounded in the file. Patch 0.3.2
 requires the reply to reproduce the unique marker printed in the PDF or identify
 the generated image's color, with no marker/color in the prompt; generic answers
-are inconclusive. Re-dispatch after publishing to distinguish a genuine provider
-capability change from a hallucinated answer. The next weekly run is automatic.
-This is CI-only monitoring; no public library API or daemon deployment changes.
+are inconclusive. Release 0.3.2 and the full battery passed. Its immediate manual
+re-run was stopped by HTTP 429 on the *first* positive control, so it did not
+re-test the suspected drift. It reported `inconclusive` (and mailed that), not a
+capability change. The first email was **provisional and unverified**; the second
+was a truthful quota alert. See `docs/blockers/b01-capability-canary-quota.md` for
+the after-reset check. The next weekly run is automatic. This is CI-only monitoring;
+no public library API or daemon deployment changes.
