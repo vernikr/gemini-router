@@ -69,14 +69,17 @@ Because measurement is free and present on every file call, the forecast can be 
 
 ## A second input for the packer (measured 2026-10-11 evening)
 
-Packing groups of files needs to know **which models can read files at all**, because the
-budget is per key × model and only some models accept a Files API part: `gemini-3.5-flash-lite`
-answered 500, `gemini-3-flash-preview` and `gemma-4-31b-it` answered 400, while the same part
-served fine on `gemini-3.6-flash`/`3.8-flash`. Consequence for this design: the forecast table
-is only half of the prediction — the packer must also predict **which model will serve the
-group**, and a model outside the file-capable set cannot be a packing target at all. The
-library enforces this since 0.1.15 (`file_capable_models`, plus a learned per-process set); the
-packer should treat the capable set as its candidate list, not the whole chain.
+Packing groups of files needs to know **which models can read which media**, because the
+budget is per key × model and capability turned out to be per model × modality × transport:
+measured 2026-10-11 (full matrix in gemini-mcp `docs/worklog/2026.10.11-remaining-work/plan.md`
+§E), PDF via `file_data` is refused by `gemini-3.5-flash-lite` (500) and
+`gemini-3-flash-preview` (400) while serving on the 3.6/3.8 flash models; PNG serves on lite
+and preview, and `gemma-4-31b-it` refuses `file_data` but accepts inline images. Consequence
+for this design: the forecast table is only half of the prediction — the packer must also
+predict **which model will serve the group**, and its candidate list is the capable set for
+the media in question, not the whole chain. The library enforces the conservative version
+since 0.1.15 (`file_capable_models`, plus a learned per-process set); the per-modality
+refinement is a recorded plan item in the product repo.
 
 ## Rules kept
 

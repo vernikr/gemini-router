@@ -175,18 +175,35 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
   `KeyLeakedError` (a `GeminiHTTPError` subclass, same failover semantics): retrying or
   switching transports cannot help a revoked credential, and the operator needs the cause
   in front of them, not a generic upload failure.
-- **A file job stays on the chain.** The overflow tiers exist for quota reasons on text,
-  and the models in them cannot read Files API parts — measured 2026-10-11 on one key:
-  `gemini-3.5-flash-lite` → HTTP 500, `gemini-3-flash-preview` → 400, `gemma-4-31b-it` →
-  400, while the same part served fine on `gemini-3.6-flash`/`3.8-flash` (countTokens
-  agrees: 3360 for a 3-page PDF at `high`). So a request carrying `files` never enters a
-  tier (they would burn a call and end in a misleading "quota exhausted"), a model that
-  answers 400/500 to file input is remembered as file-incapable for the process, and when
-  the whole candidate set turns out file-blind the error says so instead of talking about
-  quota. `file_capable_models:` in the config states the capable ones explicitly when the
-  operator prefers that to learning. Same-day companion fix: a quota-drained chain no
-  longer tells the caller to re-upload the file under another key — that message now
-  appears only when the key really cannot serve the file-capable models.
+- **A file job stays on the chain.** The overflow tiers exist for quota reasons on text; a
+  file job sent there buys a wasted call and a misleading error, so a request carrying
+  `files` never enters a tier, a model that answers 400/500 to a file request is remembered
+  as file-incapable for the process, and a file-blind candidate set produces its own error
+  instead of talking about quota. `file_capable_models:` states the capable models
+  explicitly when an operator prefers that to learning.
+
+  **Two sources, deliberately kept apart** (this repo's rule, owner, 2026-10-11):
+
+  *Practice* — measured 2026-10-11 on two keys, matrix in
+  gemini-mcp `docs/worklog/2026.10.11-remaining-work/plan.md` §E: PDF via `file_data` →
+  HTTP 500 on `gemini-3.5-flash-lite`, HTTP 400 on `gemini-3-flash-preview`, OK on
+  `gemini-3.6-flash`; PNG via `file_data` → OK on lite and preview, 400 on
+  `gemma-4-31b-it`, whose inline-image path works. So the conservative rule above is right
+  for **PDF** and stricter than necessary for images; the per-modality refinement is a
+  recorded plan item, not something to code against yet.
+
+  *Official* — `ai.google.dev` model pages (fetched 2026-10-11) list PDF as a supported
+  input for `gemini-3.5-flash-lite`; the Gemma 4 card lists text and images. The docs and
+  practice disagree for lite + PDF at the moment of writing, and both statements stay here
+  on purpose.
+
+  Corollary for measurement: **`countTokens` is lenient** — it accepted a PDF part for lite
+  and preview while `generateContent` refused it, so a successful count is a price, never a
+  capability proof.
+
+  Companion fix (same day): a quota-drained chain no longer tells the caller to re-upload
+  the file under another key — that message now appears only when the key itself cannot
+  serve the file-capable models.
 - **Token estimate is script-aware.** `estimate_tokens` classifies characters and divides
   each class by its own ratio, because one divisor cannot serve mixed text: Latin prose
   runs ~5.4 chars/token, Cyrillic ~1.7, digits ~1.8. The old `len // 4` under-estimated
