@@ -16,6 +16,7 @@ from gemini_router import (
     FileUploadFailed,
     QuotaExhaustedError,
     Router,
+    RouterError,
     RouterRequest,
     key_id,
 )
@@ -333,3 +334,67 @@ async def test_an_unknown_level_fails_before_any_request(mock_api, tmp_path):
     with pytest.raises(ValueError):
         await router.count_file_tokens("gemini-3.8-flash", up.uri, up.mime,
                                        media_resolution="huge")
+
+
+async def test_file_job_never_drifts_into_tiers_that_cannot_read_files(mock_api, tmp_path):
+    """Overflow tiers (lite, gemma) exist for quota on text; they answer 400/500 to a file
+    part (measured 2026-10-11). A file job must stay on the chain, or it burns a call and
+    ends in a misleading "quota exhausted" while printing a quota hint for models that
+    could never have served it."""
+    router, up = await _prepared(mock_api, tmp_path)
+    tried: list[str] = []
+
+    def gate(request):
+        model = request.url.path.split("/models/")[1].split(":")[0]
+        tried.append(model)
+        return httpx.Response(429, json={"error": {"message": "quota",
+            "details": [{"reason": "RATE_LIMIT_EXCEEDED", "metadata": {
+                "quota_id": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}}]}})
+
+    mock_api.post(url__regex=r".*:generateContent").mock(side_effect=gate)
+    with pytest.raises(QuotaExhaustedError):
+        await router.complete(RouterRequest(prompt="x", est_tokens=50,
+                                            overflow="lite+gemma", wait=False), files=[up])
+    # both chain models were tried and both were rate-limited — and the job still never
+    # reached tier 1/2: lite and gemma cannot read a file, so dispatching them would only
+    # have produced a 400/500 and a quota hint about the wrong models
+    assert tried == ["gemini-3.8-flash", "gemini-3.7-flash"]
+
+
+async def test_a_model_that_rejects_files_is_remembered_for_the_next_job(mock_api, tmp_path):
+    """The preview model answers 400 INVALID_ARGUMENT to any file part while serving text:
+    one wasted call is acceptable, two are not. The second file job skips it outright."""
+    router, up = await _prepared(mock_api, tmp_path, chain=("gemini-3-flash-preview",
+                                                            "gemini-3.8-flash"))
+    tried: list[str] = []
+
+    def answer(request):
+        model = request.url.path.split("/models/")[1].split(":")[0]
+        tried.append(model)
+        if model == "gemini-3-flash-preview":
+            return httpx.Response(400, json={"error": {"code": 400,
+                "message": "Request contains an invalid argument.",
+                "status": "INVALID_ARGUMENT"}})
+        return gen_resp("analysis")
+
+    mock_api.post(url__regex=r".*:generateContent").mock(side_effect=answer)
+    first = await router.complete(RouterRequest(prompt="q1", est_tokens=50), files=[up])
+    assert first.text == "analysis" and tried == ["gemini-3-flash-preview",
+                                                  "gemini-3.8-flash"]
+    tried.clear()
+    second = await router.complete(RouterRequest(prompt="q2", est_tokens=50), files=[up])
+    assert second.text == "analysis" and tried == ["gemini-3.8-flash"]   # no second 400
+
+
+async def test_no_file_capable_model_left_names_the_cause(mock_api, tmp_path):
+    """When the whole chain turns out to be file-blind the operator must read why — not a
+    quota message about models that were never candidates."""
+    router, up = await _prepared(mock_api, tmp_path, chain=("gemini-3-flash-preview",))
+
+    def blind(request):
+        return httpx.Response(400, json={"error": {"code": 400,
+            "message": "Request contains an invalid argument.", "status": "INVALID_ARGUMENT"}})
+
+    mock_api.post(url__regex=r".*:generateContent").mock(side_effect=blind)
+    with pytest.raises(RouterError, match="can read this file"):
+        await router.complete(RouterRequest(prompt="x", est_tokens=50), files=[up])

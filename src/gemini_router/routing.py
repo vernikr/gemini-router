@@ -142,6 +142,8 @@ class Router:
         self._sleep = sleep or asyncio.sleep
         self._now = now or time.time
         self._avail: tuple[float, dict[str, set[str] | None]] | None = None
+        # Models that answered 400/500 to a file request in this process (see _tier_plan).
+        self._file_incapable: set[str] = set()
 
     @classmethod
     def from_env(cls, config_path: str | None = None, **over) -> Router:
@@ -318,7 +320,7 @@ class Router:
         dead_keys: set[str] = set()
         tried: list[str] = []
 
-        for tier, models in self._tier_plan(req, avail):
+        for tier, models in self._tier_plan(req, avail, bool(files)):
             if tier > 0:
                 emit("overflow", detail={"tier": tier, "models": models})
             for model in models:
@@ -350,7 +352,18 @@ class Router:
                 "leaked-key block) — delete the dead keys in the console and add fresh "
                 "ones: `gemini-mcp keys` shows the pool, `gemini-mcp keys add <key>` "
                 "validates and installs one without touching the unit file by hand")
-        if pins and not failures:
+        # A file job that exhausted its file-capable candidates is not a key problem, so
+        # this must be read before the pin clause below — and the pin clause itself must
+        # not fire on a quota block, or a 429-drained chain tells the user to re-upload a
+        # file under a key that was never the issue (found by test on 2026-10-11).
+        if files and not quota_blocked and self._file_incapable:
+            raise RouterError(
+                "no model in the chain can read this file: " +
+                ", ".join(sorted(self._file_incapable)) + " answered 400/500 to a file "
+                "request. Measured 2026-10-11: only the main gemini-3.x-flash models accept "
+                "Files API parts — lite, gemma and preview models do not. Put a file-capable "
+                "model in `chain:` (or name the capable ones in `file_capable_models:`).")
+        if pins and not failures and not quota_blocked:
             raise RouterError(
                 f"no request pinning a file could run: key(s) {sorted(pins)} cannot serve "
                 f"{tried[-1] if tried else 'the chain'} now — re-upload under a key that can")
@@ -364,6 +377,12 @@ class Router:
                     if waits else
                     f"daily quota resets ~{iso(eta)} (PT); opt in with overflow='lite' or "
                     f"'lite+gemma' to continue on weaker models")
+            if files and self._file_incapable:
+                # Tell the truth about the pool of candidates, not just the quota: on a
+                # file job the "weaker models" the hint offers cannot read the file at all.
+                hint += (" · file jobs can only run on file-capable models (" +
+                         ", ".join(sorted(self._file_incapable)) + " answered 400/500 to "
+                         "file input; lite/gemma/preview do not read files)")
             emit("quota_exhausted", detail={"hint": hint})
             raise QuotaExhaustedError(payload, iso(eta), hint=hint, waited=wait_enabled,
                                       failures=failures)
@@ -474,8 +493,19 @@ class Router:
         return list(keys)
 
     # ------------------------------------------------------------------ internals
-    def _tier_plan(self, req: RouterRequest, avail: dict) -> list[tuple[int, list[str]]]:
+    def _tier_plan(self, req: RouterRequest, avail: dict,
+                   has_files: bool = False) -> list[tuple[int, list[str]]]:
         chain = [req.model] if req.model else list(dict.fromkeys(self.cfg.chain))
+        if has_files:
+            # Overflow tiers are a quota device for text; the models in them cannot read
+            # Files API parts, so sending a file job there burns a call and ends in a
+            # misleading "quota exhausted". Measured 2026-10-11: lite → 500, preview → 400,
+            # gemma → 400 on a part the flash models served fine.
+            if self.cfg.file_capable_models:
+                allow = set(self.cfg.file_capable_models)
+                chain = [m for m in chain if m in allow]
+            chain = [m for m in chain if m not in self._file_incapable]
+            return [(0, chain)]
         tiers = [(0, chain)]
         if req.overflow in ("lite", "lite+gemma"):
             tiers.append((1, [m for m in self.cfg.overflow_tiers if m != "gemma-auto"]))
@@ -557,6 +587,8 @@ class Router:
                     file_parts=file_parts(files) if files else None)
             except GeminiHTTPError as e:
                 ms = int((self._now() - t0) * 1000)
+                if files and e.status in (400, 500):
+                    self._file_incapable.add(model)               # cannot read files: remember
                 if e.quota_day:                                  # FR-C4: live daily 429
                     self.ledger.resolve(row_id, "quota", http_status=e.status, latency_ms=ms,
                                         quota_error=str(e), retry_after_s=e.retry_after)
