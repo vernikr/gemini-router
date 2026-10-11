@@ -1,6 +1,6 @@
 [project]
 name = "gemini-router"
-version = "0.1.10"
+version = "0.1.11"
 description = "Quota-aware Gemini Flash router: cascading fallback, per-key/model RPD/RPM/TPM ledger (SQLite WAL), key pool, wait policy, CLI"
 readme = "README.md"
 requires-python = ">=3.12"
