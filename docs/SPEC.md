@@ -56,6 +56,28 @@ await router.quota_table() -> list[QuotaRow]   # key_id, model, rpd_left, rpm_wa
 router.complete_sync(...)                      # blocking facade (tldr-digest migration)
 ```
 
+### File input (Files API, §8)
+
+```python
+up: UploadedFile = await router.upload_file(
+    path, mime=None,             # default from the suffix
+    model=None,                  # whose serving key to pick; None → chain head
+    source="cli", display_name=None, key=None, sha256=None, ready_timeout_s=30.0)
+# UploadedFile: name, uri, mime, size, state, expires_at, sha256, key_id
+
+n   = await router.count_file_tokens(model, up.uri, up.mime)      # free (FR-C7)
+res = await router.complete(RouterRequest(prompt, est_tokens=…), files=[up], …)
+await router.delete_file(up.name)                                 # best-effort
+```
+
+`complete(..., files=[…])` pins the candidate keys to those the files were uploaded under
+(a file lives in its key's own project) and refuses without `est_tokens`: the TPM gate must
+include the measured file tokens, since a text-only estimate under-counts on the one
+request where being wrong costs a 429 mid-job. The request carries `file_data` parts ahead
+of the text, and the cache hash mixes in the file's `sha256` — never the URI, which changes
+on every re-upload. A key rejected mid-upload moves to the next key; a request whose pinned
+key cannot serve says so, and the caller re-uploads from its own blob.
+
 Errors: `QuotaExhaustedError` carries the machine-readable payload
 (per-model rpd_left/rpm_wait_s/tpm_wait_s/cooldown_until, reset_eta_pt, hint) — frontends
 surface it as-is. `RouterError` base for everything else (network, http 4xx, parse).
@@ -68,6 +90,13 @@ Rules summary: WAL + busy_timeout 5 s; TPM pre-flight writes a `status='planned'
 upgraded after the call; RPD counts `ok|quota|http5xx` attempts (conservative),
 not client-validation 4xx/network; PT-midnight + rolling-24h dual gate; retention prune
 via `gemini-router prune` and by frontends' daily task.
+
+Non-spending provider calls are named once (`NON_SPENDING_KINDS`: `countTokens`, Files API
+uploads) and excluded from every gate, from the pacing clock and from cooldowns. An upload
+is recorded as `kind='upload'` with its byte count in `bytes` and a sentinel `model`, so
+`router_logs` shows it while no per-model counter moves. The schema is additive: a new
+nullable column is added in place when an older database is opened, because the production
+file is shared with frontends that may run older code.
 
 ## 4. Config
 
@@ -106,7 +135,22 @@ gemini-mcp daemon (localhost:8790, bearer) — same ledger, same rules.
 SemVer; tags `v*`; gemini-mcp pins a tag. CI: ruff + pytest (respx mocks, no network) on
 push/PR. Conventional Commits.
 
-## 8. Semantics worth knowing
+## 8. File input (Files API)
+
+Resumable upload: `POST {upload_base_url}/files` with the start headers → `PUT` to the
+returned `x-goog-upload-url` with `upload, finalize`. The blob streams in 1 MiB chunks with
+an explicit Content-Length (no base64, no second copy in RAM — the gateway's box has 1 GB).
+The provider processes asynchronously: `state` is usually `ACTIVE` in the finalize answer,
+otherwise the client polls with a bounded wait and raises `FileNotReady` on expiry of the
+budget, `FileUploadFailed` when the provider marks it FAILED. `upload_base_url` is separate
+from `base_url` because the upload endpoint lives on another host path.
+
+Provider facts the capability leans on: 2 GB per file, 20 GB per project, 48-hour retention,
+no download back, free of charge, and a file is visible only to the project of the key that
+uploaded it. Document-level ceilings (PDF size and page count) are enforced by the provider
+at analysis time and are the frontend's pre-flight concern, not this library's.
+
+## 9. Semantics worth knowing
 
 - **Thinking-token starvation:** in 3.x models `maxOutputTokens` counts thinking tokens,
   so a tiny cap yields empty visible text and no `candidatesTokenCount`. Therefore

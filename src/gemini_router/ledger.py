@@ -7,6 +7,8 @@ Accounting rules (D3, FR-C2/C7):
   plus 'planned' rows younger than planned_ttl_s: an in-flight request is spend, so
   callers sharing this file cannot all pass the same check and overshoot the day.
 - RPM/TPM sliding windows count WINDOW_STATUSES; 'planned' rows expire after planned_ttl_s.
+- Provider calls that never draw on model quotas are named once in NON_SPENDING_KINDS and
+  excluded from every gate: countTokens ('count') and Files API uploads ('upload').
 - TPM pre-flight writes a 'planned' row (upgraded in place after the call) to close the
   countTokens→send race between processes (D2).
 """
@@ -22,7 +24,12 @@ from zoneinfo import ZoneInfo
 
 RPD_STATUSES = ("ok", "quota", "http5xx", "blocked")            # conservative: 429 counts as spent
 WINDOW_STATUSES = RPD_STATUSES + ("planned",)
-SCHEMA_VERSION = "1"
+NON_SPENDING_KINDS = ("count", "upload")     # provider calls that never draw on model quotas
+SPENDS = "kind NOT IN ({})".format(",".join(f"'{k}'" for k in NON_SPENDING_KINDS))
+# An upload belongs to a key, not a model, but the column is NOT NULL and feeds per-model
+# filters. A sentinel no model id can equal.
+FILE_ROW_MODEL = "(file)"
+SCHEMA_VERSION = "2"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls(
@@ -32,7 +39,7 @@ CREATE TABLE IF NOT EXISTS calls(
   key_id TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL,
   http_status INTEGER, tokens_in INTEGER, tokens_out INTEGER,
   quota_error TEXT, retry_after_s REAL, latency_ms INTEGER,
-  overflow_tier INTEGER NOT NULL DEFAULT 0);
+  overflow_tier INTEGER NOT NULL DEFAULT 0, bytes INTEGER);
 CREATE INDEX IF NOT EXISTS idx_calls_model_ts ON calls(model, ts);
 CREATE INDEX IF NOT EXISTS idx_calls_key_model_ts ON calls(key_id, model, ts);
 CREATE INDEX IF NOT EXISTS idx_calls_req ON calls(request_id);
@@ -69,8 +76,17 @@ class Ledger:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         with self._lock, self._conn:
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.execute(
-                "INSERT OR IGNORE INTO meta(k,v) VALUES('schema_version',?)", (SCHEMA_VERSION,))
+                "INSERT OR REPLACE INTO meta(k,v) VALUES('schema_version',?)", (SCHEMA_VERSION,))
+
+    def _migrate(self) -> None:
+        """Additive only: a shared database is opened by older code too (tldr-digest),
+        so an extra nullable column must never break the reader."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(calls)")}
+        for col in ("bytes",):
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE calls ADD COLUMN {col} INTEGER")
 
     def close(self) -> None:
         with self._lock:
@@ -101,6 +117,21 @@ class Ledger:
                 (status, http_status, tokens_in, tokens_out, latency_ms,
                  quota_error and quota_error[:500], retry_after_s, row_id))
 
+    def record_upload(self, *, key_id: str, nbytes: int, source: str = "cli",
+                      request_id: str | None = None, latency_ms: int | None = None,
+                      now: float | None = None) -> int:
+        """One Files API upload, recorded but never counted against model quotas: the row
+        is kind='upload' with the byte count in `bytes`, and every gate skips it. It is
+        the local audit trail — the provider forgets the file within 48 hours."""
+        now = now or time.time()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO calls(ts,ts_iso,request_id,source,kind,key_id,model,status,"
+                "http_status,latency_ms,bytes) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (now, iso(now), request_id, source, "upload", key_id, FILE_ROW_MODEL,
+                 "ok", 200, latency_ms, nbytes))
+            return int(cur.lastrowid)
+
     def rpd_spent(self, key_id: str, model: str, day_start: float,
                   roll_start: float, planned_min: float | None = None) -> tuple[int, int]:
         """Daily and rolling spend. A fresh `planned` row counts as spent: the request is
@@ -111,7 +142,7 @@ class Ledger:
         spent = "(status IN ({})".format(",".join("?" * len(RPD_STATUSES)))
         spent += (" OR (status='planned' AND ts>=?))" if planned_min is not None else ")")
         q = ("SELECT SUM(ts>=?), SUM(ts>=?) FROM calls WHERE key_id=? AND model=? "
-             "AND kind!='count' AND ts>=? AND " + spent)
+             f"AND {SPENDS} AND ts>=? AND " + spent)
         params = [day_start, roll_start, key_id, model, since, *RPD_STATUSES]
         if planned_min is not None:
             params.append(planned_min)
@@ -124,7 +155,7 @@ class Ledger:
         """→ (calls, tokens, oldest_ts) inside the sliding window (planned rows younger
         than planned_min only)."""
         q = ("SELECT COUNT(*), COALESCE(SUM(tokens_in),0), MIN(ts) FROM calls "
-             "WHERE key_id=? AND model=? AND kind!='count' AND ts>=? AND "
+             f"WHERE key_id=? AND model=? AND {SPENDS} AND ts>=? AND "
              "(status IN ({}) OR (status='planned' AND ts>=?))").format(
             ",".join("?" * len(RPD_STATUSES)))
         with self._lock:
@@ -141,12 +172,12 @@ class Ledger:
         that runs per tool call and per chunk. Pairs with no history are simply
         absent; callers fall back to zeros.
         """
-        rpd_q = ("SELECT key_id, model, SUM(ts>=?), SUM(ts>=?) FROM calls "
-                 "WHERE kind!='count' AND ts>=? AND (status IN ({}) OR "
+        rpd_q = (f"SELECT key_id, model, SUM(ts>=?), SUM(ts>=?) FROM calls "
+                 f"WHERE {SPENDS} AND ts>=? AND (status IN ({{}}) OR "
                  "(status='planned' AND ts>=?)) GROUP BY key_id, model").format(
             ",".join("?" * len(RPD_STATUSES)))
-        win_q = ("SELECT key_id, model, COUNT(*), COALESCE(SUM(tokens_in),0), MIN(ts) "
-                 "FROM calls WHERE kind!='count' AND ts>=? AND (status IN ({}) OR "
+        win_q = (f"SELECT key_id, model, COUNT(*), COALESCE(SUM(tokens_in),0), MIN(ts) "
+                 f"FROM calls WHERE {SPENDS} AND ts>=? AND (status IN ({{}}) OR "
                  "(status='planned' AND ts>=?)) GROUP BY key_id, model").format(
             ",".join("?" * len(RPD_STATUSES)))
         since = min(day_start, roll_start)
@@ -166,7 +197,7 @@ class Ledger:
     def last_call_ts(self, key_id: str, model: str) -> float | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT MAX(ts) FROM calls WHERE key_id=? AND model=? AND kind!='count'",
+                f"SELECT MAX(ts) FROM calls WHERE key_id=? AND model=? AND {SPENDS}",
                 (key_id, model)).fetchone()
         return row[0]
 

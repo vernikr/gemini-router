@@ -1,11 +1,19 @@
 """Async Gemini API client (v1beta REST). Gemini 3.x rules (docs/01 §3.1):
 thinkingConfig.thinkingLevel instead of thinking_budget; temperature/top_p stripped for
-3.x models. Key goes in the x-goog-api-key header, never in the URL (log hygiene)."""
+3.x models. Key goes in the x-goog-api-key header, never in the URL (log hygiene).
+
+File input (spec: docs/SPEC.md §8): resumable upload to `upload_base_url`, then a
+`file_data` part in generateContent. The blob is streamed in chunks and never held twice
+in memory — the gateway runs on a 1 GB box."""
 from __future__ import annotations
 
+import asyncio
 import json
+import mimetypes
 import re
+import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 
@@ -14,9 +22,36 @@ from .errors import (
     KEY_REJECT_STATUS,
     MODEL_SWITCH_STATUS,
     RETRYABLE_STATUS,
+    FileNotReady,
+    FileUploadFailed,
     GeminiHTTPError,
     RouterError,
 )
+
+CHUNK = 1 << 20          # upload read size; small enough for a 1 GB box, big enough for LAN
+
+
+@dataclass(slots=True)
+class UploadedFile:
+    """A provider-side file. `sha256` is the local blob's hash — it is what the cache
+    keys on, so a hit survives the provider forgetting the file; `key_id`, not the key
+    itself, is what callers pin a request to."""
+
+    name: str                     # "files/<id>" as the provider names it
+    uri: str                      # what a request references
+    mime: str
+    size: int
+    state: str                    # ACTIVE when usable
+    expires_at: str | None = None
+    sha256: str | None = None
+    key_id: str | None = None
+
+    @classmethod
+    def from_api(cls, info: dict, *, mime: str, fallback_size: int = 0) -> UploadedFile:
+        return cls(name=info.get("name", ""), uri=info.get("uri", ""),
+                   mime=info.get("mimeType") or mime,
+                   size=int(info.get("sizeBytes") or fallback_size),
+                   state=info.get("state", ""), expires_at=info.get("expirationTime"))
 
 
 @dataclass(slots=True)
@@ -58,6 +93,83 @@ class GeminiClient:
     def _headers(key: str) -> dict:
         return {"x-goog-api-key": key, "content-type": "application/json"}
 
+    # ------------------------------------------------------------- files (SPEC §8)
+    async def upload_file(self, key: str, path: str | Path, *, mime: str | None = None,
+                          display_name: str | None = None,
+                          timeout_s: float | None = None) -> UploadedFile:
+        """Resumable upload: start (metadata) → one PUT carrying the bytes → finalize.
+        Streams the blob in chunks with an explicit Content-Length — no base64, no second
+        copy in RAM. Returns the provider's record; the caller waits for ACTIVE."""
+        path = Path(path)
+        size = path.stat().st_size
+        mime = mime or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        start = await self._client.post(
+            f"{self.cfg.upload_base_url}/files", headers=self._headers(key) | {
+                "X-Goog-Upload-Protocol": "resumable",
+                "X-Goog-Upload-Command": "start",
+                "X-Goog-Upload-Header-Content-Length": str(size),
+                "X-Goog-Upload-Header-Content-Type": mime},
+            json={"file": {"display_name": display_name or path.name}}, timeout=timeout_s)
+        if start.status_code >= 400:
+            raise self._classify(start)
+        url = start.headers.get("x-goog-upload-url")
+        if not url:
+            raise FileUploadFailed("upload start returned no x-goog-upload-url")
+        done = await self._client.put(
+            url, headers={"Content-Length": str(size), "X-Goog-Upload-Offset": "0",
+                          "X-Goog-Upload-Command": "upload, finalize",
+                          "content-type": "application/octet-stream"},
+            content=_chunks(path), timeout=timeout_s)
+        if done.status_code >= 400:
+            raise self._classify(done)
+        info = (done.json() or {}).get("file") or {}
+        if not info.get("uri"):
+            raise FileUploadFailed(f"upload finalize returned no file record: {done.text[:200]}")
+        return UploadedFile.from_api(info, mime=mime, fallback_size=size)
+
+    async def file_state(self, key: str, name: str) -> UploadedFile:
+        r = await self._client.get(f"{self.cfg.base_url}/files/{_file_id(name)}",
+                                   headers=self._headers(key))
+        if r.status_code >= 400:
+            raise self._classify(r)
+        info = (r.json() or {}) or {}
+        return UploadedFile.from_api(info, mime=info.get("mimeType", ""))
+
+    async def wait_file_active(self, key: str, name: str, *, poll_s: float = 1.0,
+                               timeout_s: float = 30.0) -> UploadedFile:
+        """The provider processes asynchronously; small files are usually ACTIVE at once,
+        so the first check usually wins and the loop costs nothing."""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            up = await self.file_state(key, name)
+            if up.state == "ACTIVE":
+                return up
+            if up.state == "FAILED":
+                raise FileUploadFailed(f"{name}: provider marked the upload FAILED")
+            if time.monotonic() >= deadline:
+                raise FileNotReady(f"{name}: still {up.state or 'unknown'} after "
+                                   f"{timeout_s:.0f}s")
+            await asyncio.sleep(poll_s)
+
+    async def count_file_tokens(self, key: str, model: str, uri: str, mime: str) -> int:
+        """Exact token cost of a file, before anything is sent. A countTokens call: it
+        plans TPM and never draws on RPD (FR-C7)."""
+        r = await self._client.post(
+            f"{self.cfg.base_url}/models/{model}:countTokens", headers=self._headers(key),
+            json={"contents": [{"parts": [{"file_data": {"mime_type": mime,
+                                                         "file_uri": uri}}]}]})
+        if r.status_code >= 400:
+            raise self._classify(r)
+        return int((r.json() or {}).get("totalTokens") or 0)
+
+    async def delete_file(self, key: str, name: str) -> None:
+        """Best-effort tidy-up when the caller drops its blob. A missing file is a
+        success: the provider expires them on its own."""
+        r = await self._client.delete(f"{self.cfg.base_url}/files/{_file_id(name)}",
+                                      headers=self._headers(key))
+        if r.status_code >= 400 and r.status_code != 404:
+            raise self._classify(r)
+
     # ------------------------------------------------------------------
     async def list_models(self, key: str) -> set[str]:
         models: set[str] = set()
@@ -88,7 +200,8 @@ class GeminiClient:
 
     async def generate(self, key: str, model: str, *, prompt: str, system: str | None = None,
                        thinking_level: str | None = "medium", output_format: str = "text",
-                       max_output_tokens: int = 8192) -> GenResult:
+                       max_output_tokens: int = 8192,
+                       file_parts: list[dict] | None = None) -> GenResult:
         gen: dict = {"maxOutputTokens": max_output_tokens}
         if output_format == "json":
             gen["responseMimeType"] = "application/json"
@@ -97,7 +210,8 @@ class GeminiClient:
                 gen["thinkingConfig"] = {"thinkingLevel": thinking_level}
         elif self.cfg.temperature is not None:
             gen["temperature"] = self.cfg.temperature
-        payload: dict = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        parts = list(file_parts or []) + [{"text": prompt}]   # files first (provider guide)
+        payload: dict = {"contents": [{"role": "user", "parts": parts}],
                          "generationConfig": gen}
         if system:
             payload["systemInstruction"] = {"parts": [{"text": system}]}
@@ -142,6 +256,25 @@ class GeminiClient:
                                switch_model=switch, retry_after=retry_after,
                                quota_day=quota_day, quota_minute=quota_minute,
                                key_rejected=key_rejected)
+
+
+def file_parts(files) -> list[dict]:
+    """`file_data` parts for a request, in the order given."""
+    return [{"file_data": {"mime_type": f.mime, "file_uri": f.uri}} for f in files]
+
+
+def _file_id(name: str) -> str:
+    """The API's resource path is `files/<id>`; accept either form from callers."""
+    return name.rsplit("/", 1)[-1]
+
+
+async def _chunks(path: Path, size: int = CHUNK):
+    """Chunked reader: httpx accepts an async iterable with an explicit Content-Length,
+    which keeps the body streamed (verified against respx: header preserved, no chunked
+    transfer-encoding, body reassembles byte-for-byte)."""
+    with path.open("rb") as fh:
+        while (block := fh.read(size)):
+            yield block
 
 
 def extract_json(text: str):

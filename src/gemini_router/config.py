@@ -51,6 +51,7 @@ class Config(BaseModel):
     cache_ttl_h: float = 24.0
     state_path: str = "state.db"
     base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    upload_base_url: str = "https://generativelanguage.googleapis.com/upload/v1beta"
     api_keys: list[str] = Field(default_factory=list)
     temperature: float | None = None           # applied to pre-3.x models only
     max_output_tokens_default: int = 32768   # cap only; 3.x thinking tokens count toward it

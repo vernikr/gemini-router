@@ -10,14 +10,20 @@ import random
 import re
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 import httpx
 
 from .config import Config, estimate_tokens, key_id
-from .errors import GeminiHTTPError, QuotaExhaustedError, RouterError
+from .errors import (
+    FileNotReady,
+    GeminiHTTPError,
+    QuotaExhaustedError,
+    RouterError,
+)
 from .events import RouterEvent
-from .gemini import GeminiClient
+from .gemini import GeminiClient, UploadedFile, file_parts
 from .ledger import Ledger, iso, pt_midnight_ts
 
 Emitter = Callable[[RouterEvent], None]
@@ -96,10 +102,23 @@ def gates_for(cfg: Config, ledger: Ledger, model: str, key: str,
                       ledger.cooldown(kid, model, now), est_tokens, now)
 
 
-def cache_hash(model: str, req: RouterRequest, mot: int) -> str:
+def cache_hash(model: str, req: RouterRequest, mot: int,
+               file_hashes: list[str] | None = None) -> str:
+    """Content only. File bytes enter as their local sha256, never as the provider URI:
+    a URI changes on every re-upload (after expiry, or under another key) and would turn
+    every hit into a miss for work already done."""
     payload = json.dumps([model, req.thinking_level, req.output_format, mot,
-                          req.system, req.prompt], ensure_ascii=False)
+                          req.system, req.prompt, file_hashes], ensure_ascii=False)
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _sha256(path: str | Path) -> str:
+    """One pass over the blob, streamed: the cache key's file half."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while (block := fh.read(1 << 20)):
+            h.update(block)
+    return h.hexdigest()
 
 
 def pick_gemma(models: Iterable[str]) -> str | None:
@@ -246,7 +265,11 @@ class Router:
         return n
 
     # ------------------------------------------------------------------ main
-    async def complete(self, req: RouterRequest, on_event: Emitter | None = None) -> RouterResult:
+    async def complete(self, req: RouterRequest, on_event: Emitter | None = None,
+                       files: list[UploadedFile] | None = None) -> RouterResult:
+        """`files` are uploads from `upload_file` on THIS router. They pin the request to
+        the keys they were uploaded under — a file is visible only to its own project —
+        so a key switch means the caller re-uploads, not this method retrying elsewhere."""
         events: list[RouterEvent] = []
 
         def emit(stage: str, **kw) -> None:
@@ -256,6 +279,19 @@ class Router:
                 on_event(ev)
 
         cfg = self.cfg
+        files = list(files or [])
+        if files:
+            # The TPM gate must include the file tokens, and only the caller can measure
+            # them (count_file_tokens). A text-only estimate would under-count the gate
+            # on the one request where being wrong costs a 429 mid-job.
+            if not req.est_tokens:
+                raise RouterError("est_tokens is required with files: measure the request "
+                                  "with count_file_tokens and pass the total")
+            if any(f.key_id is None for f in files):
+                raise RouterError("files must come from Router.upload_file — without the "
+                                  "key_id the request cannot be pinned to their project")
+        pins = {f.key_id for f in files}
+        fhashes = [f.sha256 or "" for f in files] or None
         wait_enabled = req.wait if req.wait is not None else cfg.wait.enabled_default
         mot = req.max_output_tokens or cfg.max_output_tokens_default
         est = req.est_tokens or estimate_tokens(req.prompt, cfg.chars_per_token)
@@ -289,7 +325,7 @@ class Router:
                 tried.append(model)
                 for key in self._keys_sorted(model):
                     kid = key_id(key)
-                    if kid in dead_keys:
+                    if kid in dead_keys or (pins and kid not in pins):
                         continue
                     s = avail.get(kid)
                     if s is not None and model not in s:
@@ -300,7 +336,7 @@ class Router:
                         continue
                     res, outcome = await self._try_candidate(
                         req, tier, model, key, est, mot, wait_enabled, deadline, emit,
-                        failures, dead_keys)
+                        failures, dead_keys, files, fhashes)
                     if res is not None:
                         res.events = events
                         res.quota_after = self.model_budgets(tried)
@@ -312,6 +348,10 @@ class Router:
             raise RouterError(
                 "every configured API key was rejected by the provider (HTTP 401) — "
                 "rotate GEMINI_API_KEYS / GEMINI_API_KEY_1..10, then retry")
+        if pins and not failures:
+            raise RouterError(
+                f"no request pinning a file could run: key(s) {sorted(pins)} cannot serve "
+                f"{tried[-1] if tried else 'the chain'} now — re-upload under a key that can")
         if req.model and unavailable and not failures:
             raise RouterError(f"pinned model {req.model} is unavailable for all configured keys")
         if quota_blocked or not failures:
@@ -343,6 +383,91 @@ class Router:
             return asyncio.run(_run())
         raise RouterError("complete_sync called inside a running event loop — use await complete()")
 
+    async def upload_file(self, path: str | Path, *, mime: str | None = None,
+                          model: str | None = None, source: str = "cli",
+                          display_name: str | None = None, key: str | None = None,
+                          sha256: str | None = None,
+                          ready_timeout_s: float = 30.0) -> UploadedFile:
+        """Upload a blob and hand back the provider record, pinned to the key that will
+        serve the analysis. The key is chosen the way `complete` would choose it, minus
+        keys whose day is spent or which sit in cooldown — uploading a file for a key
+        that cannot then answer spends an upload for nothing.
+
+        `sha256` (the local blob's hash) is what the cache keys on; compute it when the
+        caller already has it. The file is left ACTIVE on the provider side."""
+        cfg = self.cfg
+        target = model or cfg.chain[0]
+        if sha256 is None:
+            sha256 = _sha256(path)
+        if key:
+            cands = [key]
+        else:
+            cands = [k for k in self._keys_sorted(target)
+                     if (g := self._gates(target, k))["rpd_left"] > 0
+                     and not g["cooldown_until"]]
+            if not cands:
+                rows = [self._gates(target, k) for k in self._keys_sorted(target)]
+                eta = iso(pt_midnight_ts(cfg.quota_day_tz, days_ahead=1))
+                raise QuotaExhaustedError(
+                    rows, eta,
+                    hint=f"no key can serve {target} now, so an upload would be spent "
+                         f"for nothing — retry after the reset or free a key")
+        last_err: Exception | None = None
+        for k in cands:
+            t0 = self._now()
+            try:
+                up = await self.client.upload_file(k, path, mime=mime,
+                                                   display_name=display_name)
+                if up.state != "ACTIVE":     # finalize usually already says ACTIVE: no poll
+                    up = await self.client.wait_file_active(k, up.name,
+                                                            timeout_s=ready_timeout_s)
+            except GeminiHTTPError as e:
+                last_err = e
+                if e.key_rejected or e.switch_model or e.retryable:
+                    continue                      # next key, or the same one tried again
+                raise
+            except FileNotReady:
+                raise
+            kid = key_id(k)
+            ms = int((self._now() - t0) * 1000)
+            self.ledger.record_upload(key_id=kid, nbytes=up.size, source=source,
+                                      latency_ms=ms)
+            return replace(up, sha256=sha256, key_id=kid)
+        raise RouterError(f"no key accepted the upload: {last_err}")
+
+    async def count_file_tokens(self, model: str, uri: str, mime: str, *,
+                               key_id: str | None = None) -> int:
+        """Exact cost of a file for a model. Free (FR-C7) and key-agnostic, so any live
+        key answers; a rejected one moves the call to the next."""
+        for k in self._candidates(1 if key_id else None, key_id, model):
+            try:
+                return await self.client.count_file_tokens(k, model, uri, mime)
+            except GeminiHTTPError as e:
+                if e.key_rejected or e.switch_model:
+                    continue
+                raise
+        raise RouterError("no key could count file tokens")
+
+    async def delete_file(self, name: str, *, key_id: str | None = None) -> None:
+        """Drop a provider-side file. Best-effort: expiry is the provider's own job."""
+        for k in self._candidates(1 if key_id else None, key_id, self.cfg.chain[0]):
+            try:
+                await self.client.delete_file(k, name)
+                return
+            except GeminiHTTPError as e:
+                if e.key_rejected or e.switch_model:
+                    continue
+                raise
+        raise RouterError("no key could delete the file")
+
+    def _candidates(self, limit: int | None, key_id_: str | None, model: str) -> list[str]:
+        keys = self.cfg.api_keys
+        if key_id_:
+            keys = [k for k in keys if key_id(k) == key_id_] or keys
+        elif limit:
+            keys = self._keys_sorted(model)[:limit]
+        return list(keys)
+
     # ------------------------------------------------------------------ internals
     def _tier_plan(self, req: RouterRequest, avail: dict) -> list[tuple[int, list[str]]]:
         chain = [req.model] if req.model else list(dict.fromkeys(self.cfg.chain))
@@ -369,7 +494,9 @@ class Router:
 
     async def _try_candidate(self, req: RouterRequest, tier: int, model: str, key: str,
                              est: int, mot: int, wait_enabled: bool, deadline: float,
-                             emit: Emitter, failures: list[str], dead_keys: set[str]):
+                             emit: Emitter, failures: list[str], dead_keys: set[str],
+                             files: list[UploadedFile] | None = None,
+                             fhashes: list[str] | None = None):
         cfg = self.cfg
         kid = key_id(key)
         g = self._gates(model, key, est)
@@ -377,7 +504,7 @@ class Router:
             emit("switch", model=model, key_id=kid, detail={"reason": "rpd"})
             return None, "quota"
 
-        h = cache_hash(model, req, mot) if req.kind != "count" else None
+        h = cache_hash(model, req, mot, fhashes) if req.kind != "count" else None
         if h:                                                    # FR-C11: cache hit = 0 spend
             row = self.ledger.cache_get(h, None, cfg.cache_ttl_h * 3600)
             if row:
@@ -421,7 +548,8 @@ class Router:
                 gr = await self.client.generate(
                     key, model, prompt=req.prompt, system=req.system,
                     thinking_level=req.thinking_level, output_format=req.output_format,
-                    max_output_tokens=mot)
+                    max_output_tokens=mot,
+                    file_parts=file_parts(files) if files else None)
             except GeminiHTTPError as e:
                 ms = int((self._now() - t0) * 1000)
                 if e.quota_day:                                  # FR-C4: live daily 429

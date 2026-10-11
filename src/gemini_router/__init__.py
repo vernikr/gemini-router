@@ -2,16 +2,23 @@
 
 Public API (docs/SPEC.md §2):
     Router, RouterRequest, RouterResult, RouterEvent,
-    RouterError, GeminiHTTPError, QuotaExhaustedError,
-    Config, Limits, Ledger, GeminiClient, extract_json, key_id, estimate_tokens
+    RouterError, GeminiHTTPError, QuotaExhaustedError, FileUploadFailed, FileNotReady,
+    Config, Limits, Ledger, GeminiClient, GenResult, UploadedFile,
+    extract_json, file_parts, key_id, estimate_tokens
 """
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 
 from .config import Config, Limits, RetryCfg, WaitCfg, estimate_tokens, key_id
-from .errors import GeminiHTTPError, QuotaExhaustedError, RouterError
+from .errors import (
+    FileNotReady,
+    FileUploadFailed,
+    GeminiHTTPError,
+    QuotaExhaustedError,
+    RouterError,
+)
 from .events import RouterEvent
-from .gemini import GeminiClient, GenResult, extract_json, is_gemini3
+from .gemini import GeminiClient, GenResult, UploadedFile, extract_json, file_parts, is_gemini3
 from .ledger import Ledger, iso, pt_midnight_ts
 from .routing import Router, RouterRequest, RouterResult, cache_hash, gates_for, pick_gemma
 
@@ -23,6 +30,7 @@ except PackageNotFoundError:           # unpackaged run from a source checkout
 __all__ = [
     "Router", "RouterRequest", "RouterResult", "RouterEvent",
     "RouterError", "GeminiHTTPError", "QuotaExhaustedError",
+    "FileUploadFailed", "FileNotReady", "UploadedFile", "file_parts",
     "Config", "Limits", "RetryCfg", "WaitCfg", "Ledger", "GeminiClient", "GenResult",
     "extract_json", "is_gemini3", "key_id", "estimate_tokens", "cache_hash",
     "gates_for", "pick_gemma", "pt_midnight_ts", "iso", "__version__",

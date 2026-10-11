@@ -26,6 +26,14 @@ class GeminiHTTPError(RouterError):
         self.key_rejected = key_rejected  # this key must not be retried in this request
 
 
+class FileUploadFailed(RouterError):
+    """The provider marked the upload FAILED, or answered the lifecycle incoherently."""
+
+
+class FileNotReady(RouterError):
+    """Still PROCESSING after the wait budget — the caller decides to wait or re-upload."""
+
+
 class QuotaExhaustedError(RouterError):
     """All candidates blocked by quota and overflow not requested/available (FR-B8)."""
 
