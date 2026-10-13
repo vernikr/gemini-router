@@ -13,6 +13,9 @@ Router changes:
   allowlists still restrict candidates, and a model/key that actually refuses that
   media with HTTP 400/500 is learned and skipped on later calls. Refusals are per
   **media × model × key**, not a fleet-wide ban.
+- A PDF upload also receives the request's overflow policy: even if Flash's day
+  is exhausted, a key with Lite quota can accept the initial file. The free
+  `countTokens` measurement still precedes generation.
 - A Files API URI is project/key-local. Callers may provide matching local
   `file_paths` to `complete`: when a different key is chosen, the router streams
   the entire file/pack to that key once, records each upload in the shared ledger,

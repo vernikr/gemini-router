@@ -393,6 +393,32 @@ async def test_pdf_falls_back_to_lite_after_primary_quota(mock_api, tmp_path):
     assert result.files_used[0].uri == up.uri
 
 
+async def test_pdf_upload_still_starts_when_flash_day_is_spent_but_lite_is_free(
+        mock_api, tmp_path):
+    _mock_upload(mock_api)
+    router = _router(tmp_path, chain=["gemini-3.8-flash"],
+                     overflow_tiers=["gemini-3.5-flash-lite"],
+                     limits_per_key_model={"rpd": 1, "rpm": 5, "tpm": 250_000})
+    row = router.ledger.plan(key_id=key_id("k1"), model="gemini-3.8-flash",
+                             kind="single", est_tokens=10, request_id=None, source="test")
+    router.ledger.resolve(row, "ok", tokens_in=10, tokens_out=1)
+    path = _blob(tmp_path)
+    up = await router.upload_file(path, mime="application/pdf",
+                                  model="gemini-3.8-flash", overflow="lite")
+    tried = []
+
+    def answer(request):
+        tried.append(request.url.path.split("/models/")[1].split(":")[0])
+        return gen_resp("Lite PDF read")
+
+    mock_api.post(url__regex=r".*:generateContent").mock(side_effect=answer)
+    result = await router.complete(RouterRequest(prompt="read", est_tokens=100,
+                                                  overflow="lite", wait=False),
+                                   files=[up], file_paths=[path])
+    assert tried == ["gemini-3.5-flash-lite"]
+    assert result.text == "Lite PDF read" and result.overflow_tier == 1
+
+
 async def test_pdf_reuploads_once_on_key_switch_and_reports_serving_file(mock_api, tmp_path):
     path = _blob(tmp_path)
     uploads = []

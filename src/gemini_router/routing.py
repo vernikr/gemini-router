@@ -463,15 +463,17 @@ class Router:
     async def upload_file(self, path: str | Path, *, mime: str | None = None,
                           model: str | None = None, source: str = "cli",
                           display_name: str | None = None, key: str | None = None,
-                          sha256: str | None = None,
+                          overflow: str = "off", sha256: str | None = None,
                           ready_timeout_s: float = 30.0) -> UploadedFile:
         """Upload a blob and hand back the provider record, pinned to the key that will
         serve the analysis. The key is chosen the way `complete` would choose it, minus
         keys whose day is spent or which sit in cooldown — uploading a file for a key
         that cannot then answer spends an upload for nothing.
 
-        `sha256` (the local blob's hash) is what the cache keys on; compute it when the
-        caller already has it. The file is left ACTIVE on the provider side."""
+        For a PDF, pass the same `overflow` policy as the generation request: if
+        every chain-head key is day-drained, select a key with Lite/Gemma budget
+        instead of refusing the upload before text-style routing can start.
+        `sha256` is the local blob's hash for the cache. The file stays ACTIVE."""
         cfg = self.cfg
         target = model or cfg.chain[0]
         if sha256 is None:
@@ -479,16 +481,28 @@ class Router:
         if key:
             cands = [key]
         else:
-            cands = [k for k in self._keys_sorted(target)
-                     if (g := self._gates(target, k))["rpd_left"] > 0
-                     and not g["cooldown_until"]]
+            targets = [target]
+            if overflow in ("lite", "lite+gemma"):
+                targets += [m for m in cfg.overflow_tiers if m != "gemma-auto"]
+            if overflow == "lite+gemma":
+                avail = await self._safe_avail()
+                union = set().union(*(s for s in avail.values() if s))
+                if gemma := pick_gemma(union):
+                    targets.append(gemma)
+            cands = []
+            for m in dict.fromkeys(targets):
+                cands = [k for k in self._keys_sorted(m)
+                         if (g := self._gates(m, k))["rpd_left"] > 0
+                         and not g["cooldown_until"]]
+                if cands:
+                    break
             if not cands:
-                rows = [self._gates(target, k) for k in self._keys_sorted(target)]
+                rows = [self._gates(m, k) for m in dict.fromkeys(targets)
+                        for k in self._keys_sorted(m)]
                 eta = iso(pt_midnight_ts(cfg.quota_day_tz, days_ahead=1))
                 raise QuotaExhaustedError(
-                    rows, eta,
-                    hint=f"no key can serve {target} now, so an upload would be spent "
-                         f"for nothing — retry after the reset or free a key")
+                    rows, eta, hint="no key can serve the requested chain/overflow "
+                    "models now; retry after the reset or free a key")
         last_err: Exception | None = None
         for k in cands:
             t0 = self._now()

@@ -63,7 +63,9 @@ router.complete_sync(...)                      # blocking facade (tldr-digest mi
 up: UploadedFile = await router.upload_file(
     path, mime=None,             # default from the suffix
     model=None,                  # whose serving key to pick; None → chain head
-    source="cli", display_name=None, key=None, sha256=None, ready_timeout_s=30.0)
+    source="cli", display_name=None, key=None,
+    overflow="lite+gemma",     # for PDF: allow a key with overflow quota if Flash is spent
+    sha256=None, ready_timeout_s=30.0)
 # UploadedFile: name, uri, mime, size, state, expires_at, sha256, key_id,
 #               media_resolution ("low" | "medium" | "high" | None = provider default)
 up  = up.with_resolution("high")            # pins the level for measurement AND request
@@ -88,7 +90,9 @@ loose keyword.
 `complete(..., files=[…])` requires `est_tokens`: the TPM gate includes the measured
 file tokens. A provider file belongs to its uploading key. Supplying matching local
 `file_paths` lets the router stream one new upload per alternate key as needed, then
-walk the same model/key tiers as a text request; gateway single, group and split-PDF
+walk the same model/key tiers as a text request. Pass the same `overflow` policy to
+`upload_file` so it can start even when only a Lite/Gemma key has quota; counting
+file tokens stays free. Gateway single, group and split-PDF
 paths all supply these sources. The result's `files_used` records the *serving* uploads.
 If the caller does not supply local paths, the router safely retains historical
 single-key pinning and never sends a foreign URI. The request carries `file_data`
