@@ -205,17 +205,19 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
   gemini-mcp `docs/worklog/archive/2026.10.11-remaining-work/plan.md` §E: PDF via `file_data` →
   HTTP 500 on `gemini-3.5-flash-lite`, HTTP 400 on `gemini-3-flash-preview`, OK on
   `gemini-3.6-flash`; PNG via `file_data` → OK on lite and preview, 400 on
-  `gemma-4-31b-it`, whose inline-image path works. The router enforces this per modality:
-  a request carrying only images keeps lite/preview as candidates, while a PDF narrows
-  the chain to the models that actually read PDFs.
+  `gemma-4-31b-it`, whose inline-image path works. The router's conservative
+  per-modality gate was based on that historical measurement; it is not a claim that
+  every key still rejects Lite/PDF.
 
   *Official* — `ai.google.dev` model pages (fetched 2026-10-11) list PDF as a supported
   input for `gemini-3.5-flash-lite`; the Gemma 4 card lists text and images. The docs and
-  practice disagree for lite + PDF at the moment of writing, and both statements stay here
-  on purpose. A later key *did* read a hidden code in a Lite/PDF file; the observed
-  support is not yet confirmed across keys. Keep the conservative routing policy
-  until an independent check; dated evidence lives in
-  `docs/worklog/archive/2026.10.12-third-key-capability-probe/`.
+  practice disagreed for lite + PDF on 2026-10-11, and both dated statements stay
+  here on purpose. On 2026-10-12 **two independent keys** (new VPS and existing CI)
+  each read the hidden PDF code on Lite, while Gemma/PNG returned HTTP 500 on both.
+  This is content-verified drift, not a reason to switch the production fleet
+  automatically. A per-key/opt-in policy needs an explicit decision. Evidence lives
+  in `docs/worklog/archive/2026.10.12-third-key-capability-probe/` and
+  `docs/worklog/archive/2026.10.11-capability-canary/`.
 
   Corollary for measurement: **`countTokens` is lenient** — it accepted a PDF part for lite
   and preview while `generateContent` refused it, so a successful count is a price, never a
@@ -223,7 +225,7 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
   generateContent canary on a CI key and verifies a hidden PDF marker/image color in
   the answer (not just HTTP 200), separate from the free `tariff-drift.yml` count.
   Drift is an alert for review, never an automatic change to the production gates;
-  see this repo's `docs/worklog/2026.10.11-capability-canary/` for its case matrix.
+  see this repo's `docs/worklog/archive/2026.10.11-capability-canary/` for its case matrix.
 
   Companion fix (same day): a quota-drained chain no longer tells the caller to re-upload
   the file under another key — that message now appears only when the key itself cannot

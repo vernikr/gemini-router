@@ -57,9 +57,9 @@ class Config(BaseModel):
     # a file job stays on the chain and a model that answers 400/500 to file input is
     # remembered as incapable for that media class. A flat list applies to every class;
     # a dict narrows per class ({"pdf": [...], "image": [...]}). Historical measurements
-    # differ by key/date: 2026-10-11 Lite/PDF refused, 2026-10-12 a new key read a
-    # hidden PDF code on Lite. Keep file overflow conservative until independently
-    # confirmed; source: docs/worklog/archive/2026.10.12-third-key-capability-probe/.
+    # differ by key/date: 2026-10-11 Lite/PDF refused, 2026-10-12 new VPS and CI
+    # keys read the hidden PDF code on Lite. File overflow stays conservative until
+    # an explicit rollout decision; see docs/worklog/archive/2026.10.11-capability-canary/.
     file_capable_models: list[str] | dict[str, list[str]] | None = None
     temperature: float | None = None           # applied to pre-3.x models only
     max_output_tokens_default: int = 32768   # cap only; 3.x thinking tokens count toward it

@@ -44,10 +44,14 @@ capability change. The first email was **provisional and unverified**; the secon
 was a truthful quota alert. The workflow originally ran Monday 06:43 UTC, before
 PT-midnight's 07:00/08:00 UTC seasonal reset. Corrected to Monday 09:20 UTC in
 0.3.3 — after the expected reset in either season. A rolling limit or other
-provider-side quota may still produce 429. See
-`docs/blockers/b01-capability-canary-quota.md` for the after-reset check. The next
-weekly run is automatic. This is CI-only monitoring;
-no public library API or daemon deployment changes. An owner-authorized one-off
-VPS probe later confirmed Lite/PDF on a different key; its distinct evidence and
-fleet-wide routing decision gate live in
+provider-side quota may still produce 429. The first weekly run, GitHub Actions `38295177978` on 2026-10-12 at 19:04 UTC
+(despite the 09:20 UTC cron), completed the matrix on the *CI key*. Flash/PDF and
+Lite/PNG controls read their fixtures; Lite/PDF reproduced the hidden PDF code
+(**verified drift**); Gemma/PNG returned HTTP 500 (baseline match). The new VPS
+key independently agreed on all four cases. The CI result resolves the earlier
+quota blocker in `docs/blockers/archive/b01-capability-canary-quota.md`. The run is
+red because capability changed, not because it failed to reach the provider.
+This is CI-only monitoring: no automatic file-gate or daemon change. An owner
+must decide whether/how to enable the newly observed Lite/PDF support after
+considering per-key rollout; see the separate VPS probe in
 `docs/worklog/archive/2026.10.12-third-key-capability-probe/`.

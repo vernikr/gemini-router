@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from scripts.tariff_check import one_page_pdf, png, send_mail
@@ -136,6 +137,59 @@ def summarize(results: list[tuple[Case, str, str]]) -> tuple[int, str]:
     return 0, body
 
 
+def alert_message(results: list[tuple[Case, str, str]], code: int, details: str,
+                  *, event: str = "", run_id: str = "") -> tuple[str, str]:
+    """Owner-facing mail: state the product, verdict, impact and concrete next step."""
+    prefix = "[Gemini Router | файлы]"
+    changed = [case.label for case, verdict, _ in results if verdict == "drift"]
+    quota = any("HTTP 429" in detail for _, _, detail in results)
+    names = {
+        "flash/pdf": "Flash не прочитала PDF",
+        "lite/png": "Flash-Lite не прочитала PNG",
+        "lite/pdf": "Flash-Lite прочитала PDF",
+        "gemma/png": "Gemma прочитала PNG",
+    }
+    if code == 1:
+        what = names.get(changed[0], "изменилась поддержка файлов") if len(changed) == 1 else (
+            "изменилась поддержка файлов у нескольких моделей")
+        subject = f"{prefix} НУЖНО РЕШЕНИЕ: {what}"
+        outcome = "Подтверждено чтение содержимого файла там, где раньше был отказ."
+        action = ("Сравните результат с независимыми ключами и решите, разрешать ли "
+                  "изменившейся модели обработку этих файлов. Если да — сначала "
+                  "включите ограниченный резервный маршрут с предупреждением ⚠️. "
+                  "Автоматически маршрутизация не изменена.")
+    elif quota and event == "schedule":
+        subject = f"{prefix} НУЖНО ДЕЙСТВИЕ: лимит ключа остановил проверку"
+        outcome = "Проверка НЕ установила, изменилась ли поддержка файлов: HTTP 429."
+        action = ("Выделите отдельный ключ для мониторинга в секрете GitHub Actions "
+                  "GEMINI_API_KEY либо согласуйте его замену. Пока ключ недоступен, "
+                  "еженедельная проверка не даёт ответа. Не запускайте её повторно "
+                  "сразу и не переносите ключ с рабочего VPS без отдельного решения.")
+    elif quota:
+        subject = f"{prefix} ПОКА ЖДАТЬ: проверку остановил лимит ключа"
+        outcome = "Проверка НЕ установила, изменилась ли поддержка файлов: HTTP 429."
+        action = ("Сейчас ничего менять не нужно. Дождитесь планового прогона в "
+                  "понедельник после сброса суточной квоты (09:20 UTC). Если и он "
+                  "получит 429, понадобится отдельный ключ мониторинга. "
+                  "Не повторяйте запросы сразу.")
+    else:
+        subject = f"{prefix} ПРОВЕРИТЬ: тест чтения файлов не завершён"
+        outcome = "Поддержка файлов не установлена: контроль или соединение не прошли."
+        action = ("Проверьте журнал запуска и доступность ключа/модели; повторяйте "
+                  "тест только после устранения причины. Не меняйте маршрутизацию "
+                  "по этому письму.")
+    date = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    link = (f"https://github.com/vernikr/gemini-router/actions/runs/{run_id}"
+            if run_id.isdigit() else "GitHub Actions → vernikr/gemini-router → capability-check")
+    body = (f"Gemini Router — еженедельная проверка чтения PDF и PNG моделями.\n"
+            f"Дата: {date}\nРезультат: {outcome}\n\n"
+            f"Что делать: {action}\n\n"
+            "Важно: это проверка на ключе мониторинга; рабочий gateway не переключался. "
+            "Ответ HTTP 200 без чтения скрытого содержимого не считается поддержкой.\n\n"
+            f"Подробности:\n{details}\n\nЗапуск: {link}\n")
+    return subject, body
+
+
 async def main() -> int:
     key = os.environ.get("GEMINI_API_KEY", "")
     if not key:
@@ -144,6 +198,7 @@ async def main() -> int:
         return 2
     cfg = Config(api_keys=[key], chain=[FLASH], state_path=":memory:")
     client = GeminiClient(cfg)
+    results: list[tuple[Case, str, str]] = []
     try:
         with tempfile.TemporaryDirectory() as tmp:
             results = await check(client, key, Path(tmp), cases())
@@ -155,10 +210,12 @@ async def main() -> int:
         await client.aclose()
     print(body)
     if code:
-        subject = ("capability drift" if code == 1 else "capability canary inconclusive")
+        subject, owner_body = alert_message(
+            results, code, body, event=os.environ.get("GITHUB_EVENT_NAME", ""),
+            run_id=os.environ.get("GITHUB_RUN_ID", ""))
         print("::error::" + subject)
         try:
-            send_mail(subject, body)
+            send_mail(subject, owner_body)
         except Exception as e:  # noqa: BLE001 — CI red is the fallback alert
             print(f"mail failed ({type(e).__name__}); red run remains the alert")
     else:

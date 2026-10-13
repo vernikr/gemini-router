@@ -103,6 +103,43 @@ def test_missing_proof_never_counts_generic_http_200_as_success():
     assert monitor.classify("blocked", status=None, answer="sure") == "inconclusive"
 
 
+def test_owner_mail_names_project_verdict_action_and_run():
+    case = monitor.Case("lite/pdf", "gemini-3.5-flash-lite", "pdf", "blocked",
+                        monitor.PDF_MARKER)
+    subject, body = monitor.alert_message(
+        [(case, "drift", "content verified")], 1, "lite/pdf: content verified",
+        event="schedule", run_id="12345")
+    assert "Gemini Router" in subject and "НУЖНО РЕШЕНИЕ" in subject
+    assert "Flash-Lite прочитала PDF" in subject
+    assert "Что делать:" in body and "Автоматически маршрутизация не изменена" in body
+    assert "https://github.com/vernikr/gemini-router/actions/runs/12345" in body
+    assert monitor.PDF_MARKER not in body  # no fixture secret in the owner mail
+
+
+def test_429_mail_distinguishes_scheduled_action_from_manual_wait():
+    case = monitor.cases()[0]
+    rows = [(case, "inconclusive", "HTTP 429")]
+    scheduled_subject, scheduled_body = monitor.alert_message(
+        rows, 2, "flash/pdf: HTTP 429", event="schedule")
+    manual_subject, manual_body = monitor.alert_message(
+        rows, 2, "flash/pdf: HTTP 429", event="workflow_dispatch")
+    assert "НУЖНО ДЕЙСТВИЕ" in scheduled_subject
+    assert "GEMINI_API_KEY" in scheduled_body and "рабочего VPS" in scheduled_body
+    assert "ПОКА ЖДАТЬ" in manual_subject
+    assert "понедельник" in manual_body and "Не повторяйте" in manual_body
+    assert "НЕ установила" in scheduled_body and "НЕ установила" in manual_body
+
+
+def test_non_quota_inconclusive_mail_does_not_claim_support():
+    case = monitor.cases()[0]
+    subject, body = monitor.alert_message(
+        [(case, "inconclusive", "HTTP 503")], 2, "flash/pdf: HTTP 503",
+        event="schedule")
+    assert "ПРОВЕРИТЬ" in subject
+    assert "Поддержка файлов не установлена" in body
+    assert "Не меняйте маршрутизацию" in body
+
+
 def test_weekly_probe_follows_both_pacific_midnight_resets():
     """PT midnight is 07:00 UTC in summer and 08:00 UTC in winter."""
     import re

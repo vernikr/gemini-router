@@ -32,3 +32,8 @@ agent-visible ⚠️. Do not automatically rewrite the matrix based on HTTP 200 
 Published as documentation/comment-only router patch 0.3.4: 115 tests, ruff and
 secrets guard green; release test/PyPI jobs green. The gateway's deployed routing
 behavior is unchanged.
+
+**2026-10-13 addendum:** the scheduled run on 2026-10-12 independently verified
+Lite/PDF on the older CI key and saw the same Gemma/PNG HTTP 500. The original
+one-key limitation above is now historical; the routing decision remains open.
+See `docs/worklog/archive/2026.10.11-capability-canary/` for the CI evidence.

@@ -510,10 +510,10 @@ class Router:
             # Overflow tiers are a quota device for text; sending a file job there burns
             # a call and ends in a misleading "quota exhausted". Capability is per model
             # × modality (historical matrix: gemini-mcp worklog §E). The 2026-10-11
-            # Lite/PDF refusal was not universal: one new key read a hidden PDF code
-            # on 2026-10-12 (router worklog 2026.10.12-third-key-capability-probe).
-            # File overflow remains disabled pending independent confirmation;
-            # a successful countTokens or ungrounded reply is NOT capability proof.
+            # Lite/PDF refusal was not universal: two independent keys read the hidden
+            # code on 2026-10-12 (router archived capability-canary worklog). File
+            # overflow remains disabled until explicit staged rollout approval;
+            # successful countTokens or ungrounded prose is NOT capability proof.
             fcm = self.cfg.file_capable_models
             for cls in sorted(file_classes):
                 allow = fcm.get(cls) if isinstance(fcm, dict) else fcm
