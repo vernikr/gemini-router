@@ -32,3 +32,8 @@ mail copy only: no API key, cron, routing gate, or model-serving behavior change
 Unit tests cover drift, both 429 paths and generic inconclusive mail; no message
 is sent in tests or for a healthy run. The tariff monitor's mail is a separate
 workflow and was not modified by this capability-mail request.
+
+Published as router 0.3.6 (`c6a5c5f`): 118 tests, ruff and secrets guard passed;
+GitHub release `38432688132` test and PyPI succeeded. No live canary was
+redispatched, so no quota-consuming request or test email was sent. The next
+scheduled mail (if any) uses the new copy.
