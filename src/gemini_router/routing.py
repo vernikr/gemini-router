@@ -62,6 +62,7 @@ class RouterResult:
     quota_after: list[dict] = field(default_factory=list)
     request_id: str | None = None
     row_id: int | None = None
+    files_used: list[UploadedFile] = field(default_factory=list)  # actual key's uploads
 
 
 def gates_from(cfg: Config, model: str, kid: str, spent: tuple[int, int],
@@ -143,9 +144,9 @@ class Router:
         self._sleep = sleep or asyncio.sleep
         self._now = now or time.time
         self._avail: tuple[float, dict[str, set[str] | None]] | None = None
-        # Models that answered 400/500 to a file request in this process, per media
-        # class (see _tier_plan): capability is per model × modality, not one flag.
-        self._file_incapable: dict[str, set[str]] = {}
+        # A refusal is per media class × model × key: another key may serve the same
+        # model/file combination. Never turn one account's 400/500 into a global ban.
+        self._file_incapable: dict[str, set[tuple[str, str]]] = {}
 
     @classmethod
     def from_env(cls, config_path: str | None = None, **over) -> Router:
@@ -270,10 +271,14 @@ class Router:
 
     # ------------------------------------------------------------------ main
     async def complete(self, req: RouterRequest, on_event: Emitter | None = None,
-                       files: list[UploadedFile] | None = None) -> RouterResult:
-        """`files` are uploads from `upload_file` on THIS router. They pin the request to
-        the keys they were uploaded under — a file is visible only to its own project —
-        so a key switch means the caller re-uploads, not this method retrying elsewhere."""
+                       files: list[UploadedFile] | None = None,
+                       file_paths: list[str | Path] | None = None) -> RouterResult:
+        """Route files like text when local sources permit re-upload on key switch.
+
+        A provider file is visible only to its uploading key. With matching local
+        `file_paths`, re-upload once per new key after quota/availability switching;
+        without them keep the historical pin, never send a foreign URI under a key.
+        The gateway supplies local sources for both single and packed PDFs."""
         events: list[RouterEvent] = []
 
         def emit(stage: str, **kw) -> None:
@@ -294,7 +299,15 @@ class Router:
             if any(f.key_id is None for f in files):
                 raise RouterError("files must come from Router.upload_file — without the "
                                   "key_id the request cannot be pinned to their project")
-        pins = {f.key_id for f in files}
+        if file_paths is not None:
+            if len(file_paths) != len(files) or not files:
+                raise RouterError("file_paths must match the uploaded files one-for-one")
+            if any(not Path(p).is_file() for p in file_paths):
+                raise RouterError("local file source missing; cannot switch upload key")
+        pins = {f.key_id for f in files} if file_paths is None else set()
+        uploads_by_key: dict[str, list[UploadedFile]] = {}
+        if len({f.key_id for f in files}) == 1:
+            uploads_by_key[files[0].key_id] = files
         fhashes = [f.sha256 or "" for f in files] or None
         wait_enabled = req.wait if req.wait is not None else cfg.wait.enabled_default
         mot = req.max_output_tokens or cfg.max_output_tokens_default
@@ -320,6 +333,7 @@ class Router:
         quota_blocked = False
         unavailable: set[str] = set()
         dead_keys: set[str] = set()
+        failed_upload_keys: set[str] = set()
         tried: list[str] = []
 
         fclasses = {media_class(f.mime) for f in files} if files else None
@@ -330,7 +344,12 @@ class Router:
                 tried.append(model)
                 for key in self._keys_sorted(model):
                     kid = key_id(key)
-                    if kid in dead_keys or (pins and kid not in pins):
+                    if kid in dead_keys or kid in failed_upload_keys or (pins and kid not in pins):
+                        continue
+                    if fclasses and any((model, kid) in self._file_incapable.get(cls, ())
+                                        for cls in fclasses):
+                        emit("switch", model=model, key_id=kid,
+                             detail={"reason": "file_refused"})
                         continue
                     s = avail.get(kid)
                     if s is not None and model not in s:
@@ -339,12 +358,46 @@ class Router:
                             emit("switch", model=model, key_id=kid,
                                  detail={"reason": "unavailable"})
                         continue
+                    serving = uploads_by_key.get(kid) if files else None
+                    if files and serving is None and file_paths is not None:
+                        # Do not upload for a day-drained key. One copy per key serves
+                        # all later model candidates; uploads are free but audited.
+                        if self._gates(model, key, est)["rpd_left"] <= 0:
+                            quota_blocked = True
+                            emit("switch", model=model, key_id=kid,
+                                 detail={"reason": "rpd"})
+                            continue
+                        serving = []
+                        try:
+                            for original, path in zip(files, file_paths, strict=True):
+                                up = await self.upload_file(
+                                    path, mime=original.mime, model=model,
+                                    source=req.source, key=key, sha256=original.sha256)
+                                serving.append(up.with_resolution(original.media_resolution)
+                                               if original.media_resolution else up)
+                        except (RouterError, httpx.HTTPError):
+                            # A partial multi-file upload must not be used. Best effort
+                            # cleanup; the provider TTL handles any failed deletion.
+                            failed_upload_keys.add(kid)
+                            for up in serving:
+                                try:
+                                    await self.client.delete_file(key, up.name)
+                                except (RouterError, httpx.HTTPError):
+                                    pass
+                            failures.append(f"{model}: re-upload failed on key {kid}")
+                            emit("switch", model=model, key_id=kid,
+                                 detail={"reason": "reupload_failed"})
+                            continue
+                        uploads_by_key[kid] = serving
+                        emit("uploading", model=model, key_id=kid,
+                             detail={"reason": "key_switch", "files": len(serving)})
                     res, outcome = await self._try_candidate(
                         req, tier, model, key, est, mot, wait_enabled, deadline, emit,
-                        failures, dead_keys, files, fhashes)
+                        failures, dead_keys, serving if files else None, fhashes)
                     if res is not None:
                         res.events = events
                         res.quota_after = self.model_budgets(tried)
+                        res.files_used = serving or []
                         return res
                     if outcome in ("quota", "wait_skip"):
                         quota_blocked = True
@@ -359,13 +412,14 @@ class Router:
         # this must be read before the pin clause below — and the pin clause itself must
         # not fire on a quota block, or a 429-drained chain tells the user to re-upload a
         # file under a key that was never the issue (found by test on 2026-10-11).
-        if files and not quota_blocked and self._file_incapable:
+        if files and not quota_blocked and any(self._file_incapable.get(cls)
+                                                for cls in (fclasses or ())):
             raise RouterError(
-                "no model in the chain can read this file: " + self._incapable_note() +
+                "no configured model/key can read this file: " + self._incapable_note() +
                 " answered 400/500 to a file request. Capability is per model × media "
-                "kind (measured 2026-10-11: PDFs serve on the main flash models; images "
-                "also on lite/preview; gemma takes inline images only). Put a capable "
-                "model in `chain:` (or name the capable ones in `file_capable_models:`).")
+                "kind and can change over time; Lite/PDF was content-verified on two "
+                "keys in 2026-10. Use a capable chain/overflow model or set "
+                "`file_capable_models:` to narrow the candidates.")
         if pins and not failures and not quota_blocked:
             raise RouterError(
                 f"no request pinning a file could run: key(s) {sorted(pins)} cannot serve "
@@ -381,9 +435,9 @@ class Router:
                     f"daily quota resets ~{iso(eta)} (PT); opt in with overflow='lite' or "
                     f"'lite+gemma' to continue on weaker models")
             if files and self._file_incapable:
-                # Tell the truth about the pool of candidates, not just the quota: on a
-                # file job the "weaker models" the hint offers cannot read the file at all.
-                hint += (" · file jobs can only run on file-capable models (" +
+                # Text and file jobs share tiers, but a model that refused this media
+                # is remembered and skipped on subsequent requests in this process.
+                hint += (" · skipped file-refusing candidates (" +
                          self._incapable_note() + " answered 400/500 to file input)")
             emit("quota_exhausted", detail={"hint": hint})
             raise QuotaExhaustedError(payload, iso(eta), hint=hint, waited=wait_enabled,
@@ -496,32 +550,14 @@ class Router:
 
     # ------------------------------------------------------------------ internals
     def _incapable_note(self) -> str:
-        """`model (class/class)` pairs for every remembered file refusal, stable order."""
-        by_model: dict[str, list[str]] = {}
-        for cls, models in sorted(self._file_incapable.items()):
-            for m in models:
-                by_model.setdefault(m, []).append(cls)
-        return ", ".join(f"{m} ({'/'.join(cs)})" for m, cs in sorted(by_model.items()))
+        """Model/class/masked-key triples for learned file refusals, stable order."""
+        return ", ".join(f"{model} ({cls}, key {kid})"
+                         for cls, pairs in sorted(self._file_incapable.items())
+                         for model, kid in sorted(pairs))
 
     def _tier_plan(self, req: RouterRequest, avail: dict,
                    file_classes: set[str] | None = None) -> list[tuple[int, list[str]]]:
         chain = [req.model] if req.model else list(dict.fromkeys(self.cfg.chain))
-        if file_classes:
-            # Overflow tiers are a quota device for text; sending a file job there burns
-            # a call and ends in a misleading "quota exhausted". Capability is per model
-            # × modality (historical matrix: gemini-mcp worklog §E). The 2026-10-11
-            # Lite/PDF refusal was not universal: two independent keys read the hidden
-            # code on 2026-10-12 (router archived capability-canary worklog). File
-            # overflow remains disabled until explicit staged rollout approval;
-            # successful countTokens or ungrounded prose is NOT capability proof.
-            fcm = self.cfg.file_capable_models
-            for cls in sorted(file_classes):
-                allow = fcm.get(cls) if isinstance(fcm, dict) else fcm
-                if allow:
-                    allow = set(allow)
-                    chain = [m for m in chain if m in allow]
-                chain = [m for m in chain if m not in self._file_incapable.get(cls, ())]
-            return [(0, chain)]
         tiers = [(0, chain)]
         if req.overflow in ("lite", "lite+gemma"):
             tiers.append((1, [m for m in self.cfg.overflow_tiers if m != "gemma-auto"]))
@@ -533,6 +569,15 @@ class Router:
             g = pick_gemma(union)
             if g:
                 tiers.append((2, [g]))
+        if file_classes:
+            # Identical tier order to text; only an explicit allowlist narrows the
+            # global model list. Learned refusals are per key, filtered in the loop.
+            for cls in sorted(file_classes):
+                allow = self.cfg.file_capable_models
+                allow = allow.get(cls) if isinstance(allow, dict) else allow
+                if allow:
+                    tiers = [(tier, [m for m in models if m in allow])
+                             for tier, models in tiers]
         return tiers
 
     def _keys_sorted(self, model: str) -> list[str]:
@@ -606,7 +651,7 @@ class Router:
                 if files and e.status in (400, 500):
                     # Cannot read (at least) one of these classes: remember per class.
                     for cls in {media_class(f.mime) for f in files}:
-                        self._file_incapable.setdefault(cls, set()).add(model)
+                        self._file_incapable.setdefault(cls, set()).add((model, kid))
                 if e.quota_day:                                  # FR-C4: live daily 429
                     self.ledger.resolve(row_id, "quota", http_status=e.status, latency_ms=ms,
                                         quota_error=str(e), retry_after_s=e.retry_after)

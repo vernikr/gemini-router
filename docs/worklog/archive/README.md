@@ -15,6 +15,8 @@ Moved into this archive on 2026-10-12:
   automatically changed by the monitoring result.
 - `2026.10.13-capability-alert-copy/` — human-readable future email subjects,
   explicit next action and run link; old messages are unchanged.
+- `2026.10.13-pdf-text-routing/` — PDF shares text's model/key/overflow tiers;
+  key switches re-upload from local sources and report the serving file.
 
 The trigger-gated Interactions API migration remains in the active worklog.
 

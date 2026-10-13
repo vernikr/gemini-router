@@ -10,7 +10,7 @@ from dataclasses import replace
 import httpx
 import pytest
 
-from conftest import gen_resp, make_config
+from conftest import gen_resp, make_config, r429_day
 from gemini_router import (
     FileNotReady,
     FileUploadFailed,
@@ -336,11 +336,9 @@ async def test_an_unknown_level_fails_before_any_request(mock_api, tmp_path):
                                        media_resolution="huge")
 
 
-async def test_file_job_never_drifts_into_tiers_that_cannot_read_files(mock_api, tmp_path):
-    """Overflow tiers (lite, gemma) exist for quota on text; they answer 400/500 to a file
-    part (measured 2026-10-11). A file job must stay on the chain, or it burns a call and
-    ends in a misleading "quota exhausted" while printing a quota hint for models that
-    could never have served it."""
+async def test_pdf_uses_same_overflow_tiers_as_text(mock_api, tmp_path):
+    """Owner decision: PDF walks the same chain, Lite and Gemma tiers as text.
+    Known 400/500 failures are learned per media class for subsequent requests."""
     router, up = await _prepared(mock_api, tmp_path)
     tried: list[str] = []
 
@@ -355,10 +353,119 @@ async def test_file_job_never_drifts_into_tiers_that_cannot_read_files(mock_api,
     with pytest.raises(QuotaExhaustedError):
         await router.complete(RouterRequest(prompt="x", est_tokens=50,
                                             overflow="lite+gemma", wait=False), files=[up])
-    # both chain models were tried and both were rate-limited — and the job still never
-    # reached tier 1/2: lite and gemma cannot read a file, so dispatching them would only
-    # have produced a 400/500 and a quota hint about the wrong models
-    assert tried == ["gemini-3.8-flash", "gemini-3.7-flash"]
+    assert tried == ["gemini-3.8-flash", "gemini-3.7-flash",
+                     "gemini-3.5-flash-lite", "gemma-4-12b-it"]
+
+
+async def test_pdf_falls_back_to_lite_after_primary_quota(mock_api, tmp_path):
+    router, up = await _prepared(mock_api, tmp_path, chain=["gemini-3.8-flash"],
+                                 overflow_tiers=["gemini-3.5-flash-lite"])
+    tried = []
+
+    def answer(request):
+        model = request.url.path.split("/models/")[1].split(":")[0]
+        tried.append(model)
+        return r429_day() if model == "gemini-3.8-flash" else gen_resp("PDF read")
+
+    mock_api.post(url__regex=r".*:generateContent").mock(side_effect=answer)
+    result = await router.complete(RouterRequest(prompt="read PDF", est_tokens=100,
+                                                  overflow="lite", wait=False), files=[up])
+    assert tried == ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
+    assert result.text == "PDF read" and result.overflow_tier == 1
+    assert result.files_used[0].uri == up.uri
+
+
+async def test_pdf_reuploads_once_on_key_switch_and_reports_serving_file(mock_api, tmp_path):
+    path = _blob(tmp_path)
+    uploads = []
+
+    def start(request):
+        k = request.headers["x-goog-api-key"]
+        uploads.append(k)
+        return httpx.Response(200, headers={"x-goog-upload-url": f"{UP_URL}/{k}"},
+                              json={"file": {"name": "pending"}})
+
+    mock_api.post(f"{UPLOAD_BASE}/files").mock(side_effect=start)
+    for k in ("k1", "k2"):
+        mock_api.put(f"{UP_URL}/{k}").mock(return_value=httpx.Response(200, json={
+            "file": {**FILE_INFO, "name": f"files/{k}", "uri": f"{BASE}/files/{k}"}}))
+    router = _router(tmp_path, api_keys=["k1", "k2"], chain=["gemini-3.8-flash"])
+    original = await router.upload_file(path, mime="application/pdf", key="k1")
+    generations = []
+
+    def answer(request):
+        k = request.headers["x-goog-api-key"]
+        file_uri = json.loads(request.content)["contents"][0]["parts"][0]["file_data"]["file_uri"]
+        generations.append((k, file_uri))
+        return r429_day() if k == "k1" else gen_resp("PDF read on second key")
+
+    mock_api.post(url__regex=r".*:generateContent").mock(side_effect=answer)
+    result = await router.complete(RouterRequest(prompt="read PDF", est_tokens=100,
+                                                  wait=False), files=[original],
+                                   file_paths=[path])
+    assert uploads == ["k1", "k2"]
+    assert generations == [("k1", f"{BASE}/files/k1"), ("k2", f"{BASE}/files/k2")]
+    assert result.key_id == key_id("k2")
+    assert result.files_used[0].uri == f"{BASE}/files/k2"
+    assert result.overflow_tier == 0
+    assert len([r for r in router.ledger.calls_tail(10) if r["kind"] == "upload"]) == 2
+
+
+async def test_group_reuploads_every_file_together_on_new_key(mock_api, tmp_path):
+    upload_route = _mock_upload(mock_api)
+    router = _router(tmp_path, api_keys=["k1", "k2"], chain=["gemini-3.8-flash"])
+    paths = [tmp_path / "first.pdf", tmp_path / "second.pdf"]
+    for index, path in enumerate(paths):
+        path.write_bytes(b"P" * (index + 12))
+    original = [await router.upload_file(p, mime="application/pdf", key="k1")
+                for p in paths]
+    sent = []
+
+    def answer(request):
+        k = request.headers["x-goog-api-key"]
+        parts = json.loads(request.content)["contents"][0]["parts"]
+        sent.append((k, len([part for part in parts if "file_data" in part])))
+        return r429_day() if k == "k1" else gen_resp("group answer")
+
+    mock_api.post(url__regex=r".*:generateContent").mock(side_effect=answer)
+    result = await router.complete(RouterRequest(prompt="group", est_tokens=500, wait=False),
+                                   files=original, file_paths=paths)
+    assert sent == [("k1", 2), ("k2", 2)]
+    assert len(upload_route.calls) == 4  # initial two + whole pack on second key
+    assert len(result.files_used) == 2
+    assert {f.key_id for f in result.files_used} == {key_id("k2")}
+
+
+async def test_file_refusal_on_one_key_does_not_ban_the_same_model_on_another(
+        mock_api, tmp_path):
+    path = _blob(tmp_path)
+    _mock_upload(mock_api)
+    router = _router(tmp_path, api_keys=["k1", "k2"],
+                     chain=["gemini-3-flash-preview"])
+    up = await router.upload_file(path, mime="application/pdf", key="k1")
+    tried = []
+
+    def answer(request):
+        k = request.headers["x-goog-api-key"]
+        tried.append(k)
+        if k == "k1":
+            return httpx.Response(400, json={"error": {"code": 400,
+                "message": "file not supported", "status": "INVALID_ARGUMENT"}})
+        return gen_resp("PDF read")
+
+    mock_api.post(url__regex=r".*:generateContent").mock(side_effect=answer)
+    for prompt in ("first", "second"):
+        result = await router.complete(RouterRequest(prompt=prompt, est_tokens=100),
+                                       files=[up], file_paths=[path])
+        assert result.key_id == key_id("k2")
+    assert tried == ["k1", "k2", "k2"]
+
+
+async def test_file_source_must_match_uploaded_file(mock_api, tmp_path):
+    router, up = await _prepared(mock_api, tmp_path)
+    with pytest.raises(RouterError, match="file_paths must match"):
+        await router.complete(RouterRequest(prompt="q", est_tokens=100), files=[up],
+                              file_paths=[])
 
 
 async def test_a_model_that_rejects_files_is_remembered_for_the_next_job(mock_api, tmp_path):

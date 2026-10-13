@@ -70,7 +70,9 @@ up  = up.with_resolution("high")            # pins the level for measurement AND
 
 n   = await router.count_file_tokens(model, up.uri, up.mime, key_id=up.key_id,
                                      media_resolution=up.media_resolution)   # free (FR-C7)
-res = await router.complete(RouterRequest(prompt, est_tokens=…), files=[up], …)
+res = await router.complete(RouterRequest(prompt, est_tokens=…), files=[up],
+                            file_paths=[path], …)  # permit key rotation
+# res.files_used names the actual provider upload(s) that served the answer.
 await router.delete_file(up.name)                                 # best-effort
 ```
 
@@ -83,13 +85,15 @@ level to the count and to the request: measuring at one level and sending at ano
 the TPM gate and the ledger disagree, which is why `with_resolution()` exists rather than a
 loose keyword.
 
-`complete(..., files=[…])` pins the candidate keys to those the files were uploaded under
-(a file lives in its key's own project) and refuses without `est_tokens`: the TPM gate must
-include the measured file tokens, since a text-only estimate under-counts on the one
-request where being wrong costs a 429 mid-job. The request carries `file_data` parts ahead
-of the text, and the cache hash mixes in the file's `sha256` — never the URI, which changes
-on every re-upload. A key rejected mid-upload moves to the next key; a request whose pinned
-key cannot serve says so, and the caller re-uploads from its own blob.
+`complete(..., files=[…])` requires `est_tokens`: the TPM gate includes the measured
+file tokens. A provider file belongs to its uploading key. Supplying matching local
+`file_paths` lets the router stream one new upload per alternate key as needed, then
+walk the same model/key tiers as a text request; gateway single, group and split-PDF
+paths all supply these sources. The result's `files_used` records the *serving* uploads.
+If the caller does not supply local paths, the router safely retains historical
+single-key pinning and never sends a foreign URI. The request carries `file_data`
+parts ahead of text; the cache hashes local `sha256`, not a key-specific URI. A failed
+multi-file re-upload discards that candidate's partial bundle.
 
 Errors: `QuotaExhaustedError` carries the machine-readable payload
 (per-model rpd_left/rpm_wait_s/tpm_wait_s/cooldown_until, reset_eta_pt, hint) — frontends
@@ -191,13 +195,11 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
   `KeyLeakedError` (a `GeminiHTTPError` subclass, same failover semantics): retrying or
   switching transports cannot help a revoked credential, and the operator needs the cause
   in front of them, not a generic upload failure.
-- **A file job stays on the chain.** The overflow tiers exist for quota reasons on text; a
-  file job sent there buys a wasted call and a misleading error, so a request carrying
-  `files` never enters a tier, a model that answers 400/500 to a file request is remembered
-  as incapable *for that media class* (capability is per model × modality), and a
-  file-blind candidate set produces its own error instead of talking about quota.
-  `file_capable_models:` states the capable models explicitly when an operator prefers
-  that to learning — a flat list applies to every media class, a map narrows per class.
+- **File jobs use text's model/key tiers.** This includes opt-in Lite/Gemma overflow,
+  quota and wait rules; known 400/500 file refusals are remembered per media class
+  and skipped on later requests. An optional `file_capable_models:` allowlist may
+  narrow the models (flat for all media classes or mapped per class). A learned
+  refusal never erases the evidence that another model/key read a PDF.
 
   **Two sources, deliberately kept apart** (this repo's rule, owner, 2026-10-11):
 
@@ -205,18 +207,21 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
   gemini-mcp `docs/worklog/archive/2026.10.11-remaining-work/plan.md` §E: PDF via `file_data` →
   HTTP 500 on `gemini-3.5-flash-lite`, HTTP 400 on `gemini-3-flash-preview`, OK on
   `gemini-3.6-flash`; PNG via `file_data` → OK on lite and preview, 400 on
-  `gemma-4-31b-it`, whose inline-image path works. The router's conservative
-  per-modality gate was based on that historical measurement; it is not a claim that
-  every key still rejects Lite/PDF.
+  `gemma-4-31b-it`, whose inline-image path works. Historical gate excluded
+  all file overflow, but the owner later chose **PDF routing like text**: same
+  chain, Lite/Gemma overflow preference, per-key quotas and wait rules. Explicit
+  `file_capable_models` allowlists and learned 400/500 file refusals still narrow
+  incompatible candidates. A Gemma refusal is not evidence that Lite/PDF fails.
 
   *Official* — `ai.google.dev` model pages (fetched 2026-10-11) list PDF as a supported
   input for `gemini-3.5-flash-lite`; the Gemma 4 card lists text and images. The docs and
   practice disagreed for lite + PDF on 2026-10-11, and both dated statements stay
   here on purpose. On 2026-10-12 **two independent keys** (new VPS and existing CI)
   each read the hidden PDF code on Lite, while Gemma/PNG returned HTTP 500 on both.
-  This is content-verified drift, not a reason to switch the production fleet
-  automatically. A per-key/opt-in policy needs an explicit decision. Evidence lives
-  in `docs/worklog/archive/2026.10.12-third-key-capability-probe/` and
+  This is content-verified drift. The owner subsequently approved PDF using the
+  normal text routing policy, with no more probing of the third key. The gateway
+  still marks unrequested Lite/Gemma with ⚠️ when they serve a request. Evidence:
+  `docs/worklog/archive/2026.10.12-third-key-capability-probe/` and
   `docs/worklog/archive/2026.10.11-capability-canary/`.
 
   Corollary for measurement: **`countTokens` is lenient** — it accepted a PDF part for lite
