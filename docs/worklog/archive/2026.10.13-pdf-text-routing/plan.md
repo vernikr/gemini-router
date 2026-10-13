@@ -33,3 +33,10 @@ source count validation and historical no-source pinning. Gateway passes local
 paths for single, grouped and split PDFs; its own worklog documents those changes.
 No live capability re-test is part of this rollout; the owner's final verification
 is deferred per standing instruction.
+
+Published as router 0.4.0 (`b67e762`) followed by two narrow corrections:
+0.4.1 (`2c52c62`) retained the prior non-PDF file policy; 0.4.2 (`916083b`)
+allowed initial PDF upload on a Lite/Gemma-quota key when Flash was day-drained.
+Full batteries: 123/124/125 tests respectively, lint and secrets guard green;
+release runs `38437302498`, `38437900257`, `38438422359` all succeeded
+(test and PyPI). No third-key probe or quota-consuming call was made.
