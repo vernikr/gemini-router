@@ -7,8 +7,9 @@ This supersedes the 2026-10-11 historical no-overflow file gate.
 
 Router changes:
 
-- A file request walks the same configured chain, opt-in Lite/Gemma overflow tiers,
-  per-model/key budgets and minute-wait gates as a text request. Optional per-media
+- A PDF-containing request walks the same configured chain, opt-in Lite/Gemma
+  overflow tiers, per-model/key budgets and minute-wait gates as a text request;
+  non-PDF-only file jobs retain the previous chain-only policy. Optional per-media
   allowlists still restrict candidates, and a model/key that actually refuses that
   media with HTTP 400/500 is learned and skipped on later calls. Refusals are per
   **media × model × key**, not a fleet-wide ban.

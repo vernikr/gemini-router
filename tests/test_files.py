@@ -357,6 +357,24 @@ async def test_pdf_uses_same_overflow_tiers_as_text(mock_api, tmp_path):
                      "gemini-3.5-flash-lite", "gemma-4-12b-it"]
 
 
+async def test_image_only_keeps_previous_chain_only_policy(mock_api, tmp_path):
+    _mock_upload(mock_api, body={**FILE_INFO, "mimeType": "image/png"})
+    router = _router(tmp_path, chain=["gemini-3.8-flash"],
+                     overflow_tiers=["gemini-3.5-flash-lite"])
+    up = await router.upload_file(_blob(tmp_path), mime="image/png")
+    tried = []
+
+    def answer(request):
+        tried.append(request.url.path.split("/models/")[1].split(":")[0])
+        return r429_day()
+
+    mock_api.post(url__regex=r".*:generateContent").mock(side_effect=answer)
+    with pytest.raises(QuotaExhaustedError):
+        await router.complete(RouterRequest(prompt="look", est_tokens=100,
+                                            overflow="lite", wait=False), files=[up])
+    assert tried == ["gemini-3.8-flash"]
+
+
 async def test_pdf_falls_back_to_lite_after_primary_quota(mock_api, tmp_path):
     router, up = await _prepared(mock_api, tmp_path, chain=["gemini-3.8-flash"],
                                  overflow_tiers=["gemini-3.5-flash-lite"])

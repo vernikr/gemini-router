@@ -195,11 +195,12 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
   `KeyLeakedError` (a `GeminiHTTPError` subclass, same failover semantics): retrying or
   switching transports cannot help a revoked credential, and the operator needs the cause
   in front of them, not a generic upload failure.
-- **File jobs use text's model/key tiers.** This includes opt-in Lite/Gemma overflow,
-  quota and wait rules; known 400/500 file refusals are remembered per media class
-  and skipped on later requests. An optional `file_capable_models:` allowlist may
-  narrow the models (flat for all media classes or mapped per class). A learned
-  refusal never erases the evidence that another model/key read a PDF.
+- **PDF-containing jobs use text's model/key tiers.** This includes opt-in
+  Lite/Gemma overflow, quota and wait rules. Image/audio/video-only jobs retain the
+  historical chain-only policy. Known 400/500 file refusals are remembered per
+  media × model × key and skipped on later requests. An optional
+  `file_capable_models:` allowlist may narrow models by media class. One key's
+  refusal never erases the evidence that another key read a PDF.
 
   **Two sources, deliberately kept apart** (this repo's rule, owner, 2026-10-11):
 
@@ -209,9 +210,9 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
   `gemini-3.6-flash`; PNG via `file_data` → OK on lite and preview, 400 on
   `gemma-4-31b-it`, whose inline-image path works. Historical gate excluded
   all file overflow, but the owner later chose **PDF routing like text**: same
-  chain, Lite/Gemma overflow preference, per-key quotas and wait rules. Explicit
-  `file_capable_models` allowlists and learned 400/500 file refusals still narrow
-  incompatible candidates. A Gemma refusal is not evidence that Lite/PDF fails.
+  chain, Lite/Gemma overflow preference, per-key quotas and wait rules for PDFs.
+  Other file-only requests retain their former tier policy. Explicit allowlists
+  and per-key learned 400/500 refusals still narrow incompatible candidates.
 
   *Official* — `ai.google.dev` model pages (fetched 2026-10-11) list PDF as a supported
   input for `gemini-3.5-flash-lite`; the Gemma 4 card lists text and images. The docs and

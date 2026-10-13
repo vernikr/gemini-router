@@ -570,8 +570,11 @@ class Router:
             if g:
                 tiers.append((2, [g]))
         if file_classes:
-            # Identical tier order to text; only an explicit allowlist narrows the
-            # global model list. Learned refusals are per key, filtered in the loop.
+            # PDF-containing jobs use text's tier order. Other media keep the
+            # historical chain-only policy; Gemma still refuses PNG file_data.
+            # Allowlist narrowing is global; learned refusals are per key.
+            if "pdf" not in file_classes:
+                tiers = tiers[:1]
             for cls in sorted(file_classes):
                 allow = self.cfg.file_capable_models
                 allow = allow.get(cls) if isinstance(allow, dict) else allow
