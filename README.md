@@ -40,6 +40,15 @@ res = await router.complete(RouterRequest(prompt=..., thinking_level="high"),
                             on_event=print)
 ```
 
+### Streaming
+
+Pass `stream=True` to `Router.complete`. `on_event` receives `stream_start` before
+each provider attempt (discard the previous provisional text), then `text` events
+with `detail["text"]` deltas. The returned `RouterResult.text` is authoritative;
+cache hits return it without deltas. Text events are not retained in `result.events`.
+Truncated, blocked and interrupted responses are never cached. Existing calls stay
+non-streaming. Both paths share keys, model selection, auth fallback and the ledger.
+
 Service-style (no Python): REST `/v1/complete` + `/v1/quota` on the gemini-mcp daemon.
 
 Conventions: English in files, Conventional Commits, SemVer tags `v*` (gemini-mcp pins

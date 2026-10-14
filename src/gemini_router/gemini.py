@@ -14,6 +14,7 @@ import json
 import mimetypes
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -238,7 +239,8 @@ class GeminiClient:
     async def generate(self, key: str, model: str, *, prompt: str, system: str | None = None,
                        thinking_level: str | None = "medium", output_format: str = "text",
                        max_output_tokens: int = 8192,
-                       file_parts: list[dict] | None = None) -> GenResult:
+                       file_parts: list[dict] | None = None,
+                       on_text: Callable[[str], None] | None = None) -> GenResult:
         gen: dict = {"maxOutputTokens": max_output_tokens}
         if output_format == "json":
             gen["responseMimeType"] = "application/json"
@@ -252,6 +254,8 @@ class GeminiClient:
                          "generationConfig": gen}
         if system:
             payload["systemInstruction"] = {"parts": [{"text": system}]}
+        if on_text is not None:
+            return await self._generate_stream(key, model, payload, on_text)
         r = await self._authed("POST", f"{self.cfg.base_url}/models/{model}:generateContent",
                                key=key, json=payload)
         if r.status_code >= 400:
@@ -271,6 +275,67 @@ class GeminiClient:
                          tokens_out=usage.get("candidatesTokenCount"),
                          finish_reason=c.get("finishReason"),
                          tokens_thought=usage.get("thoughtsTokenCount"))
+
+    async def _generate_stream(self, key: str, model: str, payload: dict,
+                               on_text: Callable[[str], None]) -> GenResult:
+        url = f"{self.cfg.base_url}/models/{model}:streamGenerateContent"
+        for transport in keyauth.attempts_for(key):
+            async with self._client.stream(
+                "POST", url, json=payload,
+                headers=keyauth.merge_headers(None, key, transport),
+                params=keyauth.merge_params({"alt": "sse"}, key, transport),
+            ) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                    if (not keyauth.leaked(response.status_code, response.text)
+                            and keyauth.auth_failure(response.status_code, response.text)):
+                        failure = self._classify(response)
+                        continue
+                    raise self._classify(response)
+                keyauth.remember(key, transport)
+                chunks: list[str] = []
+                usage: dict = {}
+                finish = None
+
+                def consume(lines: list[str], usage=usage, chunks=chunks) -> None:
+                    nonlocal finish
+                    if not lines or "\n".join(lines) == "[DONE]":
+                        return
+                    try:
+                        data = json.loads("\n".join(lines))
+                        if not isinstance(data, dict) or "error" in data:
+                            raise ValueError("invalid provider event")
+                        candidates = data.get("candidates") or []
+                        candidate = next((c for c in candidates if c.get("index", 0) == 0), {})
+                        text = "".join(p.get("text", "") for p in
+                                       (candidate.get("content") or {}).get("parts", [])
+                                       if not p.get("thought"))
+                        finish = candidate.get("finishReason") or finish
+                        usage.update(data.get("usageMetadata") or {})
+                    except (ValueError, TypeError, AttributeError) as exc:
+                        raise RouterError("invalid streaming response") from exc
+                    if text:
+                        chunks.append(text)
+                        on_text(text)
+
+                event: list[str] = []
+                async for line in response.aiter_lines():
+                    if not line:
+                        consume(event)
+                        event = []
+                    elif line.startswith("data:"):
+                        event.append(line[5:].removeprefix(" "))
+                consume(event)
+                if not finish:
+                    raise httpx.RemoteProtocolError("stream ended without finishReason")
+                text = "".join(chunks)
+                if finish != "STOP" or not text.strip():
+                    raise RouterError(f"stream incomplete/blocked: {finish}")
+                return GenResult(text=text, tokens_in=usage.get("promptTokenCount"),
+                                 tokens_out=usage.get("candidatesTokenCount"),
+                                 finish_reason=finish,
+                                 tokens_thought=usage.get("thoughtsTokenCount"))
+        raise failure
 
     # ------------------------------------------------------------------
     @staticmethod

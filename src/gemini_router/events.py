@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field
 
 STAGES = ("routing", "waiting", "pacing", "dispatch", "retry", "switch",
-          "overflow", "ok", "quota_exhausted")
+          "overflow", "ok", "quota_exhausted", "stream_start", "text")
 
 
 @dataclass(slots=True)

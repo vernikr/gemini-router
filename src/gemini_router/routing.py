@@ -272,7 +272,8 @@ class Router:
     # ------------------------------------------------------------------ main
     async def complete(self, req: RouterRequest, on_event: Emitter | None = None,
                        files: list[UploadedFile] | None = None,
-                       file_paths: list[str | Path] | None = None) -> RouterResult:
+                       file_paths: list[str | Path] | None = None, *,
+                       stream: bool = False) -> RouterResult:
         """Route files like text when local sources permit re-upload on key switch.
 
         A provider file is visible only to its uploading key. With matching local
@@ -283,7 +284,8 @@ class Router:
 
         def emit(stage: str, **kw) -> None:
             ev = RouterEvent(stage=stage, **kw)
-            events.append(ev)
+            if stage != "text":
+                events.append(ev)
             if on_event:
                 on_event(ev)
 
@@ -393,7 +395,7 @@ class Router:
                              detail={"reason": "key_switch", "files": len(serving)})
                     res, outcome = await self._try_candidate(
                         req, tier, model, key, est, mot, wait_enabled, deadline, emit,
-                        failures, dead_keys, serving if files else None, fhashes)
+                        failures, dead_keys, serving if files else None, fhashes, stream)
                     if res is not None:
                         res.events = events
                         res.quota_after = self.model_budgets(tried)
@@ -609,7 +611,7 @@ class Router:
                              est: int, mot: int, wait_enabled: bool, deadline: float,
                              emit: Emitter, failures: list[str], dead_keys: set[str],
                              files: list[UploadedFile] | None = None,
-                             fhashes: list[str] | None = None):
+                             fhashes: list[str] | None = None, stream: bool = False):
         cfg = self.cfg
         kid = key_id(key)
         g = self._gates(model, key, est)
@@ -657,12 +659,17 @@ class Router:
         attempt = 0
         t0 = self._now()
         while True:
+            extra = {}
+            if stream:
+                emit("stream_start", model=model, key_id=kid, detail={"attempt": attempt})
+                extra["on_text"] = lambda text: emit(
+                    "text", model=model, key_id=kid, detail={"text": text})
             try:
                 gr = await self.client.generate(
                     key, model, prompt=req.prompt, system=req.system,
                     thinking_level=req.thinking_level, output_format=req.output_format,
                     max_output_tokens=mot,
-                    file_parts=file_parts(files) if files else None)
+                    file_parts=file_parts(files) if files else None, **extra)
             except GeminiHTTPError as e:
                 ms = int((self._now() - t0) * 1000)
                 if files and e.status in (400, 500):
@@ -699,6 +706,16 @@ class Router:
                     emit("waiting" if e.retry_after is not None else "retry",
                          model=model, key_id=kid, wait_s=round(backoff, 1),
                          detail={"reason": f"http_{e.status}", "attempt": attempt})
+                    if stream:
+                        self._resolve_err(row_id, e, ms)
+                        gate = self._gates(model, key, est)
+                        if gate["rpd_left"] <= 0 or gate["wait_s"] > 0:
+                            emit("switch", model=model, key_id=kid,
+                                 detail={"reason": "stream_retry_gate"})
+                            return None, "quota"
+                        row_id = self.ledger.plan(
+                            key_id=kid, model=model, kind=req.kind, est_tokens=est,
+                            request_id=req.request_id, source=req.source, overflow_tier=tier)
                     await self._sleep(backoff)
                     continue
                 self._resolve_err(row_id, e, ms)
@@ -716,12 +733,29 @@ class Router:
                                   max(0.0, deadline - self._now()))
                     emit("retry", model=model, key_id=kid, wait_s=round(backoff, 1),
                          detail={"reason": "network", "attempt": attempt})
+                    if stream:
+                        self.ledger.resolve(row_id, "interrupted", latency_ms=ms,
+                                            quota_error="stream transport interrupted")
+                        gate = self._gates(model, key, est)
+                        if gate["rpd_left"] <= 0 or gate["wait_s"] > 0:
+                            emit("switch", model=model, key_id=kid,
+                                 detail={"reason": "stream_retry_gate"})
+                            return None, "quota"
+                        row_id = self.ledger.plan(
+                            key_id=kid, model=model, kind=req.kind, est_tokens=est,
+                            request_id=req.request_id, source=req.source, overflow_tier=tier)
                     await self._sleep(backoff)
                     continue
-                self.ledger.resolve(row_id, "network", latency_ms=ms, quota_error=str(e)[:200])
+                self.ledger.resolve(row_id, "interrupted" if stream else "network",
+                                    latency_ms=ms, quota_error=type(e).__name__)
                 failures.append(f"{model}: network {type(e).__name__}")
                 emit("switch", model=model, key_id=kid, detail={"reason": "network"})
                 return None, "network"
+            except asyncio.CancelledError:
+                self.ledger.resolve(row_id, "interrupted" if stream else "network",
+                                    latency_ms=int((self._now() - t0) * 1000),
+                                    quota_error="request cancelled")
+                raise
             except RouterError as e:                             # blocked/empty response
                 self.ledger.resolve(row_id, "blocked",
                                     latency_ms=int((self._now() - t0) * 1000),

@@ -294,3 +294,17 @@ Rules:
   implementation to drift.
 - Log hygiene: the default transport keeps keys out of URLs; while a `query`-transport key
   is in the pool, keep the frontend's log level at INFO (httpx prints URLs at DEBUG).
+
+## Streaming completion
+
+`Router.complete(..., stream=True)` uses `streamGenerateContent?alt=sse` with the same
+request payload and quota path. `stream_start` resets provisional output before every
+provider attempt; `text` delivers visible deltas in `detail.text` (thought parts excluded).
+Deltas are callback-only, absent from the retained event trace. A cache hit emits `ok`
+without deltas; always use the final result as the authoritative answer.
+
+Only a nonempty stream terminated with `STOP` succeeds. Missing completion markers are
+transport errors; blocked/truncated answers are candidate failures and cannot enter cache.
+Stream retries reserve separate calls and recheck gates. Interrupted/cancelled streamed
+attempts count conservatively as `interrupted` in daily and sliding-window quotas.
+Cancellation propagates after resolving its reservation. Non-streaming APIs are unchanged.
