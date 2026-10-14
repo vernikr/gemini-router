@@ -306,5 +306,6 @@ without deltas; always use the final result as the authoritative answer.
 Only a nonempty stream terminated with `STOP` succeeds. Missing completion markers are
 transport errors; blocked/truncated answers are candidate failures and cannot enter cache.
 Stream retries reserve separate calls and recheck gates. Interrupted/cancelled streamed
-attempts count conservatively as `interrupted` in daily and sliding-window quotas.
+attempts count conservatively as `blocked` in daily and sliding-window quotas, with an
+interruption note. This existing status keeps older processes sharing the ledger accurate.
 Cancellation propagates after resolving its reservation. Non-streaming APIs are unchanged.

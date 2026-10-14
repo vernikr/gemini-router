@@ -142,6 +142,6 @@ async def test_disconnected_consumer_resolves_reservation(tmp_path, respx_mock, 
         with pytest.raises(BrokenPipeError):
             await router.complete(RouterRequest('hello'), receive, stream=True)
         statuses = router.ledger._conn.execute('SELECT status FROM calls').fetchall()
-        assert [r[0] for r in statuses] == ['interrupted']
+        assert [r[0] for r in statuses] == ['blocked']
     finally:
         await router.aclose()

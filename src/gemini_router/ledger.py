@@ -23,7 +23,7 @@ from datetime import time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-RPD_STATUSES = ("ok", "quota", "http5xx", "blocked", "interrupted")
+RPD_STATUSES = ("ok", "quota", "http5xx", "blocked")
 WINDOW_STATUSES = RPD_STATUSES + ("planned",)
 # 'drift' is a tariff-forecast miss note, not a provider call at all — same exclusion.
 NON_SPENDING_KINDS = ("count", "upload", "drift")

@@ -734,7 +734,7 @@ class Router:
                     emit("retry", model=model, key_id=kid, wait_s=round(backoff, 1),
                          detail={"reason": "network", "attempt": attempt})
                     if stream:
-                        self.ledger.resolve(row_id, "interrupted", latency_ms=ms,
+                        self.ledger.resolve(row_id, "blocked", latency_ms=ms,
                                             quota_error="stream transport interrupted")
                         gate = self._gates(model, key, est)
                         if gate["rpd_left"] <= 0 or gate["wait_s"] > 0:
@@ -746,13 +746,13 @@ class Router:
                             request_id=req.request_id, source=req.source, overflow_tier=tier)
                     await self._sleep(backoff)
                     continue
-                self.ledger.resolve(row_id, "interrupted" if stream else "network",
+                self.ledger.resolve(row_id, "blocked" if stream else "network",
                                     latency_ms=ms, quota_error=type(e).__name__)
                 failures.append(f"{model}: network {type(e).__name__}")
                 emit("switch", model=model, key_id=kid, detail={"reason": "network"})
                 return None, "network"
             except asyncio.CancelledError:
-                self.ledger.resolve(row_id, "interrupted" if stream else "network",
+                self.ledger.resolve(row_id, "blocked" if stream else "network",
                                     latency_ms=int((self._now() - t0) * 1000),
                                     quota_error="request cancelled")
                 raise
@@ -765,7 +765,7 @@ class Router:
                 return None, "blocked"
             except Exception:
                 if stream:
-                    self.ledger.resolve(row_id, "interrupted",
+                    self.ledger.resolve(row_id, "blocked",
                                         latency_ms=int((self._now() - t0) * 1000),
                                         quota_error="stream consumer disconnected")
                 raise
