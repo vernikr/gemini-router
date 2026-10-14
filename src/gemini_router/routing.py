@@ -660,11 +660,11 @@ class Router:
         t0 = self._now()
         while True:
             extra = {}
-            if stream:
-                emit("stream_start", model=model, key_id=kid, detail={"attempt": attempt})
-                extra["on_text"] = lambda text: emit(
-                    "text", model=model, key_id=kid, detail={"text": text})
             try:
+                if stream:
+                    emit("stream_start", model=model, key_id=kid, detail={"attempt": attempt})
+                    extra["on_text"] = lambda text: emit(
+                        "text", model=model, key_id=kid, detail={"text": text})
                 gr = await self.client.generate(
                     key, model, prompt=req.prompt, system=req.system,
                     thinking_level=req.thinking_level, output_format=req.output_format,
@@ -763,6 +763,12 @@ class Router:
                 failures.append(f"{model}: {e}")
                 emit("switch", model=model, key_id=kid, detail={"reason": "blocked"})
                 return None, "blocked"
+            except Exception:
+                if stream:
+                    self.ledger.resolve(row_id, "interrupted",
+                                        latency_ms=int((self._now() - t0) * 1000),
+                                        quota_error="stream consumer disconnected")
+                raise
 
             ms = int((self._now() - t0) * 1000)
             tin = gr.tokens_in if gr.tokens_in is not None else est

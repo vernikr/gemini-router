@@ -124,3 +124,24 @@ async def test_cancelled_stream_keeps_conservative_reservation(tmp_path, mock_ap
         assert router.ledger.rpd_spent(key_id('k1'), MODEL, 0, 0) == (1, 1)
     finally:
         await router.aclose()
+
+
+@pytest.mark.parametrize('stage', ['stream_start', 'text'])
+async def test_disconnected_consumer_resolves_reservation(tmp_path, respx_mock, stage):
+    respx_mock.get(f'{BASE}/models').mock(return_value=httpx.Response(
+        200, json={'models': [{'name': f'models/{MODEL}'}]}))
+    if stage == 'text':
+        respx_mock.post(URL).mock(return_value=sse(event('partial', 'STOP')))
+    router = Router(make_config(tmp_path))
+
+    def receive(event):
+        if event.stage == stage:
+            raise BrokenPipeError
+
+    try:
+        with pytest.raises(BrokenPipeError):
+            await router.complete(RouterRequest('hello'), receive, stream=True)
+        statuses = router.ledger._conn.execute('SELECT status FROM calls').fetchall()
+        assert [r[0] for r in statuses] == ['interrupted']
+    finally:
+        await router.aclose()
