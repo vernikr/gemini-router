@@ -199,8 +199,44 @@ def cmd_doctor(args, cfg: Config | None = None) -> int:
     return 0
 
 
+def cmd_proxy(args) -> int:
+    """Run the native-Gemini pass-through (`GOOGLE_GEMINI_BASE_URL` for Gen AI SDKs).
+
+    Fails fast and loudly when the client token is missing: an open port in front of the
+    key pool with no credential is not a degraded service, it is a credential.
+    """
+    from .proxy import serve
+
+    over: dict = {}
+    if getattr(args, "bind", None):
+        over["proxy"] = {**_proxy_cfg(args), "bind": args.bind}
+    if getattr(args, "port", None):
+        over["proxy"] = {**_proxy_cfg(args), "port": args.port}
+    cfg = Config.load(getattr(args, "config", None),
+                      state_path=getattr(args, "state", None), **over)
+    if not cfg.api_keys:
+        console.print("[red]error:[/red] no API keys: set GEMINI_API_KEYS or "
+                      "GEMINI_API_KEY_1..10")
+        return 3
+    import os
+
+    if not os.environ.get(cfg.proxy.token_env):
+        console.print(f"[red]error:[/red] {cfg.proxy.token_env} is not set — mint one with "
+                      f"`openssl rand -hex 32` and put it in the unit's EnvironmentFile")
+        return 2
+    serve(cfg)
+    return 0
+
+
+def _proxy_cfg(args) -> dict:
+    """The proxy sub-config merged from whatever the flags already set."""
+    cfg = Config.load(getattr(args, "config", None),
+                      state_path=getattr(args, "state", None))
+    return cfg.proxy.model_dump()
+
+
 _COMMANDS = {"quota": cmd_quota, "models": cmd_models, "calls": cmd_calls,
-             "prune": cmd_prune, "doctor": cmd_doctor}
+             "prune": cmd_prune, "doctor": cmd_doctor, "proxy": cmd_proxy}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -226,6 +262,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dry", action="store_true")
     p = sub.add_parser("doctor", help="config/state/connectivity check")
     p.add_argument("--offline", action="store_true")
+    p = sub.add_parser("proxy", help="native Gemini API pass-through (File Search MCP)")
+    p.add_argument("--bind", help="listen address (default from config: 127.0.0.1)")
+    p.add_argument("--port", type=int, help="listen port (default from config: 8787)")
 
     args = ap.parse_args(argv)
     try:

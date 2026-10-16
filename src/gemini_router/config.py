@@ -36,6 +36,31 @@ class WaitCfg(BaseModel):
     poll_s: float = 2.0
 
 
+class ProxyCfg(BaseModel):
+    """Settings of the native-Gemini pass-through (`gemini-router proxy`, SPEC §11).
+
+    It holds no secrets: the client token is read from the environment named by
+    `token_env`, never from YAML.
+    """
+
+    bind: str = "127.0.0.1"                 # loopback only — reach it through a tunnel
+    port: int = 8787
+    token_env: str = "GEMINI_ROUTER_PROXY_TOKEN"
+    max_upload_bytes: int = 2 * 1024 ** 3   # the provider's own per-file ceiling
+    request_timeout_s: float = 180.0        # long enough for an 8 MiB chunk on a slow link
+    # Bodies up to this size are buffered, which is what lets the proxy read the store
+    # name out of a generateContent body. Anything larger (upload chunks) is streamed
+    # and never held twice in memory — the gateway box has 1 GB.
+    body_inspect_bytes: int = 1 << 20
+    audit: bool = True                      # one JSONL line per request, key_id only
+    # What to do with the model the caller asked for (SPEC §11.6).
+    #   auto        keep it when the chosen key can serve it, else rewrite
+    #   strict      always rewrite to the best chain/overflow model with budget
+    #   passthrough never rewrite; account only
+    model_policy: str = "auto"
+    file_search_models: list[str] | None = None   # None = cfg.chain for rewriting
+
+
 class Config(BaseModel):
     chain: list[str] = Field(default_factory=lambda: list(DEFAULT_CHAIN))
     overflow_tiers: list[str] = Field(default_factory=lambda: list(DEFAULT_OVERFLOW))
@@ -67,6 +92,11 @@ class Config(BaseModel):
     # Estimate divisor for the TPM pre-flight gate. None (default) = script-aware
     # estimate; set a number to force the old single-divisor behaviour.
     chars_per_token: int | None = None
+    proxy: ProxyCfg = Field(default_factory=ProxyCfg)
+    # key_id of the project that owns File Search by default: where stores are created
+    # and where unscoped calls (list stores, Files API list) are answered from. None =
+    # pick the key with the largest remaining budget once, then keep it (SPEC §11.4).
+    file_search_key: str | None = None
 
     @classmethod
     def load(cls, path: str | Path | None = None, **over) -> Config:

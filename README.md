@@ -19,7 +19,12 @@ ledger; `tldr-digest` has **not** been migrated yet.
   **wait** with countdown events (`waiting`, remaining seconds); `wait=False` skips to
   the next candidate or returns wait ETAs in the structured error. Daily resets are
   never waited on.
-- CLI: `gemini-router quota | models | calls | prune | doctor` (rich tables).
+- CLI: `gemini-router quota | models | calls | prune | doctor | proxy` (rich tables).
+- **Native Gemini API pass-through** (`gemini-router proxy`, loopback): point
+  `GOOGLE_GEMINI_BASE_URL` at it to run a Google Gen AI SDK client — e.g. the
+  `mikesmitty/file-search` MCP — on this key pool. File Search resources stay pinned to
+  the Google project that owns them ([SPEC §11](docs/SPEC.md#11-native-gemini-api-pass-through-gemini-router-proxy),
+  wiring: [docs/file-search-wiring.md](docs/file-search-wiring.md)).
 - Deps: `httpx`, `pydantic`, `rich`, stdlib `sqlite3` — **no MCP/web-framework coupling**.
 
 Contract: [`docs/SPEC.md`](docs/SPEC.md).
@@ -50,6 +55,16 @@ Truncated, blocked and interrupted responses are never cached. Existing calls st
 non-streaming. Both paths share keys, model selection, auth fallback and the ledger.
 
 Service-style (no Python): REST `/v1/complete` + `/v1/quota` on the gemini-mcp daemon.
+
+### Native Gemini API pass-through
+
+```bash
+GEMINI_ROUTER_PROXY_TOKEN=$(openssl rand -hex 32) gemini-router proxy   # 127.0.0.1:8787
+```
+
+Then, on the client machine, `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8787` (through an
+SSH tunnel) plus `GEMINI_API_KEY=<the token>` — no change to the client's code. The base
+URL must be a bare origin with no path prefix; see SPEC §11.
 
 Conventions: English in files, Conventional Commits, SemVer tags `v*` (gemini-mcp pins
 a tag), CI = ruff + pytest with mocked HTTP (see `AGENTS.md`).

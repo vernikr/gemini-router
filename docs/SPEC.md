@@ -30,7 +30,8 @@ Zero MCP/web-framework deps: `httpx`, `pydantic`, `rich`, stdlib `sqlite3`. Pyth
 ## 2. Public API
 
 ```python
-from gemini_router import Router, RouterRequest, RouterResult, RouterEvent, QuotaExhaustedError
+from gemini_router import (Router, RouterRequest, RouterResult, RouterEvent,
+                          QuotaExhaustedError, GeminiProxy)   # GeminiProxy: §11
 
 router = Router.from_env()            # env + optional GEMINI_ROUTER_CONFIG yaml
 res: RouterResult = await router.complete(
@@ -142,7 +143,9 @@ Env: `GEMINI_API_KEYS`/`GEMINI_API_KEY_1..10`, `GEMINI_ROUTER_STATE`,
 `quota_day_tz`, `retry {max,backoff_base_s,jitter_max_s,provider_timeout_s,request_delay_s}`,
 `wait {enabled_default,max_s,poll_s}` (FR-C13 semantics), `window_s`, `planned_ttl_s`,
 `models_refresh_h`, `cache_ttl_h`, `state_path`, `base_url`, `temperature` (pre-3.x models
-only), `max_output_tokens_default`, `chars_per_token` (unset = script-aware estimate). Defaults per gemini-mcp `docs/03-architecture.md` §8. Secrets never logged
+only), `max_output_tokens_default`, `chars_per_token` (unset = script-aware estimate),
+`proxy {bind,port,token_env,max_upload_bytes,request_timeout_s,body_inspect_bytes,audit,
+model_policy,file_search_models}` and `file_search_key` (§11). Defaults per gemini-mcp `docs/03-architecture.md` §8. Secrets never logged
 (`key_id = sha256(key)[:8]`).
 
 ## 5. Integration guide (external consumers)
@@ -309,3 +312,123 @@ Stream retries reserve separate calls and recheck gates. Interrupted/cancelled s
 attempts count conservatively as `blocked` in daily and sliding-window quotas, with an
 interruption note. This existing status keeps older processes sharing the ledger accurate.
 Cancellation propagates after resolving its reservation. Non-streaming APIs are unchanged.
+
+## 11. Native Gemini API pass-through (`gemini-router proxy`)
+
+A second surface next to the routing library: an HTTP service that speaks the **native
+Gemini `v1beta` API**, so a client using the Google Gen AI SDK can point
+`GOOGLE_GEMINI_BASE_URL` at this router and run on its key pool. It exists for clients
+that build their own URLs and read provider-specific statuses, headers and error bodies
+— `github.com/mikesmitty/file-search` and its `google.golang.org/genai` SDK — where a
+`POST /v1/complete`-shaped endpoint cannot serve, because every re-serialisation on the
+way through breaks the contract (`sizeBytes` is a string in that SDK's struct tags).
+
+### 11.1 What it forwards
+
+| family | requests |
+|---|---|
+| File Search stores | `POST/GET/DELETE /v1beta/fileSearchStores[/{id}]`, `…/{id}:importFile`, `…/{id}/documents[/{doc}]`, `…/{id}/operations/{op}` |
+| Files API | `GET/DELETE /v1beta/files[/{id}]` |
+| models | `POST /v1beta/models/{model}:generateContent`, `:countTokens`, `GET /v1beta/models[/{id}]` |
+| resumable upload | `POST /upload/v1beta/files`, `POST /upload/v1beta/fileSearchStores/{id}:uploadToFileSearchStore` (start and chunks) |
+
+Everything else is a JSON 404 in the provider's own error shape. Requests and responses
+are forwarded byte-for-byte; only what the router is for is added (§11.3–11.6).
+
+### 11.2 The base URL format is a hard constraint
+
+`GOOGLE_GEMINI_BASE_URL` must be a **bare origin**: `scheme://host[:port]`, with no path
+prefix and no `/v1beta`. The SDK prepends the API version itself. Measured against the
+real SDK: with a base URL of `http://host/proxy`, ordinary calls go to
+`/proxy/v1beta/…` but the **upload continuation goes to `/upload/v1beta/…`** — the SDK
+copies only the base URL's scheme and host onto the upload URL Google returned, and
+drops the prefix. A path prefix therefore breaks uploads and nothing else, which is the
+worst kind of failure.
+
+### 11.3 Client authentication
+
+The client's key is the router's token: `x-goog-api-key: <token>` (what the Gen AI SDK
+sends from `GEMINI_API_KEY`/`GOOGLE_API_KEY`) or `Authorization: Bearer <token>`.
+Compared in constant time; refused with a Google-shaped 401 carrying
+`WWW-Authenticate`. The client credential is consumed here and never forwarded: upstream
+only ever sees a pool key, and only through the `header` transport of `keyauth`, so no
+key ever appears in a URL. `/healthz` is open; every `/.well-known/*` rung answers JSON,
+never `text/plain`.
+
+### 11.4 Resource affinity — File Search is per Google project
+
+A store, a Files API object, a document and an operation under it are visible only to
+the project of the key that created them. The router's ordinary rotation (largest
+remaining budget) is right for `generateContent`, where a file can be re-uploaded under
+another key, and wrong here: the second request to a store would answer 404.
+
+The pass-through therefore adds one mapping on top of the existing pool — never a second
+key system:
+
+* `fs_affinity(resource → key_id)` in the shared ledger, learned from a successful
+  create and consulted on every later request. It lives in the database because every
+  process serving File Search on the machine must agree on it and a restart must not
+  orphan every store.
+* a persisted **default project** (`meta.fs_pin`, or `file_search_key:` in config), used
+  for creates and for unscoped calls such as `list_stores` — two different keys would
+  otherwise show two different worlds of stores.
+* a **self-healing probe**: a read or delete of a resource with no known owner tries the
+  other keys once, in budget order, and remembers the winner.
+
+For `generateContent` the store is named in the **body**
+(`tools[].fileSearch.fileSearchStoreNames[]`), so small bodies are buffered to read it;
+large ones (upload chunks) are streamed and never held twice in memory.
+
+### 11.5 Resumable upload
+
+Google answers the handshake with an absolute `X-Goog-Upload-Url` on its own host. The
+proxy rewrites it to itself and stamps it with two parameters, which the SDK copies
+verbatim on every chunk:
+
+```
+router_k=<key_id>                                    # the project that owns the session
+router_s=HMAC(token, "<upload_id>|<key_id>|upload")  # the authentication
+```
+
+Stateless and restart-safe: a continuation cannot bypass authentication, cannot be
+forged, and cannot land in a different project mid-upload. The two parameters are
+stripped before the request goes upstream. Chunks are POSTed in 8 MiB pieces with
+`X-Goog-Upload-Offset`; `X-Goog-Upload-Status` and `X-Goog-Upload-Url` are forwarded
+untouched.
+
+### 11.6 Model policy
+
+`proxy.model_policy`: `auto` (default) keeps the caller's model when the chosen key can
+serve it and falls back to the best chain model with budget otherwise; `strict` always
+routes through the chain; `passthrough` never rewrites and only accounts. A File Search
+client names models outside the router's chain, and silently substituting a model that
+cannot serve the `fileSearch` tool would break every query — so the fallback, not the
+substitution, is the default.
+
+### 11.7 Idempotency and retries
+
+| request | retries |
+|---|---|
+| `GET`/`DELETE`/`HEAD` | yes — same key first, then the other projects once; 429 sets a cooldown and moves on |
+| upload chunks | yes, on transport errors, always under the session's own key |
+| `POST` create / `importFile` / upload start | **no** repeat once a response may have taken effect — a second create makes a second store |
+| `generateContent` | retried only when the request is not bound to a store |
+
+A consumed request stream cannot be replayed, so a streamed body always gets one attempt.
+
+### 11.8 Accounting
+
+`generateContent` is planned and resolved like any other router call and draws on the
+model's RPD/RPM/TPM. Every other File Search call is recorded as `kind='filesearch'`,
+which is in `NON_SPENDING_KINDS`: visible in `calls`/`router_logs`, excluded from every
+gate — a store listing must not fail because the text budget is spent.
+
+### 11.9 Operating it
+
+```bash
+GEMINI_ROUTER_PROXY_TOKEN=$(openssl rand -hex 32) gemini-router proxy     # 127.0.0.1:8787
+```
+
+Loopback only: reach it through an SSH tunnel. The service is stateless apart from the
+shared ledger, so several processes (and the CLI) may run against one `state.db`.
+Sizing: stdlib `http.server`, no new dependencies, `MemoryMax=128M` is ample.

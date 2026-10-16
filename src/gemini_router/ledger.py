@@ -26,7 +26,11 @@ from zoneinfo import ZoneInfo
 RPD_STATUSES = ("ok", "quota", "http5xx", "blocked")
 WINDOW_STATUSES = RPD_STATUSES + ("planned",)
 # 'drift' is a tariff-forecast miss note, not a provider call at all — same exclusion.
-NON_SPENDING_KINDS = ("count", "upload", "drift")
+# 'filesearch' is the pass-through's bookkeeping row for a File Search management call
+# (create/list/delete a store, document or operation). It draws on no model quota, so it
+# belongs here with the other excluded kinds — but it is recorded, so `router_logs` and
+# `calls` show what the MCP did.
+NON_SPENDING_KINDS = ("count", "upload", "drift", "filesearch")
 SPENDS = "kind NOT IN ({})".format(",".join(f"'{k}'" for k in NON_SPENDING_KINDS))
 # An upload belongs to a key, not a model, but the column is NOT NULL and feeds per-model
 # filters. A sentinel no model id can equal.
@@ -52,6 +56,14 @@ CREATE TABLE IF NOT EXISTS cache(
   hash TEXT PRIMARY KEY, request_id TEXT, model TEXT NOT NULL, ts REAL NOT NULL,
   response TEXT NOT NULL, tokens_in INTEGER, tokens_out INTEGER);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+-- File Search affinity (proxy): a File Search store / Files API object lives in the
+-- Google project of the key that created it, so the proxy must send every later request
+-- for it under the SAME key. This is the only place that mapping can live: every process
+-- sharing this file must agree on it (see SPEC §3).
+CREATE TABLE IF NOT EXISTS fs_affinity(
+  resource TEXT PRIMARY KEY,   -- 'fileSearchStores/<id>' | 'files/<id>'
+  key_id   TEXT NOT NULL,
+  ts       REAL NOT NULL);
 """
 
 
@@ -337,3 +349,44 @@ class Ledger:
             cache = self._conn.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
         size_mb = Path(self.path).stat().st_size / 1e6 if Path(self.path).exists() else 0
         return {"calls": calls, "cache": cache, "size_mb": round(size_mb, 2)}
+
+    # ------------------------------------------------- file search affinity (proxy)
+    def fs_owner(self, resource: str) -> str | None:
+        """The key_id that owns `resource`, or None when it has never been seen."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT key_id FROM fs_affinity WHERE resource=?", (resource,)).fetchone()
+        return row["key_id"] if row else None
+
+    def fs_bind(self, resource: str, key_id: str, now: float | None = None) -> None:
+        """Record (or move) the owner of a File Search resource."""
+        ts = now or time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO fs_affinity(resource,key_id,ts) VALUES(?,?,?) "
+                "ON CONFLICT(resource) DO UPDATE SET key_id=excluded.key_id, ts=excluded.ts",
+                (resource, key_id, ts))
+
+    def fs_forget(self, resource: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM fs_affinity WHERE resource=?", (resource,))
+
+    def fs_affinity(self) -> dict[str, str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT resource, key_id FROM fs_affinity ORDER BY resource").fetchall()
+        return {r["resource"]: r["key_id"] for r in rows}
+
+    def fs_pin(self) -> str | None:
+        """The File Search default project: where stores are created and where
+        unscoped lists are answered from. Persisted, because two different keys would
+        show two different worlds of stores (SPEC §11)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT v FROM meta WHERE k='fs_pin'").fetchone()
+        return row["v"] if row else None
+
+    def fs_set_pin(self, key_id: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO meta(k,v) VALUES('fs_pin',?)", (key_id,))
