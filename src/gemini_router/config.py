@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # Deprecated ids are left out even though the API still lists them: gemini-3.5-flash
 # and gemini-3.7-flash are aliases now, every call redirects to 3.6 and 3.8. Routing to
@@ -50,8 +50,10 @@ class ProxyCfg(BaseModel):
     request_timeout_s: float = 180.0        # long enough for an 8 MiB chunk on a slow link
     # Bodies up to this size are buffered, which is what lets the proxy read the store
     # name out of a generateContent body. Anything larger (upload chunks) is streamed
-    # and never held twice in memory — the gateway box has 1 GB.
-    body_inspect_bytes: int = 1 << 20
+    # and never held twice in memory — the gateway box has 1 GB. 4 MiB, not 1: a vision
+    # request carries a base64 screenshot inline and routinely crosses 1 MiB, and a
+    # streamed body loses the retry path (one attempt, SPEC §11.7) for no reason.
+    body_inspect_bytes: int = 4 << 20
     audit: bool = True                      # one JSONL line per request, key_id only
     # What to do with the model the caller asked for (SPEC §11.6).
     #   strict (default) always route through the router's own chain — the model with
@@ -67,6 +69,11 @@ class ProxyCfg(BaseModel):
 class Config(BaseModel):
     chain: list[str] = Field(default_factory=lambda: list(DEFAULT_CHAIN))
     overflow_tiers: list[str] = Field(default_factory=lambda: list(DEFAULT_OVERFLOW))
+    # The overflow policy every entry point starts from (FR-C8 stays opt-in: the
+    # default is "off"). A library call may override it per request; the pass-through
+    # proxy cannot carry a per-request knob, so this single key is what makes both
+    # entries walk the same tiers. Values: off | lite | lite+gemma.
+    overflow_default: str = "off"
     limits_per_key_model: Limits = Field(default_factory=Limits)
     overflow_limits: Limits = Field(default_factory=lambda: Limits(rpd=500, rpm=15, tpm=250_000))
     limits_overrides: dict[str, dict[str, int]] = Field(default_factory=dict)
@@ -100,6 +107,13 @@ class Config(BaseModel):
     # and where unscoped calls (list stores, Files API list) are answered from. None =
     # pick the key with the largest remaining budget once, then keep it (SPEC §11.4).
     file_search_key: str | None = None
+
+    @field_validator("overflow_default")
+    @classmethod
+    def _overflow_default_known(cls, v: str) -> str:
+        if v not in ("off", "lite", "lite+gemma"):
+            raise ValueError("overflow_default must be one of: off, lite, lite+gemma")
+        return v
 
     @classmethod
     def load(cls, path: str | Path | None = None, **over) -> Config:

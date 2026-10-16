@@ -241,10 +241,18 @@ class GeminiProxy:
 
         model = model_of(path)
         if model and cfg.proxy.model_policy != "passthrough":
-            chosen = self.routing.resolve_model(model, kid)
-            if chosen != model:
+            # Key and model come from the shared selection walk (SPEC §11.6): resource
+            # affinity pins the key and only the model walks; an unbound model call
+            # (plain generateContent/countTokens) walks both — the pool rotates by
+            # remaining budget instead of riding the File Search pin.
+            new_kid, chosen = self.routing.choose(model, kid if resource else None)
+            if chosen and chosen != model:
                 path = path.replace(f"/models/{model}:", f"/models/{chosen}:", 1)
                 model = chosen
+            if not resource and new_kid != kid:
+                rotated = self.routing._resolve(new_kid)
+                if rotated is not None:
+                    kid, key = new_kid, rotated
 
         headers = self._upstream_headers(h)
         headers["x-goog-api-key"] = key
@@ -275,6 +283,11 @@ class GeminiProxy:
             log.info("proxy %s %s -> %d key=%s resource=%s pinned=%s bytes=%d %.0fms",
                      method, path, status, kid, resource or "-", pinned, length,
                      (time.time() - started) * 1000)
+        if model:
+            # Who actually served a model call — so a caller's own run log can record
+            # the pair without correlating against this proxy's audit stream by time.
+            out_headers["x-router-model"] = model
+            out_headers["x-router-key-id"] = kid
         self._send(h, status, out_headers.pop("content-type", b"application/json"),
                    payload, out_headers)
 

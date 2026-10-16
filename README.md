@@ -14,7 +14,9 @@ ledger; `tldr-digest` has **not** been migrated yet.
   with cooldowns and `Retry-After`.
 - Key pool (`GEMINI_API_KEYS` / `GEMINI_API_KEY_1..10`), budget-maximizing selection.
 - `thinking_level` per request (Gemini 3.x rules), request cache (0-RPD hits), opt-in
-  overflow tiers (`flash-lite → gemma-auto`), event stream for progress frontends.
+  overflow tiers (`flash-lite → gemma-auto`) behind one `overflow_default` config key that
+  every entry point (library and proxy) walks identically, event stream for progress
+  frontends.
 - Per-request wait policy for minute-scale gates (RPM/TPM/short cooldowns): default
   **wait** with countdown events (`waiting`, remaining seconds); `wait=False` skips to
   the next candidate or returns wait ETAs in the structured error. Daily resets are
@@ -22,8 +24,9 @@ ledger; `tldr-digest` has **not** been migrated yet.
 - CLI: `gemini-router quota | models | calls | prune | doctor | proxy` (rich tables).
 - **Native Gemini API pass-through** (`gemini-router proxy`, loopback): point
   `GOOGLE_GEMINI_BASE_URL` at it to run a Google Gen AI SDK client — e.g. the
-  `mikesmitty/file-search` MCP — on this key pool. File Search resources stay pinned to
-  the Google project that owns them ([SPEC §11](docs/SPEC.md#11-native-gemini-api-pass-through-gemini-router-proxy),
+  `mikesmitty/file-search` MCP — on this key pool. Model **and key** of a model call come
+  from the same selection walk the library uses (chain, overflow, budgets — SPEC §11.6);
+  File Search resources stay pinned to the Google project that owns them ([SPEC §11](docs/SPEC.md#11-native-gemini-api-pass-through-gemini-router-proxy),
   wiring: [docs/file-search-wiring.md](docs/file-search-wiring.md)).
 - Deps: `httpx`, `pydantic`, `rich`, stdlib `sqlite3` — **no MCP/web-framework coupling**.
 

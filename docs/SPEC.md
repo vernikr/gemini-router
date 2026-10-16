@@ -41,7 +41,8 @@ res: RouterResult = await router.complete(
         output_format="text|json" = "text",
         max_output_tokens=8192,
         kind="single|chunk|consolidate|count" = "single",
-        request_id=None, source="cli", overflow="off|lite|lite+gemma",
+        request_id=None, source="cli", overflow=None,   # off|lite|lite+gemma;
+                                      # None → cfg.overflow_default (FR-C8: that default is "off")
         wait=True,                    # wait out minute-scale gates (RPM/TPM/short cooldown,
                                       # ≤ wait.max_s), countdown via `waiting` events;
                                       # daily RPD resets are NEVER waited on
@@ -139,6 +140,8 @@ file is shared with frontends that may run older code.
 
 Env: `GEMINI_API_KEYS`/`GEMINI_API_KEY_1..10`, `GEMINI_ROUTER_STATE`,
 `GEMINI_ROUTER_CONFIG` (yaml). YAML keys: `chain`, `overflow_tiers`,
+`overflow_default` (off|lite|lite+gemma — the overflow policy every entry point starts
+from; a library request may override it per call, the pass-through proxy walks it as is),
 `limits_per_key_model {rpd,rpm,tpm}`, `overflow_limits {rpd,rpm,tpm}`, `limits_overrides`,
 `quota_day_tz`, `retry {max,backoff_base_s,jitter_max_s,provider_timeout_s,request_delay_s}`,
 `wait {enabled_default,max_s,poll_s}` (FR-C13 semantics), `window_s`, `planned_ttl_s`,
@@ -396,17 +399,31 @@ stripped before the request goes upstream. Chunks are POSTed in 8 MiB pieces wit
 `X-Goog-Upload-Offset`; `X-Goog-Upload-Status` and `X-Goog-Upload-Url` are forwarded
 untouched.
 
-### 11.6 Model policy
+### 11.6 Model policy and the single selection procedure
 
-`proxy.model_policy`: `strict` (default) always routes through the router's own chain,
-picking the chain model with the largest remaining budget; `auto` keeps the caller's
-model when the chosen key can serve it and falls back to the chain otherwise;
-`passthrough` never rewrites and only accounts.
+Both the model **and the key** of a model-path request come from `routing.pick_pair` —
+the same walk `Router.complete` makes (tiers from `tier_plan` including the
+`overflow_default` tiers, keys ranked by remaining day budget, ledger gates). The owner's
+rule this encodes: parameter logic is identical regardless of the entry door and is not
+duplicated — the proxy only maps its policy onto the walk's inputs:
+
+- **resource affinity pins the key** (§11.4): for a store-bound call only the model
+  walks; an unbound `generateContent`/`countTokens` walks both, so the pool rotates by
+  budget instead of riding the File Search pin.
+- `proxy.model_policy`: `strict` (default) always walks; `auto` keeps the caller's model
+  when a key can serve it and falls back to the walk otherwise; `passthrough` never
+  rewrites and keeps the caller's landing key.
+- when every pair is day-drained the head candidate is forwarded anyway — the provider
+  stays the source of truth and its own 429 body reaches the client untranslated.
 
 `strict` is the default because of what the client actually sends: `file-search` asks for
 its own hardcoded `gemini-2.5-flash`, which the router's keys cannot serve, so honouring
 the request would fail every query. The chain exists precisely to answer "which model can
 take this request right now", and the caller's model id is a default, not a requirement.
+
+Every model-path response carries `x-router-model` and `x-router-key-id`, so a caller's
+own run log can record which pair served it without correlating against this proxy's
+audit stream by time.
 
 ### 11.7 Idempotency and retries
 

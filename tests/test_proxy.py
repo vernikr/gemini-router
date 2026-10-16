@@ -6,6 +6,7 @@ network, no provider keys. Fixtures carry the DUMMY marker the secrets guard req
 """
 from __future__ import annotations
 
+import contextlib
 import threading
 
 import httpx
@@ -414,3 +415,131 @@ def test_affinity_survives_a_new_process(tmp_path):
     again = Ledger(cfg.state_path)
     assert again.fs_owner("fileSearchStores/demo") == kid(K2)
     assert again.fs_affinity() == {"fileSearchStores/demo": kid(K2)}
+
+
+# --------------------------------------------- unified selection (SPEC §11.6)
+# The pass-through consumes routing.pick_pair — the same walk the library makes.
+# The walk itself is pinned in test_selection.py; here: that the proxy obeys it.
+
+
+@contextlib.contextmanager
+def spawn(tmp_path, respx_mock, **over):
+    respx_mock.route(host="127.0.0.1").pass_through()
+    cfg = make_cfg(tmp_path, **over)
+    from gemini_router import Ledger as _Ledger
+    p = GeminiProxy(cfg, ledger=_Ledger(cfg.state_path), token=TOKEN)
+    httpd = p.server()
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    p.base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        yield p
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+        p.close()
+
+
+def drain(ledger, key: str, model: str) -> None:
+    row = ledger.plan(key_id=kid(key), model=model, kind="single",
+                      est_tokens=0, request_id=None, source="test")
+    ledger.resolve(row, "ok", http_status=200, latency_ms=1)
+
+
+def gen_ok() -> httpx.Response:
+    return httpx.Response(200, json={"candidates": [
+        {"content": {"parts": [{"text": "A"}]}, "finishReason": "STOP"}]})
+
+
+def test_unbound_generate_rotates_to_the_budgeted_key(tmp_path, respx_mock):
+    """A plain generateContent no longer rides the File Search pin: the key with
+    remaining budget serves it, exactly as the library would choose."""
+    with spawn(tmp_path, respx_mock,
+               limits_per_key_model={"rpd": 1, "rpm": 5, "tpm": 250_000}) as p:
+        drain(p.ledger, K1, "gemini-3.8-flash")
+        seen = {}
+
+        def capture(request):
+            seen["key"] = request.headers.get("x-goog-api-key")
+            return gen_ok()
+
+        respx_mock.post(f"{API}/models/gemini-3.8-flash:generateContent").mock(
+            side_effect=capture)
+        with client(p) as c:
+            r = c.post("/v1beta/models/gemini-3.8-flash:generateContent",
+                       json={"contents": [{"parts": [{"text": "q"}]}]})
+    assert seen["key"] == K2
+    assert r.headers["x-router-key-id"] == kid(K2)
+    assert r.headers["x-router-model"] == "gemini-3.8-flash"
+
+
+def test_proxy_reaches_overflow_through_the_shared_walk(tmp_path, respx_mock):
+    """Chain day-drained on every key + overflow_default=lite → the request lands on
+    the overflow model. Before unification the proxy could not reach lite at all."""
+    with spawn(tmp_path, respx_mock, overflow_default="lite",
+               limits_per_key_model={"rpd": 1, "rpm": 5, "tpm": 250_000}) as p:
+        for k in (K1, K2):
+            for m in ("gemini-3.8-flash", "gemini-3.6-flash"):
+                drain(p.ledger, k, m)
+        route = respx_mock.post(
+            f"{API}/models/gemini-3.5-flash-lite:generateContent").mock(
+            return_value=gen_ok())
+        with client(p) as c:
+            r = c.post("/v1beta/models/gemini-2.5-flash:generateContent",
+                       json={"contents": [{"parts": [{"text": "q"}]}]})
+    assert route.call_count == 1
+    assert r.headers["x-router-model"] == "gemini-3.5-flash-lite"
+
+
+def test_exhausted_pool_still_forwards_and_upstream_answers(tmp_path, respx_mock):
+    """No budget anywhere and no overflow: the head candidate is forwarded anyway —
+    the provider stays the source of truth and its own 429 body reaches the client."""
+    with spawn(tmp_path, respx_mock,
+               limits_per_key_model={"rpd": 1, "rpm": 5, "tpm": 250_000}) as p:
+        for k in (K1, K2):
+            for m in ("gemini-3.8-flash", "gemini-3.6-flash"):
+                drain(p.ledger, k, m)
+        respx_mock.post(f"{API}/models/gemini-3.8-flash:generateContent").mock(
+            return_value=httpx.Response(429, json={"error": {"message": "quota"}}))
+        with client(p) as c:
+            r = c.post("/v1beta/models/gemini-2.5-flash:generateContent",
+                       json={"contents": [{"parts": [{"text": "q"}]}]})
+    assert r.status_code == 429
+
+
+def test_store_bound_generate_keeps_the_owner_key(tmp_path, respx_mock):
+    """Affinity still wins over budget: only the model walks for a store-bound call."""
+    with spawn(tmp_path, respx_mock,
+               limits_per_key_model={"rpd": 1, "rpm": 5, "tpm": 250_000}) as p:
+        p.ledger.fs_bind("fileSearchStores/demo", kid(K1))
+        drain(p.ledger, K1, "gemini-3.8-flash")   # owner's head model is spent
+        seen = {}
+
+        def capture(request):
+            seen["key"] = request.headers.get("x-goog-api-key")
+            return gen_ok()
+
+        respx_mock.post(f"{API}/models/gemini-3.6-flash:generateContent").mock(
+            side_effect=capture)
+        with client(p) as c:
+            c.post("/v1beta/models/gemini-3.8-flash:generateContent", json={
+                "contents": [{"parts": [{"text": "q"}]}],
+                "tools": [{"fileSearch": {"fileSearchStoreNames":
+                                          ["fileSearchStores/demo"]}}]})
+    assert seen["key"] == K1, "the store's owner must serve it, whatever the budgets"
+
+
+def test_vision_sized_body_is_buffered_not_streamed(tmp_path, respx_mock):
+    """A ~1.5 MiB inline-image body stays under the 4 MiB inspect limit, so it keeps
+    the buffered path (and with it the retry semantics of SPEC §11.7)."""
+    with spawn(tmp_path, respx_mock) as p:
+        route = respx_mock.post(
+            f"{API}/models/gemini-3.8-flash:generateContent").mock(return_value=gen_ok())
+        big = "A" * (1536 * 1024)
+        with client(p) as c:
+            r = c.post("/v1beta/models/gemini-3.8-flash:generateContent", json={
+                "contents": [{"parts": [
+                    {"inline_data": {"mime_type": "image/png", "data": big}},
+                    {"text": "what is on the screen?"}]}]})
+    assert r.status_code == 200 and route.call_count == 1

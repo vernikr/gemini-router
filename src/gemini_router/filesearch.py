@@ -30,7 +30,7 @@ import httpx
 from . import keyauth
 from .config import Config, key_id
 from .ledger import Ledger
-from .routing import gates_for
+from .routing import gates_for, pick_pair
 
 # ---------------------------------------------------------------- path shapes
 STORE_RX = re.compile(r"/v1beta/(fileSearchStores/[^/:?]+)")
@@ -292,28 +292,46 @@ class FileSearchRouting:
             return None
         return None
 
-    def resolve_model(self, requested: str, kid: str | None) -> str:
-        """Apply `proxy.model_policy` to the model the caller asked for.
+    def choose(self, requested: str | None, kid_pin: str | None = None) -> tuple[str, str | None]:
+        """(key_id, model) for a model-path request, per `proxy.model_policy` (SPEC §11.6).
 
-        `auto` (default) keeps the caller's model when the key can serve it and falls
-        back to the best chain model with budget otherwise — a caller naming a model the
-        account cannot serve would otherwise fail every File Search query. `strict`
-        always routes through the router's own chain. `passthrough` never rewrites.
+        The walk itself is `routing.pick_pair` — the single selection procedure every
+        entry point shares (tiers incl. `overflow_default`, keys by remaining budget,
+        ledger gates). This method only maps the proxy's policy onto its inputs:
+
+        - `kid_pin` carries resource affinity — the key is not negotiable, only the
+          model walks; without it both the key and the model are chosen by budget.
+        - `auto` keeps the caller's model when a key can serve it and falls back to
+          the shared walk otherwise; `strict` always walks; `passthrough` never
+          rewrites and keeps the key the caller landed on.
         """
         policy = self.cfg.proxy.model_policy
-        if policy == "passthrough":
-            return requested
-        candidates = self.cfg.proxy.file_search_models or list(self.cfg.chain)
-        if policy == "auto" and kid:
-            key = self._resolve(kid)
-            if key is not None and requested in self.cfg.chain:
-                return requested          # already a router model: nothing to gain
-            if key is not None:
-                available = self.available_models(key)
+        if policy == "passthrough" or not requested:
+            return (kid_pin or self.pin()), requested
+        keys: list[str] | None = None
+        if kid_pin:
+            key = self._resolve(kid_pin)
+            if key is None:
+                return kid_pin, requested   # the proxy answers the lost key itself
+            keys = [key]
+        if policy == "auto":
+            if requested in self.cfg.chain:
+                # Already a router model: nothing to gain from a rewrite.
+                return (kid_pin or self._richest(requested)), requested
+            probe_kid = kid_pin or self._richest(self.cfg.chain[0] if self.cfg.chain else None)
+            probe = self._resolve(probe_kid)
+            if probe is not None:
+                available = self.available_models(probe)
                 if available is None or requested in available:
-                    return requested      # unknown availability must not break a query
-        for model in candidates:
-            key = self._resolve(kid) if kid else None
-            if key and gates_for(self.cfg, self.ledger, model, key, 0)["rpd_left"] > 0:
-                return model
-        return candidates[0] if candidates else requested
+                    return probe_kid, requested   # unknown availability must not break a query
+        choice = pick_pair(self.cfg, self.ledger,
+                           overflow=self.cfg.overflow_default,
+                           chain_override=self.cfg.proxy.file_search_models,
+                           keys=keys,
+                           now=self._now() if self._now else None)
+        if choice.model is None or choice.key is None:
+            # Day budgets spent everywhere: forward the head candidate anyway — the
+            # provider stays the source of truth and answers with its own 429 body.
+            cands = self.cfg.proxy.file_search_models or list(self.cfg.chain)
+            return (kid_pin or self.pin()), (cands[0] if cands else requested)
+        return key_id(choice.key), choice.model

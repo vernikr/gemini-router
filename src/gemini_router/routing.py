@@ -40,7 +40,8 @@ class RouterRequest:
     kind: str = "single"                    # single|chunk|consolidate|count
     request_id: str | None = None           # idempotency / cache lookup
     source: str = "cli"                     # mcp|cli|rest|tldr
-    overflow: str = "off"                   # off|lite|lite+gemma (FR-C8, never automatic)
+    overflow: str | None = None             # off|lite|lite+gemma; None → cfg.overflow_default
+                                            # (FR-C8 stays opt-in: that default is "off")
     wait: bool | None = None                # None → cfg.wait.enabled_default (FR-C13)
     model: str | None = None                # pin → skips chain fallback
     est_tokens: int | None = None           # caller-provided countTokens result
@@ -121,6 +122,87 @@ def _sha256(path: str | Path) -> str:
         while (block := fh.read(1 << 20)):
             h.update(block)
     return h.hexdigest()
+
+
+def tier_plan(cfg: Config, *, model_pin: str | None = None,
+              overflow: str = "off") -> list[tuple[int, list[str]]]:
+    """The model tiers every entry point walks — defined once (owner's rule: parameter
+    logic must not depend on which door a request came through).
+
+    Tier 0 is the chain (or the pinned model), tier 1 the literal overflow models,
+    tier 2 the `"gemma-auto"` placeholder — the caller resolves it against listModels
+    (`pick_gemma`), because availability knowledge lives with the caller, not here.
+    """
+    chain = [model_pin] if model_pin else list(dict.fromkeys(cfg.chain))
+    tiers = [(0, chain)]
+    if overflow in ("lite", "lite+gemma"):
+        tiers.append((1, [m for m in cfg.overflow_tiers if m != "gemma-auto"]))
+    if overflow == "lite+gemma":
+        tiers.append((2, ["gemma-auto"]))
+    return tiers
+
+
+def keys_sorted(cfg: Config, ledger: Ledger, model: str, *,
+                keys: list[str] | None = None, now: float | None = None) -> list[str]:
+    """The key order every entry point uses: largest remaining day budget first.
+    `keys` narrows the pool (resource affinity); None means the whole pool."""
+    now = now or time.time()
+    pool = list(keys) if keys is not None else list(cfg.api_keys)
+    return sorted(pool,
+                  key=lambda k: -gates_for(cfg, ledger, model, k, 0, now)["rpd_left"])
+
+
+@dataclass(slots=True)
+class PairChoice:
+    """One (model, key) answer from the shared walk, for single-shot callers."""
+    model: str | None
+    key: str | None
+    gates: dict | None
+    tier: int = 0
+    reason: str = "exhausted"               # ok | wait | exhausted
+
+
+def pick_pair(cfg: Config, ledger: Ledger, *, overflow: str = "off",
+              chain_override: list[str] | None = None, keys: list[str] | None = None,
+              avail: dict[str, set[str] | None] | None = None, est_tokens: int = 0,
+              now: float | None = None) -> PairChoice:
+    """The same walk `Router.complete` makes — tiers from `tier_plan`, keys from
+    `keys_sorted`, gates from `gates_for` — reduced to one up-front answer for callers
+    that forward a single request instead of running an attempt loop (the pass-through
+    proxy, SPEC §11.6).
+
+    `chain_override` substitutes tier 0 (the proxy's `file_search_models`); `keys`
+    narrows the pool (resource affinity); `avail` is an optional key_id → listModels
+    filter. Preference: a pair that can run now ("ok"); else the budgeted pair with the
+    shortest minute-scale wait ("wait"); else "exhausted" — day budgets spent everywhere.
+    """
+    now = now or time.time()
+    pool = list(keys) if keys is not None else list(cfg.api_keys)
+    best_wait: PairChoice | None = None
+    tiers = tier_plan(cfg, overflow=overflow)
+    if chain_override:
+        tiers[0] = (0, list(dict.fromkeys(chain_override)))
+    for tier, models in tiers:
+        if models == ["gemma-auto"]:
+            union: set[str] = set()
+            for s in (avail or {}).values():
+                if s:
+                    union |= s
+            g = pick_gemma(union)
+            models = [g] if g else []
+        for model in models:
+            for key in keys_sorted(cfg, ledger, model, keys=pool, now=now):
+                s = (avail or {}).get(key_id(key))
+                if s is not None and model not in s:
+                    continue
+                gates = gates_for(cfg, ledger, model, key, est_tokens, now)
+                if gates["rpd_left"] <= 0:
+                    continue
+                if gates["wait_s"] <= 0:
+                    return PairChoice(model, key, gates, tier, "ok")
+                if best_wait is None or gates["wait_s"] < best_wait.gates["wait_s"]:
+                    best_wait = PairChoice(model, key, gates, tier, "wait")
+    return best_wait or PairChoice(None, None, None, 0, "exhausted")
 
 
 def pick_gemma(models: Iterable[str]) -> str | None:
@@ -290,6 +372,10 @@ class Router:
                 on_event(ev)
 
         cfg = self.cfg
+        if req.overflow is None:
+            # One config key sets the overflow policy for every entry point; an
+            # explicit per-request value (any string, including "off") wins.
+            req = replace(req, overflow=cfg.overflow_default)
         files = list(files or [])
         if files:
             # The TPM gate must include the file tokens, and only the caller can measure
@@ -465,7 +551,7 @@ class Router:
     async def upload_file(self, path: str | Path, *, mime: str | None = None,
                           model: str | None = None, source: str = "cli",
                           display_name: str | None = None, key: str | None = None,
-                          overflow: str = "off", sha256: str | None = None,
+                          overflow: str | None = None, sha256: str | None = None,
                           ready_timeout_s: float = 30.0) -> UploadedFile:
         """Upload a blob and hand back the provider record, pinned to the key that will
         serve the analysis. The key is chosen the way `complete` would choose it, minus
@@ -477,6 +563,8 @@ class Router:
         instead of refusing the upload before text-style routing can start.
         `sha256` is the local blob's hash for the cache. The file stays ACTIVE."""
         cfg = self.cfg
+        if overflow is None:
+            overflow = cfg.overflow_default
         target = model or cfg.chain[0]
         if sha256 is None:
             sha256 = _sha256(path)
@@ -573,18 +661,22 @@ class Router:
 
     def _tier_plan(self, req: RouterRequest, avail: dict,
                    file_classes: set[str] | None = None) -> list[tuple[int, list[str]]]:
-        chain = [req.model] if req.model else list(dict.fromkeys(self.cfg.chain))
-        tiers = [(0, chain)]
-        if req.overflow in ("lite", "lite+gemma"):
-            tiers.append((1, [m for m in self.cfg.overflow_tiers if m != "gemma-auto"]))
-        if req.overflow == "lite+gemma":
-            union: set[str] = set()
-            for s in avail.values():
-                if s:
-                    union |= s
-            g = pick_gemma(union)
-            if g:
-                tiers.append((2, [g]))
+        # The tier order itself comes from the shared `tier_plan` (one walk for every
+        # entry point); this method only resolves the gemma placeholder against the
+        # availability this Router holds, and narrows by file class.
+        tiers = []
+        for tier, models in tier_plan(self.cfg, model_pin=req.model,
+                                      overflow=req.overflow or "off"):
+            if models == ["gemma-auto"]:
+                union: set[str] = set()
+                for s in avail.values():
+                    if s:
+                        union |= s
+                g = pick_gemma(union)
+                if g:
+                    tiers.append((tier, [g]))
+                continue
+            tiers.append((tier, models))
         if file_classes:
             # PDF-containing jobs use text's tier order. Other media keep the
             # historical chain-only policy; Gemma still refuses PNG file_data.
@@ -600,9 +692,7 @@ class Router:
         return tiers
 
     def _keys_sorted(self, model: str) -> list[str]:
-        now = self._now()
-        return sorted(self.cfg.api_keys,
-                      key=lambda k: -gates_for(self.cfg, self.ledger, model, k, 0, now)["rpd_left"])
+        return keys_sorted(self.cfg, self.ledger, model, now=self._now())
 
     def _gates(self, model: str, key: str, est_tokens: int = 0) -> dict:
         return gates_for(self.cfg, self.ledger, model, key, est_tokens, self._now())
