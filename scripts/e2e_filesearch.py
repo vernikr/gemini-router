@@ -119,11 +119,30 @@ class Upstream(BaseHTTPRequestHandler):
     do_GET = do_POST = do_DELETE = do_PUT = route
 
 
+def make_fixtures() -> dict[str, Path]:
+    """The two blobs the Go probe uploads. The big one is deliberately just over the
+    SDK's 8 MiB chunk size, so the upload is split into two requests and the offsets
+    are actually exercised."""
+    small = Path("/tmp/gemini-router-e2e-small.txt")
+    big = Path("/tmp/gemini-router-e2e-big.txt")
+    small.write_text("hello world\n")
+    if not big.exists() or big.stat().st_size <= 8 << 20:
+        with big.open("wb") as fh:
+            line = b"%08d the quick brown fox jumps over the lazy dog 0123456789abcdef\n"
+            for _ in range((9 << 20) // len(line) + 1):
+                fh.write(line)
+    return {"small": small, "big": big}
+
+
 def main() -> int:
     probe = Path(sys.argv[1]) if len(sys.argv) > 1 else None
     sys.path.insert(0, str(HERE.parent / "src"))
     from gemini_router import Config
     from gemini_router.proxy import GeminiProxy
+
+    fixtures = make_fixtures()
+    print(f"fixtures: {fixtures['small']} ({fixtures['small'].stat().st_size} B), "
+          f"{fixtures['big']} ({fixtures['big'].stat().st_size} B)")
 
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
     up_port = upstream.server_address[1]

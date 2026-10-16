@@ -10,7 +10,6 @@ import threading
 
 import httpx
 import pytest
-import respx
 
 from gemini_router import Config, Ledger
 from gemini_router.proxy import GeminiProxy
@@ -115,7 +114,6 @@ def test_well_known_is_json_not_text(proxy):
 
 
 # --------------------------------------------------------------------- passthrough
-@respx.mock
 def test_list_stores_forwards_path_query_and_headers(proxy, respx_mock):
     route = respx_mock.get(f"{API}/fileSearchStores").mock(
         return_value=httpx.Response(200, json={"fileSearchStores": [store_body()]}))
@@ -127,7 +125,6 @@ def test_list_stores_forwards_path_query_and_headers(proxy, respx_mock):
     assert sent.headers["x-goog-api-key"] in (K1, K2)
 
 
-@respx.mock
 def test_client_credential_never_reaches_upstream(proxy, respx_mock):
     route = respx_mock.get(f"{API}/files").mock(return_value=httpx.Response(200, json={}))
     with client(proxy) as c:
@@ -139,7 +136,6 @@ def test_client_credential_never_reaches_upstream(proxy, respx_mock):
     assert route.calls.last.request.headers["x-goog-api-key"] != TOKEN
 
 
-@respx.mock
 def test_error_body_is_passed_through_byte_for_byte(proxy, respx_mock):
     """The SDK parses `{"error":{...}}` and expects `sizeBytes` as a string —
     re-serialising the body on the way through breaks it."""
@@ -155,7 +151,6 @@ def test_error_body_is_passed_through_byte_for_byte(proxy, respx_mock):
     assert r.json()["error"]["status"] == "NOT_FOUND"
 
 
-@respx.mock
 def test_create_store_binds_affinity(proxy, respx_mock):
     respx_mock.post(f"{API}/fileSearchStores").mock(
         return_value=httpx.Response(200, json=store_body()))
@@ -166,7 +161,6 @@ def test_create_store_binds_affinity(proxy, respx_mock):
     assert owner in (kid(K1), kid(K2))
 
 
-@respx.mock
 def test_store_request_is_pinned_to_its_owner(proxy, respx_mock):
     """Rotation must not move a store to another Google project: the owner wins even
     when the other key has more budget."""
@@ -182,11 +176,9 @@ def test_store_request_is_pinned_to_its_owner(proxy, respx_mock):
     assert route.calls.last.request.headers["x-goog-api-key"] == K2
 
 
-@respx.mock
 def test_generate_content_reads_the_store_from_the_body(proxy, respx_mock):
     proxy.ledger.fs_bind("fileSearchStores/demo", kid(K2))
-    respx_mock.get(f"{UPSTREAM}/v1beta/models").mock(return_value=httpx.Response(
-        200, json={"models": [{"name": "models/gemini-2.5-flash"}]}))
+    proxy.cfg.proxy.model_policy = "passthrough"   # this test is about the body's store
     route = respx_mock.post(f"{API}/models/gemini-2.5-flash:generateContent").mock(
         return_value=httpx.Response(200, json={"candidates": [
             {"content": {"parts": [{"text": "ANSWER"}]}, "finishReason": "STOP"}]}))
@@ -199,7 +191,6 @@ def test_generate_content_reads_the_store_from_the_body(proxy, respx_mock):
     assert route.calls.last.request.headers["x-goog-api-key"] == K2
 
 
-@respx.mock
 def test_unknown_store_probes_other_keys_and_remembers(proxy, respx_mock):
     """An affinity lost to a wiped state file must heal, not 404 forever."""
     first = respx_mock.get(f"{API}/fileSearchStores/demo").mock(side_effect=[
@@ -213,7 +204,6 @@ def test_unknown_store_probes_other_keys_and_remembers(proxy, respx_mock):
     assert proxy.ledger.fs_owner("fileSearchStores/demo") in (kid(K1), kid(K2))
 
 
-@respx.mock
 def test_create_is_never_retried(proxy, respx_mock):
     """A second POST could create a second store: one attempt, then the truth."""
     route = respx_mock.post(f"{API}/fileSearchStores").mock(
@@ -224,7 +214,6 @@ def test_create_is_never_retried(proxy, respx_mock):
 
 
 # ------------------------------------------------------------------- upload flow
-@respx.mock
 def test_upload_start_rewrites_the_upload_url(proxy, respx_mock):
     respx_mock.post(f"{UPLOAD}/fileSearchStores/demo:uploadToFileSearchStore").mock(
         return_value=httpx.Response(
@@ -244,7 +233,6 @@ def test_upload_start_rewrites_the_upload_url(proxy, respx_mock):
     assert "upload_id=UP1" in url and "router_k=" in url and "router_s=" in url
 
 
-@respx.mock
 def test_full_resumable_upload_cycle(proxy, respx_mock):
     """start → chunked continuation → finalize: the continuation is authenticated and
     lands in the same Google project as the start."""
@@ -278,7 +266,6 @@ def test_full_resumable_upload_cycle(proxy, respx_mock):
         cont.headers["x-goog-api-key"], "a continuation must not change project mid-upload"
 
 
-@respx.mock
 def test_upload_id_needing_percent_encoding_survives_the_round_trip(proxy, respx_mock):
     """Google's upload ids carry ':' and '+': the id is url-encoded on the way out, so it
     must be decoded before the signature is checked or every continuation is rejected."""
@@ -301,7 +288,6 @@ def test_upload_id_needing_percent_encoding_survives_the_round_trip(proxy, respx
     assert r1.headers["x-goog-upload-status"] == "final"
 
 
-@respx.mock
 def test_forged_upload_session_is_rejected(proxy, respx_mock):
     with client(proxy) as c:
         r = c.post("/upload/v1beta/files?upload_id=UP1&upload_protocol=resumable"
@@ -309,7 +295,6 @@ def test_forged_upload_session_is_rejected(proxy, respx_mock):
     assert r.status_code == 403 and r.json()["error"]["code"] == 403
 
 
-@respx.mock
 def test_upload_chunk_larger_than_the_inspect_limit_is_streamed(proxy, respx_mock):
     blob = bytes(range(256)) * 9000                      # ~2.3 MiB, above the buffer limit
     route = respx_mock.post(f"{UPLOAD}/files").mock(return_value=httpx.Response(
@@ -326,7 +311,6 @@ def test_upload_chunk_larger_than_the_inspect_limit_is_streamed(proxy, respx_moc
 
 
 # ------------------------------------------------------------------ policy, quota
-@respx.mock
 def test_quota_429_sets_a_cooldown(proxy, respx_mock):
     proxy.ledger.fs_bind("fileSearchStores/demo", kid(K1))
     respx_mock.post(f"{API}/models/gemini-3.8-flash:generateContent").mock(
@@ -344,7 +328,19 @@ def test_quota_429_sets_a_cooldown(proxy, respx_mock):
     assert proxy.ledger.cooldown(kid(K1), "gemini-3.8-flash") is not None
 
 
-@respx.mock
+def test_strict_is_the_default_policy(proxy, respx_mock):
+    """The client's model id is a hardcoded default these keys cannot serve, so the
+    chain is what answers — otherwise every File Search query fails."""
+    assert Config.model_validate({"api_keys": [K1]}).proxy.model_policy == "strict"
+    route = respx_mock.post(f"{API}/models/gemini-3.8-flash:generateContent").mock(
+        return_value=httpx.Response(200, json={"candidates": [
+            {"content": {"parts": [{"text": "A"}]}, "finishReason": "STOP"}]}))
+    with client(proxy) as c:
+        c.post("/v1beta/models/gemini-2.5-flash:generateContent",
+               json={"contents": [{"parts": [{"text": "q"}]}]})
+    assert route.call_count == 1
+
+
 def test_strict_policy_rewrites_the_model(proxy, respx_mock):
     proxy.cfg.proxy.model_policy = "strict"
     route = respx_mock.post(f"{API}/models/gemini-3.8-flash:generateContent").mock(
@@ -356,8 +352,9 @@ def test_strict_policy_rewrites_the_model(proxy, respx_mock):
     assert route.call_count == 1
 
 
-@respx.mock
 def test_auto_policy_keeps_a_model_the_key_can_serve(proxy, respx_mock):
+    """`auto` is the opt-out: keep a model the key can actually serve."""
+    proxy.cfg.proxy.model_policy = "auto"
     respx_mock.get(f"{UPSTREAM}/v1beta/models").mock(return_value=httpx.Response(
         200, json={"models": [{"name": "models/gemini-2.5-flash"}]}))
     route = respx_mock.post(f"{API}/models/gemini-2.5-flash:generateContent").mock(
@@ -370,7 +367,6 @@ def test_auto_policy_keeps_a_model_the_key_can_serve(proxy, respx_mock):
 
 
 # ------------------------------------------------------------------------ ledger
-@respx.mock
 def test_generate_content_spends_and_management_calls_do_not(proxy, respx_mock):
     respx_mock.get(f"{API}/files").mock(return_value=httpx.Response(200, json={"files": []}))
     respx_mock.post(f"{API}/models/gemini-3.8-flash:generateContent").mock(
@@ -399,7 +395,6 @@ def test_no_keys_refuses_to_start(tmp_path):
         GeminiProxy(cfg, ledger=Ledger(cfg.state_path), token=TOKEN)
 
 
-@respx.mock
 def test_audit_line_carries_no_secret(proxy, respx_mock, caplog):
     import logging
 

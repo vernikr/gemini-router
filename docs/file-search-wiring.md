@@ -104,5 +104,8 @@ the usual cause is a stale ssh key or a dead WiFi before `ServerAlive` gives up.
   a different key, or they will not be visible.
 - Only the File Search surface is served: stores, documents, operations, Files API,
   models and resumable upload. Anything else is a JSON 404 (SPEC §11.1).
-- The model in `query_knowledge_base` is honoured as-is when the key can serve it
-  (`proxy.model_policy: auto`); set `strict` in the router config to force the chain.
+- The model in `query_knowledge_base` is **not** honoured: the proxy routes the query
+  through the router's own chain (`proxy.model_policy: strict` by default), picking the
+  chain model with the largest remaining budget. `file-search` asks for
+  `gemini-2.5-flash`, which these keys cannot serve, so passing it through would fail
+  every query. Set `model_policy: auto` or `passthrough` to change that.

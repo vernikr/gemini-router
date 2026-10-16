@@ -54,10 +54,13 @@ class ProxyCfg(BaseModel):
     body_inspect_bytes: int = 1 << 20
     audit: bool = True                      # one JSONL line per request, key_id only
     # What to do with the model the caller asked for (SPEC §11.6).
-    #   auto        keep it when the chosen key can serve it, else rewrite
-    #   strict      always rewrite to the best chain/overflow model with budget
-    #   passthrough never rewrite; account only
-    model_policy: str = "auto"
+    #   strict (default) always route through the router's own chain — the model with
+    #                    the largest remaining budget, because the caller's choice is
+    #                    usually a hardcoded default (file-search asks for
+    #                    gemini-2.5-flash) and its account cannot serve it
+    #   auto            keep the caller's model when the chosen key can serve it
+    #   passthrough     never rewrite; account only
+    model_policy: str = "strict"
     file_search_models: list[str] | None = None   # None = cfg.chain for rewriting
 
 

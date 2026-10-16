@@ -398,12 +398,15 @@ untouched.
 
 ### 11.6 Model policy
 
-`proxy.model_policy`: `auto` (default) keeps the caller's model when the chosen key can
-serve it and falls back to the best chain model with budget otherwise; `strict` always
-routes through the chain; `passthrough` never rewrites and only accounts. A File Search
-client names models outside the router's chain, and silently substituting a model that
-cannot serve the `fileSearch` tool would break every query — so the fallback, not the
-substitution, is the default.
+`proxy.model_policy`: `strict` (default) always routes through the router's own chain,
+picking the chain model with the largest remaining budget; `auto` keeps the caller's
+model when the chosen key can serve it and falls back to the chain otherwise;
+`passthrough` never rewrites and only accounts.
+
+`strict` is the default because of what the client actually sends: `file-search` asks for
+its own hardcoded `gemini-2.5-flash`, which the router's keys cannot serve, so honouring
+the request would fail every query. The chain exists precisely to answer "which model can
+take this request right now", and the caller's model id is a default, not a requirement.
 
 ### 11.7 Idempotency and retries
 

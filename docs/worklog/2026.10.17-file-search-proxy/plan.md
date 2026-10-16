@@ -15,4 +15,5 @@ taxonomy. New: client auth, resource→key affinity, upload-session tickets.
 - stdlib `http.server` (no new dependency, fits the 1 GB box, library stays MCP-agnostic)
 - separate systemd unit on `127.0.0.1:8787`, reached through the existing ssh tunnel
 - affinity in the shared ledger, so a restart cannot orphan stores
-- `auto` model policy by default (keep what the key can serve, fall back to the chain)
+- `strict` model policy by default (the client's model id is a hardcoded default
+  these keys cannot serve, so queries go through the chain)
