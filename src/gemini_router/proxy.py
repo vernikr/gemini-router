@@ -90,9 +90,11 @@ _STATUS_NAME = {400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED", 403: "PERMISSIO
 class GeminiProxy:
     """The pass-through service: one process, one port, the shared ledger."""
 
-    #: How many further candidates one request may walk after a live 429/503.
-    #: Three keys and a handful of tiers fit comfortably; a failed hop costs ~0.3 s.
-    WALK_RETRIES = 6
+    #: Hard cap on further candidates one request may walk after a live 429/503.
+    #: The effective bound is every key × every tier (see `_walk_bound`) — the day
+    #: the whole chain is drained out-of-band, the walk must still reach the
+    #: overflow tier within ONE request; a failed hop costs ~0.3 s.
+    WALK_RETRIES = 16
     #: A 503 is the model overloaded right now, not a budget verdict — cool the pair
     #: briefly so the walk moves on, and the pair comes back on its own.
     OVERLOAD_COOLDOWN_S = 60.0
@@ -299,7 +301,7 @@ class GeminiProxy:
         # Bounded; only an unbound, buffered model call is retried (a pinned call has
         # no alternative, a streamed body cannot be replayed).
         if spending and model and not resource and stream is None:
-            for _ in range(self.WALK_RETRIES):
+            for _ in range(self._walk_bound()):
                 if status not in (429, 503):
                     break
                 if status == 503:                 # 429 cooled down inside _forward
@@ -388,6 +390,12 @@ class GeminiProxy:
         if "x-goog-upload-url" in out:
             out["x-goog-upload-url"] = self.tickets.rewrite(out["x-goog-upload-url"], kid)
         return resp.status_code, out, payload
+
+    def _walk_bound(self) -> int:
+        """Every key x every tier, capped: the walk must be able to cross the whole
+        chain into overflow when the entire chain is drained out-of-band."""
+        tiers = len(self.cfg.chain) + len(self.cfg.overflow_tiers)
+        return min(self.WALK_RETRIES, max(1, len(self.cfg.api_keys) * tiers))
 
     def _quota_cooldown(self, kid: str, model: str | None, payload: bytes) -> None:
         """A 429 from the provider is the router's own signal: reuse its taxonomy and

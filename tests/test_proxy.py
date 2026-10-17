@@ -630,3 +630,22 @@ def test_a_fully_drained_pool_still_answers_with_the_provider_error(tmp_path, re
         assert r.status_code == 429
         assert len(calls) <= 1 + p.WALK_RETRIES
         assert b"RESOURCE_EXHAUSTED" in r.content or b"quota" in r.content.lower()
+
+
+def test_the_walk_bound_covers_every_key_and_tier(tmp_path, respx_mock):
+    """The day the WHOLE chain is drained out-of-band, one request must still
+    reach the overflow tier: bound = keys x (chain + overflow), capped."""
+    with spawn(tmp_path, respx_mock, overflow_default="lite",
+               overflow_tiers=["gemini-3.5-flash-lite"]) as p:
+        assert p._walk_bound() >= len(p.cfg.api_keys) * (
+            len(p.cfg.chain) + len(p.cfg.overflow_tiers))
+        for m in ("gemini-3.8-flash", "gemini-3.6-flash"):
+            respx_mock.post(f"{API}/models/{m}:generateContent").mock(
+                side_effect=lambda request: _r429_day_resp())
+        respx_mock.post(f"{API}/models/gemini-3.5-flash-lite:generateContent").mock(
+            side_effect=lambda request: gen_ok())
+        with client(p) as c:
+            r = c.post("/v1beta/models/gemini-3.8-flash:generateContent",
+                       json={"contents": [{"parts": [{"text": "hi"}]}]})
+        assert r.status_code == 200
+        assert r.headers["x-router-model"] == "gemini-3.5-flash-lite"
