@@ -543,3 +543,90 @@ def test_vision_sized_body_is_buffered_not_streamed(tmp_path, respx_mock):
                     {"inline_data": {"mime_type": "image/png", "data": big}},
                     {"text": "what is on the screen?"}]}]})
     assert r.status_code == 200 and route.call_count == 1
+
+
+# ------------------------------------------- walk continues on live 429/503
+# The ledger only sees traffic that went through the router; a key drained by an
+# out-of-band consumer looks fresh until the provider says 429. One request must
+# absorb that discovery itself — cool the pair, re-walk, answer from whoever can.
+
+
+def _r429_day_resp():
+    from tests.conftest import r429_day
+    return r429_day()
+
+
+def test_a_live_daily_429_walks_to_the_next_key(tmp_path, respx_mock):
+    """Ledger says K1 is fresh; the provider disagrees. The same request must be
+    served by K2, and the cooldown must be on record for the next walk."""
+    with spawn(tmp_path, respx_mock) as p:
+        seen = []
+
+        def upstream(request):
+            seen.append(request.headers.get("x-goog-api-key"))
+            return _r429_day_resp() if seen[-1] == K1 else gen_ok()
+
+        respx_mock.post(f"{API}/models/gemini-3.8-flash:generateContent").mock(
+            side_effect=upstream)
+        with client(p) as c:
+            r = c.post("/v1beta/models/gemini-3.8-flash:generateContent",
+                       json={"contents": [{"parts": [{"text": "hi"}]}]})
+        assert r.status_code == 200
+        assert seen == [K1, K2]
+        assert r.headers["x-router-key-id"] == kid(K2)
+
+
+def test_a_live_503_walks_on_and_the_pair_recovers_later(tmp_path, respx_mock):
+    """503 is overload, not budget: the request is served by the next candidate and
+    the cooled pair is only benched briefly (not until midnight)."""
+    with spawn(tmp_path, respx_mock) as p:
+        seen = []
+
+        def upstream(request):
+            seen.append(request.headers.get("x-goog-api-key"))
+            if seen[-1] == K1:
+                return httpx.Response(503, json={"error": {"message": "overloaded"}})
+            return gen_ok()
+
+        respx_mock.post(f"{API}/models/gemini-3.8-flash:generateContent").mock(
+            side_effect=upstream)
+        with client(p) as c:
+            r = c.post("/v1beta/models/gemini-3.8-flash:generateContent",
+                       json={"contents": [{"parts": [{"text": "hi"}]}]})
+        assert r.status_code == 200
+        assert seen == [K1, K2]
+        cd = p.ledger._conn.execute(
+            "SELECT until_ts - strftime('%s','now') FROM cooldowns WHERE key_id=?",
+            (kid(K1),)).fetchone()
+        assert cd is not None and cd[0] < 120, "a 503 bench is seconds, not a day"
+
+
+def test_every_key_drained_live_falls_through_to_the_next_tier(tmp_path, respx_mock):
+    """Both keys answer daily-429 on the head model: the walk crosses the tier and
+    the SAME request comes back 200 from the second chain model."""
+    with spawn(tmp_path, respx_mock) as p:
+        respx_mock.post(f"{API}/models/gemini-3.8-flash:generateContent").mock(
+            side_effect=lambda request: _r429_day_resp())
+        respx_mock.post(f"{API}/models/gemini-3.6-flash:generateContent").mock(
+            side_effect=lambda request: gen_ok())
+        with client(p) as c:
+            r = c.post("/v1beta/models/gemini-3.8-flash:generateContent",
+                       json={"contents": [{"parts": [{"text": "hi"}]}]})
+        assert r.status_code == 200
+        assert r.headers["x-router-model"] == "gemini-3.6-flash"
+
+
+def test_a_fully_drained_pool_still_answers_with_the_provider_error(tmp_path, respx_mock):
+    """When the whole walk is dead the caller still gets the provider's own 429 —
+    bounded retries, never a hang or a synthetic error."""
+    with spawn(tmp_path, respx_mock) as p:
+        calls = []
+        for m in ("gemini-3.8-flash", "gemini-3.6-flash"):
+            respx_mock.post(f"{API}/models/{m}:generateContent").mock(
+                side_effect=lambda request: (calls.append(1), _r429_day_resp())[1])
+        with client(p) as c:
+            r = c.post("/v1beta/models/gemini-3.8-flash:generateContent",
+                       json={"contents": [{"parts": [{"text": "hi"}]}]})
+        assert r.status_code == 429
+        assert len(calls) <= 1 + p.WALK_RETRIES
+        assert b"RESOURCE_EXHAUSTED" in r.content or b"quota" in r.content.lower()

@@ -415,6 +415,14 @@ duplicated — the proxy only maps its policy onto the walk's inputs:
   rewrites and keeps the caller's landing key.
 - when every pair is day-drained the head candidate is forwarded anyway — the provider
   stays the source of truth and its own 429 body reaches the client untranslated.
+- **a live 429/503 continues the same walk.** The ledger only sees traffic that went
+  through the router; a key drained out-of-band looks fresh until the provider answers
+  429. That answer (or a 503 overload) cools the pair down (429 via the usual taxonomy,
+  503 for `OVERLOAD_COOLDOWN_S` seconds) and the same request re-runs the walk — next
+  key, then next tier — up to `WALK_RETRIES` further candidates before the last provider
+  error is forwarded. Only an unbound, buffered `generateContent` walks on (a pinned call
+  has no alternative; a streamed body cannot be replayed). Every upstream attempt is
+  planned and resolved in the ledger: retried attempts spent real provider quota.
 
 `strict` is the default because of what the client actually sends: `file-search` asks for
 its own hardcoded `gemini-2.5-flash`, which the router's keys cannot serve, so honouring

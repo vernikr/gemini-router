@@ -90,6 +90,13 @@ _STATUS_NAME = {400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED", 403: "PERMISSIO
 class GeminiProxy:
     """The pass-through service: one process, one port, the shared ledger."""
 
+    #: How many further candidates one request may walk after a live 429/503.
+    #: Three keys and a handful of tiers fit comfortably; a failed hop costs ~0.3 s.
+    WALK_RETRIES = 6
+    #: A 503 is the model overloaded right now, not a budget verdict — cool the pair
+    #: briefly so the walk moves on, and the pair comes back on its own.
+    OVERLOAD_COOLDOWN_S = 60.0
+
     def __init__(self, cfg: Config, *, ledger: Ledger | None = None,
                  token: str | None = None, origin: str | None = None):
         if not cfg.api_keys:
@@ -258,26 +265,62 @@ class GeminiProxy:
         headers["x-goog-api-key"] = key
         url = self._upstream_url(path, upstream_query)
         spending = path.endswith(":generateContent") and method == "POST"
-        # A generateContent call spends the model's quota, so it is planned and resolved
-        # like any other router call. Everything else is recorded but excluded from every
-        # gate (NON_SPENDING_KINDS), so `quota` and `calls` stay truthful without ever
-        # blocking a store listing on a day when the text budget is gone.
-        row_id = self.ledger.plan(
-            key_id=key_id(key), model=model or FILE_ROW_MODEL,
-            kind="single" if spending else "filesearch", est_tokens=0, request_id=None,
-            source="filesearch") if (spending or cfg.proxy.audit) else None
 
-        status, out_headers, payload = self._forward(
-            method, url, headers, body, stream, length, path, resource, pinned, kid, key)
+        def attempt() -> tuple[int, dict, bytes]:
+            # A generateContent call spends the model's quota, so EVERY upstream try is
+            # planned and resolved like any other router call — a retried attempt spent
+            # real provider quota and must not vanish from the ledger. Everything else
+            # is recorded but excluded from every gate (NON_SPENDING_KINDS), so `quota`
+            # and `calls` stay truthful without ever blocking a store listing on a day
+            # when the text budget is gone.
+            row_id = self.ledger.plan(
+                key_id=key_id(key), model=model or FILE_ROW_MODEL,
+                kind="single" if spending else "filesearch", est_tokens=0,
+                request_id=None,
+                source="filesearch") if (spending or cfg.proxy.audit) else None
+            st, hdrs_out, pl = self._forward(
+                method, url, headers, body, stream, length, path, resource, pinned,
+                kid, key)
+            if row_id is not None:
+                self.ledger.resolve(row_id,
+                                    "ok" if st < 400 else self._status_name(st),
+                                    http_status=st,
+                                    latency_ms=int((time.time() - started) * 1000))
+            return st, hdrs_out, pl
+
+        status, out_headers, payload = attempt()
+
+        # --- keep walking on a live quota/overload answer (SPEC §11.6) -------------
+        # The ledger only sees traffic that went through the router; a key drained by
+        # another consumer looks fresh until the provider answers 429. That answer
+        # (or a 503 overload) cools the pair down, so re-running the same selection
+        # walk now lands on the next candidate — another key, or the next tier.
+        # Forwarding the first failure would push this walk onto every caller.
+        # Bounded; only an unbound, buffered model call is retried (a pinned call has
+        # no alternative, a streamed body cannot be replayed).
+        if spending and model and not resource and stream is None:
+            for _ in range(self.WALK_RETRIES):
+                if status not in (429, 503):
+                    break
+                if status == 503:                 # 429 cooled down inside _forward
+                    self.ledger.set_cooldown(kid, model,
+                                             time.time() + self.OVERLOAD_COOLDOWN_S,
+                                             "unavailable_503")
+                next_kid, next_model = self.routing.choose(model, None)
+                next_key = self.routing._resolve(next_kid)
+                if next_key is None or (next_kid, next_model) == (kid, model):
+                    break                         # the walk has nothing new to offer
+                if next_model != model:
+                    path = path.replace(f"/models/{model}:", f"/models/{next_model}:", 1)
+                    model = next_model
+                kid, key = next_kid, next_key
+                headers["x-goog-api-key"] = key
+                url = self._upstream_url(path, upstream_query)
+                status, out_headers, payload = attempt()
 
         # --- learn what a create produced, so the next call needs no probing -------
         if is_create(path, method):
             self.routing.learn(path, method, status, payload, kid)
-
-        if row_id is not None:
-            self.ledger.resolve(row_id, "ok" if status < 400 else self._status_name(status),
-                                http_status=status,
-                                latency_ms=int((time.time() - started) * 1000))
 
         if cfg.proxy.audit:
             log.info("proxy %s %s -> %d key=%s resource=%s pinned=%s bytes=%d %.0fms",
