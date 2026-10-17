@@ -7,6 +7,7 @@ network, no provider keys. Fixtures carry the DUMMY marker the secrets guard req
 from __future__ import annotations
 
 import contextlib
+import json
 import threading
 
 import httpx
@@ -649,3 +650,71 @@ def test_the_walk_bound_covers_every_key_and_tier(tmp_path, respx_mock):
                        json={"contents": [{"parts": [{"text": "hi"}]}]})
         assert r.status_code == 200
         assert r.headers["x-router-model"] == "gemini-3.5-flash-lite"
+
+
+# ------------------------------------------------------------- interactions API
+def _interaction_ok(iid: str = "intx_1", model: str = "gemini-3.8-flash") -> dict:
+    return {"id": iid, "status": "completed", "model": model,
+            "steps": [{"type": "model_output",
+                       "content": [{"type": "text", "text": "hello"}]}],
+            "usage": {"total_input_tokens": 10, "total_output_tokens": 2}}
+
+
+def test_an_interactions_create_is_served_and_bound_to_its_key(proxy, respx_mock):
+    route = respx_mock.post(f"{API}/interactions").respond(200, json=_interaction_ok())
+    with client(proxy) as c:
+        r = c.post("/v1beta/interactions",
+                   json={"model": "gemini-2.5-flash", "input": "hi"})
+    assert r.status_code == 200
+    sent = json.loads(route.calls[0].request.content)
+    assert sent["model"] in ("gemini-3.8-flash", "gemini-3.6-flash"), \
+        "the policy walk rewrites the model inside the BODY"
+    assert r.headers["x-router-model"] == sent["model"]
+    served = r.headers["x-router-key-id"]
+    assert proxy.ledger.fs_owner("interactions/intx_1") == served, \
+        "the new interaction is bound to the key that created it"
+
+
+def test_a_chained_turn_rides_the_key_that_holds_its_history(proxy, respx_mock):
+    respx_mock.post(f"{API}/interactions").respond(200, json=_interaction_ok("intx_2"))
+    proxy.ledger.fs_bind("interactions/intx_1", kid(K2))
+    with client(proxy) as c:
+        r = c.post("/v1beta/interactions",
+                   json={"model": "gemini-3.8-flash", "input": "again",
+                         "previous_interaction_id": "intx_1"})
+    assert r.status_code == 200
+    assert r.headers["x-router-key-id"] == kid(K2), \
+        "server-side history lives in one project; the chain must not rotate keys"
+    assert proxy.ledger.fs_owner("interactions/intx_2") == kid(K2)
+
+
+def test_a_drained_key_walks_models_but_never_leaves_the_chain_key(proxy, respx_mock):
+    calls = []
+
+    def answer(request):
+        calls.append(json.loads(request.content))
+        if len(calls) == 1:
+            return httpx.Response(429, json={"error": {"code": 429, "message": "quota",
+                                                       "status": "RESOURCE_EXHAUSTED"}})
+        return httpx.Response(200, json=_interaction_ok("intx_3"))
+
+    respx_mock.post(f"{API}/interactions").mock(side_effect=answer)
+    proxy.ledger.fs_bind("interactions/intx_1", kid(K1))
+    with client(proxy) as c:
+        r = c.post("/v1beta/interactions",
+                   json={"model": "gemini-3.8-flash", "input": "x",
+                         "previous_interaction_id": "intx_1"})
+    assert r.status_code == 200
+    assert len(calls) == 2
+    assert calls[0]["model"] != calls[1]["model"], "the walk moved down the chain"
+    assert r.headers["x-router-key-id"] == kid(K1), "the key stayed pinned"
+
+
+def test_interaction_retrieval_reaches_the_owning_key(proxy, respx_mock):
+    route = respx_mock.get(f"{API}/interactions/intx_9").respond(
+        200, json=_interaction_ok("intx_9"))
+    proxy.ledger.fs_bind("interactions/intx_9", kid(K2))
+    with client(proxy) as c:
+        r = c.get("/v1beta/interactions/intx_9")
+    assert r.status_code == 200
+    assert route.calls[0].request.headers["x-goog-api-key"] == K2

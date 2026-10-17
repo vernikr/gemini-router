@@ -46,14 +46,17 @@ import httpx
 from .config import Config, key_id
 from .errors import GeminiHTTPError
 from .filesearch import (
+    INTERACTIONS_CREATE,
     FileSearchRouting,
     UploadTickets,
     allowed_path,
+    interactions_model,
     is_create,
     is_upload_chunk,
     is_upload_start,
     model_of,
     resource_of,
+    set_interactions_model,
 )
 from .gemini import GeminiClient
 from .ledger import FILE_ROW_MODEL, Ledger
@@ -249,6 +252,12 @@ class GeminiProxy:
                     500, "no configured key matches the selected key id"), {})
 
         model = model_of(path)
+        # The Interactions API names the model in the BODY, not the path — the same
+        # policy walk applies, only the rewrite lands in different bytes.
+        model_in_body = (path == INTERACTIONS_CREATE and method == "POST"
+                         and body is not None)
+        if model_in_body and not model:
+            model = interactions_model(body)
         if model and cfg.proxy.model_policy != "passthrough":
             # Key and model come from the shared selection walk (SPEC §11.6): resource
             # affinity pins the key and only the model walks; an unbound model call
@@ -256,7 +265,11 @@ class GeminiProxy:
             # remaining budget instead of riding the File Search pin.
             new_kid, chosen = self.routing.choose(model, kid if resource else None)
             if chosen and chosen != model:
-                path = path.replace(f"/models/{model}:", f"/models/{chosen}:", 1)
+                if model_in_body:
+                    body = set_interactions_model(body, chosen)
+                    length = len(body)
+                else:
+                    path = path.replace(f"/models/{model}:", f"/models/{chosen}:", 1)
                 model = chosen
             if not resource and new_kid != kid:
                 rotated = self.routing._resolve(new_kid)
@@ -266,7 +279,8 @@ class GeminiProxy:
         headers = self._upstream_headers(h)
         headers["x-goog-api-key"] = key
         url = self._upstream_url(path, upstream_query)
-        spending = path.endswith(":generateContent") and method == "POST"
+        spending = method == "POST" and (path.endswith(":generateContent")
+                                         or path == INTERACTIONS_CREATE)
 
         def attempt() -> tuple[int, dict, bytes]:
             # A generateContent call spends the model's quota, so EVERY upstream try is
@@ -282,7 +296,7 @@ class GeminiProxy:
                 source="filesearch") if (spending or cfg.proxy.audit) else None
             st, hdrs_out, pl = self._forward(
                 method, url, headers, body, stream, length, path, resource, pinned,
-                kid, key)
+                kid, key, model=model)
             if row_id is not None:
                 self.ledger.resolve(row_id,
                                     "ok" if st < 400 else self._status_name(st),
@@ -298,9 +312,12 @@ class GeminiProxy:
         # (or a 503 overload) cools the pair down, so re-running the same selection
         # walk now lands on the next candidate — another key, or the next tier.
         # Forwarding the first failure would push this walk onto every caller.
-        # Bounded; only an unbound, buffered model call is retried (a pinned call has
-        # no alternative, a streamed body cannot be replayed).
-        if spending and model and not resource and stream is None:
+        # Bounded; only a buffered model call is retried (a streamed body cannot be
+        # replayed). A resource-pinned path-model call (File Search generateContent)
+        # stays put as before; an interactions chain is pinned to its KEY but may
+        # still walk MODELS on that key — the model is interaction-scoped, only the
+        # history belongs to the project.
+        if spending and model and stream is None and (not resource or model_in_body):
             for _ in range(self._walk_bound()):
                 if status not in (429, 503):
                     break
@@ -308,12 +325,16 @@ class GeminiProxy:
                     self.ledger.set_cooldown(kid, model,
                                              time.time() + self.OVERLOAD_COOLDOWN_S,
                                              "unavailable_503")
-                next_kid, next_model = self.routing.choose(model, None)
+                next_kid, next_model = self.routing.choose(model, kid if resource else None)
                 next_key = self.routing._resolve(next_kid)
                 if next_key is None or (next_kid, next_model) == (kid, model):
                     break                         # the walk has nothing new to offer
                 if next_model != model:
-                    path = path.replace(f"/models/{model}:", f"/models/{next_model}:", 1)
+                    if model_in_body:
+                        body = set_interactions_model(body, next_model)
+                        length = len(body)
+                    else:
+                        path = path.replace(f"/models/{model}:", f"/models/{next_model}:", 1)
                     model = next_model
                 kid, key = next_kid, next_key
                 headers["x-goog-api-key"] = key
@@ -323,6 +344,7 @@ class GeminiProxy:
         # --- learn what a create produced, so the next call needs no probing -------
         if is_create(path, method):
             self.routing.learn(path, method, status, payload, kid)
+            self.routing.learn_interaction(path, method, status, payload, kid)
 
         if cfg.proxy.audit:
             log.info("proxy %s %s -> %d key=%s resource=%s pinned=%s bytes=%d %.0fms",
@@ -337,7 +359,7 @@ class GeminiProxy:
                    payload, out_headers)
 
     def _forward(self, method, url, headers, body, stream, length, path, resource,
-                 pinned, kid, key) -> tuple[int, dict, bytes]:
+                 pinned, kid, key, model=None) -> tuple[int, dict, bytes]:
         """Send upstream, retrying only where that is safe (SPEC §11.7).
 
         A non-idempotent POST (create a store, import a file) is never repeated once it
@@ -347,7 +369,7 @@ class GeminiProxy:
         """
         attempts = [(url, headers, body, stream, kid, key)]
         if method in ("GET", "DELETE", "HEAD") and not pinned and resource:
-            for other in self.routing.probe_order(resource, model_of(path))[1:]:
+            for other in self.routing.probe_order(resource, model or model_of(path))[1:]:
                 k = self.routing._resolve(other)
                 if k is not None:
                     attempts.append((url, {**headers, "x-goog-api-key": k}, body,
@@ -367,7 +389,7 @@ class GeminiProxy:
             if status in (403, 404) and resource and i + 1 < len(attempts):
                 continue                                  # another project may own it
             if status == 429:
-                self._quota_cooldown(cur_kid, model_of(path), payload)
+                self._quota_cooldown(cur_kid, model or model_of(path), payload)
                 if not pinned and i + 1 < len(attempts):
                     continue
                 last = (status, out, payload)

@@ -48,10 +48,17 @@ ALLOWED = (
     re.compile(r"^/v1beta/models$"),
     re.compile(r"^/upload/v1beta/files$"),
     re.compile(r"^/upload/v1beta/fileSearchStores/[^/:?]+:uploadToFileSearchStore$"),
+    # Interactions API (GA 2026; generateContent is legacy): create, retrieve,
+    # delete, cancel. Server-side conversation state is project-scoped exactly
+    # like a File Search store, so the same resource->key binding carries it.
+    re.compile(r"^/v1beta/interactions$"),
+    re.compile(r"^/v1beta/interactions/[^/:?]+(:cancel)?$"),
 )
 
 GENERATE_RX = re.compile(r"^/v1beta/models/([^/:]+):generateContent$")
 UPLOAD_PATHS = ("/upload/v1beta/files",)
+INTERACTIONS_CREATE = "/v1beta/interactions"
+INTERACTION_RX = re.compile(r"^/v1beta/interactions/([^/:?]+)")
 
 
 def allowed_path(path: str) -> bool:
@@ -74,7 +81,8 @@ def is_create(path: str, method: str) -> bool:
     """A request that creates a project-scoped resource — never blindly retried."""
     return method == "POST" and (path == "/v1beta/fileSearchStores"
                                  or ":importFile" in path
-                                 or UPLOAD_STORE_RX.match(path) is not None)
+                                 or UPLOAD_STORE_RX.match(path) is not None
+                                 or path == INTERACTIONS_CREATE)
 
 
 def resource_of(path: str, body: bytes | None = None) -> str | None:
@@ -90,18 +98,33 @@ def resource_of(path: str, body: bytes | None = None) -> str | None:
     m = FILE_RX.search(path)
     if m:
         return m.group(1)
+    m = INTERACTION_RX.match(path)
+    if m:
+        return f"interactions/{m.group(1)}"
     if body:
+        if path == INTERACTIONS_CREATE:
+            # A chained turn must land in the project that holds the previous
+            # turn's server-side state — the whole point of the chain.
+            prev = str((_body_json(body) or {}).get("previous_interaction_id") or "")
+            return f"interactions/{prev}" if prev else None
         g = GENERATE_RX.match(path)
         if g:
-            try:
-                data = json.loads(body)
-            except ValueError:
+            data = _body_json(body)
+            if data is None:
                 return None
             for tool in data.get("tools") or []:
                 names = (tool.get("fileSearch") or {}).get("fileSearchStoreNames") or []
                 if names:
                     return names[0]
     return None
+
+
+def _body_json(body: bytes) -> dict | None:
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def model_of(path: str) -> str | None:
@@ -114,6 +137,27 @@ def rewrite_model(body: bytes, model: str) -> bytes:
     needs no change; this helper exists for callers that carry the model in the body
     (countTokens shares the shape)."""
     return body
+
+
+def interactions_model(body: bytes | None) -> str | None:
+    """The model named in an interactions create body — the Interactions API moved
+    the model out of the URL path and into the request body."""
+    if not body:
+        return None
+    data = _body_json(body)
+    model = str((data or {}).get("model") or "")
+    return model or None
+
+
+def set_interactions_model(body: bytes, model: str) -> bytes:
+    """The same body asking for `model` instead. Only the one field changes; an
+    unparseable body comes back untouched — forwarding a client's exact bytes is
+    always safer than guessing."""
+    data = _body_json(body)
+    if data is None or not data.get("model"):
+        return body
+    data["model"] = model
+    return json.dumps(data, ensure_ascii=False).encode("utf-8")
 
 
 # ---------------------------------------------------------------- upload tickets
@@ -251,6 +295,18 @@ class FileSearchRouting:
             resource = name
         if resource:
             self.ledger.fs_bind(resource, kid)
+
+    def learn_interaction(self, path: str, method: str, status: int,
+                          body: bytes, kid: str) -> None:
+        """Remember which key served a created interaction: the next turn carries
+        this id as `previous_interaction_id`, and its server-side history exists
+        only in that key's project."""
+        if path != INTERACTIONS_CREATE or method != "POST" or status >= 300 or not body:
+            return
+        data = _body_json(body)
+        iid = str((data or {}).get("id") or "")
+        if iid:
+            self.ledger.fs_bind(f"interactions/{iid}", kid)
 
     # --------------------------------------------------------------------- models
     def available_models(self, key: str, timeout: float = 15.0) -> set[str] | None:
