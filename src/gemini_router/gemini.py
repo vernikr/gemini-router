@@ -238,10 +238,20 @@ class GeminiClient:
 
     async def generate(self, key: str, model: str, *, prompt: str, system: str | None = None,
                        thinking_level: str | None = "medium", output_format: str = "text",
-                       max_output_tokens: int = 8192,
+                       max_output_tokens: int | None = None,
                        file_parts: list[dict] | None = None,
                        on_text: Callable[[str], None] | None = None) -> GenResult:
-        gen: dict = {"maxOutputTokens": max_output_tokens}
+        # No cap unless the caller asked for one. The field is OMITTED rather than sent
+        # as null when unset: measured against the live free tier, an omitted
+        # maxOutputTokens let one call return 29,899 candidate tokens with
+        # finishReason=STOP, so the provider treats "absent" as unlimited here, not as
+        # the 8,192 the docs describe as the default. The old `= 8192` default arrived in
+        # the first commit with no stated rationale and was invisible in this path —
+        # routing.py always passes a value — so it only ever bit a direct caller of this
+        # client, silently, with no way to tell a cap from a short answer.
+        gen: dict = {}
+        if max_output_tokens is not None:
+            gen["maxOutputTokens"] = max_output_tokens
         if output_format == "json":
             gen["responseMimeType"] = "application/json"
         if is_gemini3(model):

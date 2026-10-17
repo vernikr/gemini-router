@@ -318,3 +318,39 @@ async def test_routing_asks_for_the_model_list_once(tmp_path, respx_mock):
         assert set(per) == set(avail)
     finally:
         await r.aclose()
+
+
+async def test_no_requested_cap_reaches_the_provider_as_no_cap(mock_api, tmp_path):
+    """The router used to substitute cfg.max_output_tokens_default (32768) whenever the
+    caller left max_output_tokens unset — which the gateway always does, so every gateway
+    call was hard-capped at 32768 output tokens and nothing in the gateway could see it.
+    Unset now means unset: the field is absent from the request, which measured live as
+    unlimited rather than as the documented 8192 default.
+    """
+    import json
+
+    seen = {}
+
+    def cap(request: httpx.Request) -> httpx.Response:
+        seen["gen"] = json.loads(request.content)["generationConfig"]
+        return gen_resp("ok")
+
+    mock_api.post(f"{BASE}/models/{M8}:generateContent").mock(side_effect=cap)
+    r = Router(make_config(tmp_path))
+    await r.complete(req("p"))
+    assert "maxOutputTokens" not in seen["gen"], seen["gen"]
+
+
+async def test_an_explicit_cap_survives_the_router(mock_api, tmp_path):
+    import json
+
+    seen = {}
+
+    def cap(request: httpx.Request) -> httpx.Response:
+        seen["gen"] = json.loads(request.content)["generationConfig"]
+        return gen_resp("ok")
+
+    mock_api.post(f"{BASE}/models/{M8}:generateContent").mock(side_effect=cap)
+    r = Router(make_config(tmp_path))
+    await r.complete(req("p", max_output_tokens=900))
+    assert seen["gen"]["maxOutputTokens"] == 900

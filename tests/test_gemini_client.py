@@ -136,3 +136,26 @@ async def test_thinking_starvation_surfaces(mock_api, tmp_path):
     await client.aclose()
     assert gr.text == "" and gr.finish_reason == "MAX_TOKENS"
     assert gr.tokens_out is None and gr.tokens_thought == 16
+
+
+async def test_no_max_output_tokens_means_no_cap_sent(mock_api, tmp_path):
+    """The client used to default max_output_tokens to 8192 and always put the field in
+    the request. That default arrived in the first commit with no stated rationale, and
+    it is the kind of cap nobody can see: a short answer and a capped one look identical
+    from the outside. Measured against the live free tier, an omitted maxOutputTokens let
+    one call return 29,899 candidate tokens with finishReason=STOP — the provider treats
+    "absent" as unlimited, so not sending the field is what "no cap" actually means.
+    """
+    cfg = make_config(tmp_path)
+    seen = await _capture(mock_api, cfg, "gemini-3.8-flash", thinking_level="low")
+    gen = seen["payload"]["generationConfig"]
+    assert "maxOutputTokens" not in gen, gen
+
+
+async def test_an_explicit_cap_is_still_honoured(mock_api, tmp_path):
+    """Removing the default must not remove the knob: a caller that asks for a cap gets
+    exactly that cap, and the field is present so the provider enforces it."""
+    cfg = make_config(tmp_path)
+    seen = await _capture(mock_api, cfg, "gemini-3.8-flash", thinking_level="low",
+                          max_output_tokens=512)
+    assert seen["payload"]["generationConfig"]["maxOutputTokens"] == 512

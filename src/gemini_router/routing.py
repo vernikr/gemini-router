@@ -36,7 +36,7 @@ class RouterRequest:
     system: str | None = None
     thinking_level: str | None = "medium"   # low|medium|high; None omits thinkingConfig
     output_format: str = "text"             # text|json
-    max_output_tokens: int | None = None    # None → cfg.max_output_tokens_default
+    max_output_tokens: int | None = None    # None → no cap sent to the provider
     kind: str = "single"                    # single|chunk|consolidate|count
     request_id: str | None = None           # idempotency / cache lookup
     source: str = "cli"                     # mcp|cli|rest|tldr
@@ -105,7 +105,7 @@ def gates_for(cfg: Config, ledger: Ledger, model: str, key: str,
                       ledger.cooldown(kid, model, now), est_tokens, now)
 
 
-def cache_hash(model: str, req: RouterRequest, mot: int,
+def cache_hash(model: str, req: RouterRequest, mot: int | None,
                file_hashes: list[str] | None = None) -> str:
     """Content only. File bytes enter as their local sha256, never as the provider URI:
     a URI changes on every re-upload (after expiry, or under another key) and would turn
@@ -398,7 +398,7 @@ class Router:
             uploads_by_key[files[0].key_id] = files
         fhashes = [f.sha256 or "" for f in files] or None
         wait_enabled = req.wait if req.wait is not None else cfg.wait.enabled_default
-        mot = req.max_output_tokens or cfg.max_output_tokens_default
+        mot = req.max_output_tokens          # None means unlimited; nothing substitutes
         est = req.est_tokens or estimate_tokens(req.prompt, cfg.chars_per_token)
         ttl = cfg.cache_ttl_h * 3600
 
@@ -698,7 +698,7 @@ class Router:
         return gates_for(self.cfg, self.ledger, model, key, est_tokens, self._now())
 
     async def _try_candidate(self, req: RouterRequest, tier: int, model: str, key: str,
-                             est: int, mot: int, wait_enabled: bool, deadline: float,
+                             est: int, mot: int | None, wait_enabled: bool, deadline: float,
                              emit: Emitter, failures: list[str], dead_keys: set[str],
                              files: list[UploadedFile] | None = None,
                              fhashes: list[str] | None = None, stream: bool = False):

@@ -98,7 +98,6 @@ class Config(BaseModel):
     # Evidence: docs/worklog/archive/2026.10.11-capability-canary/.
     file_capable_models: list[str] | dict[str, list[str]] | None = None
     temperature: float | None = None           # applied to pre-3.x models only
-    max_output_tokens_default: int = 32768   # cap only; 3.x thinking tokens count toward it
     # Estimate divisor for the TPM pre-flight gate. None (default) = script-aware
     # estimate; set a number to force the old single-divisor behaviour.
     chars_per_token: int | None = None
