@@ -39,13 +39,64 @@ uv add gemini-router          # PyPI
 gemini-router quota           # RPD left / RPM & TPM windows / cooldowns / recommendation
 ```
 
-## Usage
+## How to Call from Another Project (3 Ways)
+
+### 1. HTTP REST API via `gemini-mcp` daemon (`127.0.0.1:8790`) — Language-Agnostic
+
+Ensure the SSH tunnel is active (`packaging/com.vernikr.gemini-tunnel.plist` forwards `:8790` and `:8787` from the VPS):
+
+```bash
+# Health check (no auth):
+curl -s http://127.0.0.1:8790/healthz
+
+# Quota table:
+curl -s http://127.0.0.1:8790/v1/quota \
+  -H "Authorization: Bearer $GEMINI_MCP_TOKEN"
+
+# Single-shot completion:
+curl -s -X POST http://127.0.0.1:8790/v1/complete \
+  -H "Authorization: Bearer $GEMINI_MCP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Summarize these messages...",
+    "system": "You are a concise analyst.",
+    "route": "auto",
+    "thinking_level": "medium",
+    "overflow": "lite"
+  }'
+# Returns: {"report": "...", "result": "<text>", "meta": {"model": "...", "latency_s": 2.1, "progress_trace": [...]}}
+```
+
+### 2. Native Gemini v1beta Pass-Through Proxy (`127.0.0.1:8787`)
+
+For standard Google Gen AI SDKs or clients calling `/v1beta/models/{model}:generateContent`:
+
+```bash
+GEMINI_ROUTER_PROXY_TOKEN=$(openssl rand -hex 32) gemini-router proxy   # 127.0.0.1:8787
+```
+
+On the client machine, set `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8787` (bare origin, no path prefix) and `GEMINI_API_KEY=$GEMINI_ROUTER_PROXY_TOKEN` (sent as `x-goog-api-key`). See [SPEC §11](docs/SPEC.md#11-native-gemini-api-pass-through-gemini-router-proxy).
+
+### 3. Python Library (`gemini_router`)
 
 ```python
-from gemini_router import Router, RouterRequest
-router = Router.from_env()
-res = await router.complete(RouterRequest(prompt=..., thinking_level="high"),
-                            on_event=print)
+from gemini_router import Config, Router, RouterRequest
+
+cfg = Config.load(state_path="~/.config/gemini-mcp/state.db")
+router = Router(cfg)
+try:
+    res = await router.complete(
+        RouterRequest(
+            prompt="...",
+            system="...",
+            thinking_level="medium",   # "low" | "medium" | "high" | None
+            overflow="lite",           # "off" | "lite" | "lite+gemma"
+        ),
+        on_event=lambda ev: print(ev.message(), flush=True),
+    )
+    print(res.text, res.model, res.latency_s)
+finally:
+    await router.aclose()
 ```
 
 ### Streaming
@@ -56,18 +107,6 @@ with `detail["text"]` deltas. The returned `RouterResult.text` is authoritative;
 cache hits return it without deltas. Text events are not retained in `result.events`.
 Truncated, blocked and interrupted responses are never cached. Existing calls stay
 non-streaming. Both paths share keys, model selection, auth fallback and the ledger.
-
-Service-style (no Python): REST `/v1/complete` + `/v1/quota` on the gemini-mcp daemon.
-
-### Native Gemini API pass-through
-
-```bash
-GEMINI_ROUTER_PROXY_TOKEN=$(openssl rand -hex 32) gemini-router proxy   # 127.0.0.1:8787
-```
-
-Then, on the client machine, `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8787` (through an
-SSH tunnel) plus `GEMINI_API_KEY=<the token>` — no change to the client's code. The base
-URL must be a bare origin with no path prefix; see SPEC §11.
 
 Conventions: English in files, Conventional Commits, SemVer tags `v*` (gemini-mcp pins
 a tag), CI = ruff + pytest with mocked HTTP (see `AGENTS.md`).
