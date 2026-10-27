@@ -1,10 +1,11 @@
-"""Terminal UX (FR-C12): quota | models | calls | prune | doctor. Works over SSH
-against the shared state file without touching the daemon (FR-E7)."""
+"""Terminal UX (FR-C12): quota, models, calls, jobs, job, notes, prune, doctor, proxy.
+Works over SSH against the shared state file without touching the daemon (FR-E7)."""
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 from rich.console import Console
@@ -18,6 +19,11 @@ from .ledger import Ledger, iso, pt_midnight_ts
 from .routing import Router, pick_gemma
 
 console = Console()
+
+
+def _emit_audit(line: str, args) -> None:
+    """Keep `--json` stdout parseable; the audit line still exists on stderr."""
+    print(line, file=sys.stderr if getattr(args, "json", False) else sys.stdout)
 
 
 def _load_cfg(args) -> Config:
@@ -104,29 +110,34 @@ def cmd_calls(args, cfg: Config | None = None) -> int:
     rows = Ledger(cfg.state_path).calls_tail(
         args.n, model=args.model, status=args.status, source=args.source,
         request_id=getattr(args, "request_id", None),
-        initiator=getattr(args, "initiator", None))
+        initiator=getattr(args, "initiator", None),
+        job=getattr(args, "job", None), trace_id=getattr(args, "trace", None),
+        step=getattr(args, "step", None))
     wide = getattr(args, "wide", False)
     if args.json:
         print(json.dumps(rows, indent=1, default=str))
         return 0
     t = Table(title=f"Last {len(rows)} calls · gemini-router {__version__}", expand=True)
-    cols = ["ts (UTC)", "src", "initiator", "v", "kind", "key", "model", "status", "http",
-            "in", "out", "ms", "tier"]
+    cols = ["ts (UTC)", "job", "step", "src", "initiator", "v", "kind", "key",
+            "model", "status", "http", "in", "out", "ms", "tier"]
     if wide:
-        cols += ["rid", "signal", "quota_id", "comment"]
+        cols += ["rid", "trace", "hop", "req.model", "signal", "quota_id", "comment"]
     for col in cols:
         t.add_column(col, overflow="fold")
     for r in reversed(rows):
         style = {"ok": "green", "quota": "red", "http5xx": "yellow",
                  "network": "yellow", "blocked": "magenta"}.get(r["status"], "dim")
-        row = [r["ts_iso"][:19], r["source"], r.get("initiator") or "-",
+        row = [r["ts_iso"][:19], (r.get("job") or "-")[:22], r.get("step") or "-",
+               r["source"], r.get("initiator") or "-",
                r.get("version") or "-", r["kind"], r["key_id"], r["model"],
                f"[{style}]{r['status']}[/{style}]", str(r["http_status"] or ""),
                str(r["tokens_in"] or ""), str(r["tokens_out"] or ""),
                str(r["latency_ms"] or ""), str(r["overflow_tier"])]
         if wide:
-            row += [r.get("request_id") or "-", r.get("signal_kind") or "-",
-                    (r.get("quota_id") or "-")[:28], (r.get("comment") or "-")[:60]]
+            row += [r.get("request_id") or "-", (r.get("trace_id") or "-")[:20],
+                    str(r.get("hop") or 0), r.get("requested_model") or "-",
+                    r.get("signal_kind") or "-", (r.get("quota_id") or "-")[:28],
+                    (r.get("comment") or "-")[:60]]
         t.add_row(*row)
     console.print(t)
     return 0
@@ -137,13 +148,19 @@ def cmd_note(args, cfg: Config | None = None) -> int:
     cfg = cfg if cfg is not None else _load_cfg(args)
     led = Ledger(cfg.state_path)
     initiator = getattr(args, "initiator", "cli") or "cli"
+    job = getattr(args, "job", None)
+    trace = getattr(args, "trace", None)
+    step = getattr(args, "step", None)
     note_id = led.add_note(args.comment, initiator=initiator,
-                           version=__version__, source="cli")
-    line = audit_line("note", v=__version__, initiator=initiator,
-                      note_id=note_id, comment=args.comment)
-    print(line)
+                           version=__version__, source="cli", job=job,
+                           trace_id=trace or job, step=step or None)
+    line = audit_line("note", v=__version__, initiator=initiator, job=job or "-",
+                      trace=trace or job or "-", step=step or "-", note_id=note_id,
+                      comment=args.comment)
+    _emit_audit(line, args)
     if getattr(args, "json", False):
-        print(json.dumps({"ok": True, "note_id": note_id, "version": __version__}))
+        print(json.dumps({"ok": True, "note_id": note_id,
+                          "version": __version__, "job": job}))
     else:
         console.print(f"[green]note #{note_id} recorded[/green] (no provider call, no quota)")
     return 0
@@ -151,16 +168,103 @@ def cmd_note(args, cfg: Config | None = None) -> int:
 
 def cmd_notes(args, cfg: Config | None = None) -> int:
     cfg = cfg if cfg is not None else _load_cfg(args)
-    rows = Ledger(cfg.state_path).notes_tail(args.n)
+    rows = Ledger(cfg.state_path).notes_tail(
+        args.n, job=getattr(args, "job", None))
     if args.json:
         print(json.dumps(rows, indent=1, default=str))
         return 0
     t = Table(title=f"Last {len(rows)} notes · gemini-router {__version__}", expand=True)
-    for col in ("ts (UTC)", "v", "initiator", "comment"):
+    for col in ("ts (UTC)", "event", "job", "step", "v", "initiator", "comment"):
         t.add_column(col, overflow="fold")
     for r in reversed(rows):
-        t.add_row(r["ts_iso"][:19], r["version"] or "-", r["initiator"] or "-", r["comment"])
+        t.add_row(r["ts_iso"][:19], r.get("event") or "note",
+                  (r.get("job") or "-")[:22], r.get("step") or "-",
+                  r["version"] or "-", r["initiator"] or "-", r["comment"])
     console.print(t)
+    return 0
+
+
+def cmd_jobs(args, cfg: Config | None = None) -> int:
+    """List target activities with their counters."""
+    cfg = cfg if cfg is not None else _load_cfg(args)
+    rows = Ledger(cfg.state_path).jobs_tail(getattr(args, "n", 20))
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=1, default=str))
+        return 0
+    t = Table(title=f"Last {len(rows)} jobs · gemini-router {__version__}", expand=True)
+    for col in ("started (UTC)", "job", "initiator", "status", "calls", "ok", "refusals",
+                "429", "models"):
+        t.add_column(col, overflow="fold")
+    for r in reversed(rows):
+        t.add_row(iso(r["first_ts"])[:19], r["job"], r.get("initiator") or "-",
+                  r["status"], str(r["calls"]), str(r["ok"]), str(r["refusals"]),
+                  str(r.get("quota_429") or 0), ", ".join(r["models"])[:40])
+    console.print(t)
+    return 0
+
+
+def cmd_job(args, cfg: Config | None = None) -> int:
+    """Show one activity: summary, lifecycle events and every call."""
+    cfg = cfg if cfg is not None else _load_cfg(args)
+    led = Ledger(cfg.state_path)
+    summary = led.job_summary(args.job)
+    if not summary:
+        console.print(f"[red]job {args.job!r} not found[/red]")
+        return 1
+    calls = led.job_calls(args.job, getattr(args, "n", 200))
+    events = led.notes_tail(getattr(args, "n", 200), job=args.job)
+    if getattr(args, "json", False):
+        print(json.dumps({"version": __version__, "summary": summary,
+                          "events": events, "calls": calls}, indent=1, default=str))
+        return 0
+    console.print(f"[bold cyan]job {args.job}[/bold cyan] · v{__version__} · "
+                  f"{summary['status']} · {summary['calls']} calls · "
+                  f"{summary['ok']} ok · {summary['refusals']} refusals · "
+                  f"{summary.get('quota_429', 0)} 429")
+    console.print(f"models: {', '.join(summary['models'])} · keys: "
+                  f"{', '.join(summary['keys'])} · steps: "
+                  f"{', '.join(summary['steps']) or '-'} · traces: "
+                  f"{', '.join(summary['traces'])[:60] or '-'}")
+    t = Table(title=f"job {args.job} — timeline", expand=True)
+    for col in ("ts (UTC)", "event", "status/http", "step", "model", "key", "hop", "rid"):
+        t.add_column(col, overflow="fold")
+    timeline = [("event", e["ts_iso"], e) for e in events] + \
+               [("call", c["ts_iso"], c) for c in calls]
+    for kind, _, rec in sorted(timeline, key=lambda x: x[1], reverse=True):
+        if kind == "event":
+            t.add_row(rec["ts_iso"][:19], rec.get("event") or "note", "-", "-", "-",
+                      "-", "-", rec.get("comment") or "-")
+        else:
+            t.add_row(rec["ts_iso"][:19], f"[{rec['status']}]", str(rec["http_status"] or ""),
+                      rec.get("step") or "-", rec["model"], rec["key_id"],
+                      str(rec.get("hop") or 0), rec.get("request_id") or "-")
+    console.print(t)
+    return 0
+
+
+def cmd_job_action(args, cfg: Config | None = None) -> int:
+    """Start or finish an activity (local bookkeeping, no provider call)."""
+    cfg = cfg if cfg is not None else _load_cfg(args)
+    led = Ledger(cfg.state_path)
+    action = "start" if args.cmd == "job-start" else "finish"
+    if action == "start":
+        out = led.job_start(args.job, initiator=getattr(args, "initiator", "") or "",
+                            version=__version__, comment=getattr(args, "comment", "") or "",
+                            trace_id=getattr(args, "trace", None),
+                            step=getattr(args, "step", None))
+    else:
+        out = led.job_finish(args.job, status=getattr(args, "status", "done"),
+                             initiator=getattr(args, "initiator", "") or "",
+                             version=__version__, comment=getattr(args, "comment", "") or "",
+                             step=getattr(args, "step", None))
+    status = out["status"] if action == "start" else getattr(args, "status", "done")
+    _emit_audit(audit_line("job", v=__version__, action=action, job=args.job,
+                           status=status, comment=getattr(args, "comment", "") or "-"), args)
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": True, "job": args.job, "action": action,
+                          "summary": out}, default=str))
+    else:
+        console.print(f"[green]{action}[/green] · job {args.job} · {out['calls']} calls")
     return 0
 
 
@@ -280,7 +384,8 @@ def _proxy_cfg(args) -> dict:
 
 _COMMANDS = {"quota": cmd_quota, "models": cmd_models, "calls": cmd_calls,
              "prune": cmd_prune, "doctor": cmd_doctor, "proxy": cmd_proxy,
-             "note": cmd_note, "notes": cmd_notes}
+             "note": cmd_note, "notes": cmd_notes, "jobs": cmd_jobs,
+             "job": cmd_job, "job-start": cmd_job_action, "job-finish": cmd_job_action}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -298,7 +403,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("calls", help="audit log tail")
     p.add_argument("-n", type=int, default=50)
-    for flag in ("--model", "--status", "--source", "--request-id", "--initiator"):
+    for flag in ("--model", "--status", "--source", "--request-id", "--initiator",
+                 "--job", "--trace", "--step"):
         p.add_argument(flag)
     p.add_argument("--json", action="store_true")
     p.add_argument("--wide", action="store_true",
@@ -306,10 +412,30 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("note", help="record a free-form comment (no provider call)")
     p.add_argument("comment", help='e.g. "начинаем тестирование новой версии"')
     p.add_argument("--initiator", default="cli", help='who wrote it, e.g. "ops"')
+    p.add_argument("--job", help="attach this note to a job/trace")
+    p.add_argument("--trace")
+    p.add_argument("--step")
     p.add_argument("--json", action="store_true")
-    p = sub.add_parser("notes", help="show recent annotations")
+    p = sub.add_parser("notes", help="show recent annotations and job events")
+    p.add_argument("-n", type=int, default=20)
+    p.add_argument("--job")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("jobs", help="list target activities (jobs) with counters")
     p.add_argument("-n", type=int, default=20)
     p.add_argument("--json", action="store_true")
+    p = sub.add_parser("job", help="show one job: summary, events, all calls")
+    p.add_argument("job")
+    p.add_argument("-n", type=int, default=200)
+    p.add_argument("--json", action="store_true")
+    for name in ("job-start", "job-finish"):
+        p = sub.add_parser(name, help=f"{name.split('-')[1]} a target activity")
+        p.add_argument("job")
+        p.add_argument("--initiator", default="")
+        p.add_argument("--comment", default="")
+        p.add_argument("--trace")
+        p.add_argument("--step")
+        p.add_argument("--status", default="done")
+        p.add_argument("--json", action="store_true")
     p = sub.add_parser("prune", help="apply retention (audit days, cache TTL)")
     p.add_argument("--audit-days", type=float, default=30)
     p.add_argument("--dry", action="store_true")

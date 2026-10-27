@@ -1,24 +1,19 @@
 """Key transports — one pool, every key generation.
 
-Google hands out two shapes of Gemini API key today: the classic `AIzaSy…` (Standard,
-Cloud Console) and the newer `AQ.…` (Auth, AI Studio). Both have authenticated over the
-standard `x-goog-api-key` header on the paths this library uses — the `AQ.…` form proved
-it with a live listModels probe on 2026-10-11, before the leak incident of the same day
-revoked both keys of that pool. But Google has changed which surface accepts which key
-generation more than once, and an operator watching a key pool should not have to know or
-care: the client carries an ordered list of transports, starts with the one that last
-worked for a given key, rotates on an auth-shaped refusal, and remembers the winner.
-Shape is a guess; the provider's answer is a measurement.
+Google issues two shapes of Gemini API key: the classic `AIzaSy…` (Standard, Cloud
+Console) and `AQ.…` (Auth, AI Studio). Which transport a surface accepts depends on the
+key generation and endpoint, so the client carries an ordered list of transports, starts
+with the one that last worked for a given key, rotates on an auth-shaped refusal, and
+remembers the winner. Shape is a guess; the provider's answer is a measurement.
 
 Transports (same host, same endpoints):
 
-    header   ``x-goog-api-key: <key>``        the default — what every call used before
+    header   ``x-goog-api-key: <key>``        the default, common path
     query    ``?key=<key>``                   the documented REST alternative
     bearer   ``Authorization: Bearer <key>``  what some `AQ.…`-only surfaces expect
 
 A key the provider blocked as leaked is never rotated: no transport resurrects a revoked
-credential, and that 403 deserves to reach the operator as itself — on 2026-10-11 it hid
-behind a generic upload failure for hours.
+credential, and the 403 reaches the operator as itself.
 
 One caveat on the query transport: it puts the key in the URL, where httpx's DEBUG log
 prints it. It exists for keys whose surface demands it; while such a key is in the pool,

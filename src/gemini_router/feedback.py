@@ -1,25 +1,23 @@
 """Provider truth: turn an upstream answer into a durable quota decision.
 
-The ledger's counters are a *prediction*. Google is the authority. When it answers 429
-or 503, that answer must immediately change what the router believes about the exact
-``(key, model)`` pair — otherwise the same exhausted pair is selected again and again
-inside a single request (this is how 48 refusals happened in ten seconds on 2026-10-21).
+The ledger's counters are a *prediction*. Google is the authority. A 429 or 503
+immediately changes what the router believes about the exact ``(key, model)`` pair, for
+the current walk and for every later request until the provider's reset time.
 
 This module owns the whole round trip:
 
     status + headers + body  ->  ProviderSignal  ->  ledger.pair_state
-                                                 ->  cooldowns (mirror for old readers)
+                                                 ->  cooldowns (compact mirror)
                                                  ->  one structured audit line
 
 There are two important asymmetries:
 
 * A **confirmed daily** quota answer (``...PerDay...`` in ``quotaId``) blocks the pair
-  until the next Pacific-time reset. No ``min(..., now + 65)`` — that cap was the bug
-  that made a day-long exhaustion expire in a minute.
+  until the next Pacific-time reset. ``Retry-After`` is recorded and never caps that
+  reset.
 * An **unconfirmed** 429 (no quota details in the body — what the free tier actually
   sends during a capacity blip) only benches the pair for the provider's Retry-After.
-  Repeated unconfirmed answers inside a short window are *promoted* to a day block:
-  the router learns the truth from reality instead of guessing it once.
+  Repeated unconfirmed answers inside a short window are *promoted* to a day block.
 
 503 is overload, not a budget verdict: short bench, never counted as RPD spend.
 """
@@ -232,14 +230,13 @@ class QuotaTruth:
                "retry_after_s": signal.retry_after_s, "quota_id": signal.quota_id,
                "quota_metric": signal.quota_metric, "quota_value": signal.quota_value,
                "reason": reason, "hits": hits, "first_ts": first_ts, "updated_ts": now,
-               "initiator": ctx.initiator, "version": ctx.version, "detail": signal.detail}
+               "initiator": ctx.initiator, "version": ctx.version,
+               "job": ctx.job, "trace_id": ctx.trace_id, "detail": signal.detail}
         self.ledger.set_pair_state(row)
-        # Old library builds (gemini-mcp, an older CLI) only read `cooldowns`. Mirror
-        # the decision so a mixed fleet still agrees on which pairs are out.
+        # Readers that consume the compact `cooldowns` view get the same decision.
         self.ledger.set_cooldown(key_id, model, until, reason)
         log.info(audit_line(
-            "provider_feedback", v=ctx.version, rid=ctx.request_id,
-            initiator=ctx.initiator or "-", comment=ctx.comment or "-",
+            "provider_feedback", **ctx.log_fields(),
             key=key_id, model=model, http=signal.status, kind=kind, reason=reason,
             hits=hits, promoted=int(promoted),
             until=datetime.fromtimestamp(until, UTC).isoformat(timespec="seconds"),

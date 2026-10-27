@@ -80,8 +80,8 @@ class ProxyCfg(BaseModel):
     #   passthrough     never rewrite; account only
     model_policy: str = "strict"
     file_search_models: list[str] | None = None   # None = cfg.chain for rewriting
-    # Initiator used when the client sent no X-Router-Initiator header. Callers SHOULD
-    # identify themselves; this is only a fallback for legacy SDKs.
+    # Initiator used when the client sent no X-Router-Initiator header. Callers
+    # identify themselves; SDKs that cannot set headers get this fallback.
     default_initiator: str = "filesearch"
     # Respect minute-scale waits reported by the shared selection walk instead of
     # firing immediately at a pair that is known to be cooling down.
@@ -117,15 +117,13 @@ class Config(BaseModel):
     # Models that accept Files API parts in generateContent. None (default) = "learn":
     # a file job stays on the chain and a model that answers 400/500 to file input is
     # remembered as incapable for that media class. A flat list applies to every class;
-    # a dict narrows per class ({"pdf": [...], "image": [...]}). Historical measurements
-    # differ by key/date: 2026-10-11 Lite/PDF refused, 2026-10-12 new VPS and CI
-    # keys read the hidden PDF code on Lite. PDF-containing tiers now match text;
-    # this optional allowlist and per-key learned refusals still limit incompatibility.
-    # Evidence: docs/worklog/archive/2026.10.11-capability-canary/.
+    # a dict narrows per class ({"pdf": [...], "image": [...]}). Capability varies by
+    # key and model, so learned 400/500 refusals narrow candidates per key; an optional
+    # allowlist narrows them globally. PDF-containing jobs use the text tiers.
     file_capable_models: list[str] | dict[str, list[str]] | None = None
     temperature: float | None = None           # applied to pre-3.x models only
     # Estimate divisor for the TPM pre-flight gate. None (default) = script-aware
-    # estimate; set a number to force the old single-divisor behaviour.
+    # estimate; set a number to use a single divisor for all scripts.
     chars_per_token: int | None = None
     proxy: ProxyCfg = Field(default_factory=ProxyCfg)
     # key_id of the project that owns File Search by default: where stores are created
@@ -221,8 +219,7 @@ def estimate_tokens(text: str, chars_per_token: int | None = None,
     through one divisor. Inputs longer than `sample_chars` are estimated from a
     head-and-tail sample scaled up, which keeps the cost flat.
 
-    Passing `chars_per_token` restores the old single-divisor behaviour for callers
-    that configured one.
+    Passing `chars_per_token` uses a single divisor for every script.
     """
     if chars_per_token:
         return max(1, len(text) // max(1, chars_per_token))

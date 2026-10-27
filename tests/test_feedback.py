@@ -34,7 +34,7 @@ def test_day_quota_is_a_hard_block_until_pt_reset(tmp_path):
     s = parse_provider_signal(429, {"Retry-After": "42"}, DAY_BODY, c, now=NOW)
     assert s.kind == "day" and s.reason == "rpd_429"
     assert s.quota_id and "PerDay" in s.quota_id
-    # The old implementation did min(midnight, now + retry + 5) => 47 seconds.
+    # Retry-After never caps a confirmed daily verdict.
     assert s.until_ts - NOW > 10 * 3600
 
 
@@ -85,7 +85,7 @@ def test_provider_state_overrides_fresh_counters(tmp_path):
     signal = parse_provider_signal(429, {}, DAY_BODY, c, now=NOW)
     kid = key_id("key-one")
     truth.apply(signal, key_id=kid, model=c.chain[0],
-                context=RequestContext(initiator="test", version="0.11.0"))
+                context=RequestContext(initiator="test", version="0.12.0"))
     after = gates_for(c, led, c.chain[0], "key-one", 0, NOW)
     assert after["rpd_left"] == 0
     assert after["provider_blocked"] == "day"
@@ -127,11 +127,11 @@ def test_notes_are_annotations_only(tmp_path):
     led = Ledger(c.state_path)
     before = len(led.calls_tail(50))
     nid = led.add_note("начинаем тестирование новой версии", initiator="ops-audit",
-                       version="0.11.0", source="cli")
+                       version="0.12.0", source="cli")
     assert nid and len(led.calls_tail(50)) == before
     row = led.notes_tail(1)[0]
     assert row["comment"] == "начинаем тестирование новой версии"
-    assert row["initiator"] == "ops-audit" and row["version"] == "0.11.0"
+    assert row["initiator"] == "ops-audit" and row["version"] == "0.12.0"
     led.close()
 
 
@@ -159,7 +159,7 @@ def test_v2_database_migrates_additively(tmp_path):
     led = Ledger(path)
     assert led.calls_tail(1)[0]["initiator"] == "mcp"   # backfilled from source
     assert led.provider_state("k", "m", time.time()) is None
-    led.add_note("ok", version="0.11.0")
+    led.add_note("ok", version="0.12.0")
     assert led.notes_tail(1)[0]["comment"] == "ok"
     led.close()
 

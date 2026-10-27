@@ -1,58 +1,76 @@
-"""Request identity and structured logging.
+"""Request identity, job/trace correlation and structured logging.
 
-Every hop through the router carries the same three facts, whether it came from the
-pass-through proxy, the Python library, a CLI command or a plain SQL row:
+Every record produced by the router carries the same identity:
 
-* **version** — which build produced the record (so a mixed fleet is diagnosable);
+* **version** — the build that produced it;
 * **initiator** — a free-form string supplied by whoever started the work
-  (``tldr-digest``, ``gemini-mcp``, ``ops-audit`` ...). This is deliberately *not* the
-  transport name: ``source`` stays the entry point (``filesearch``/``cli``/``mcp``) for
-  backwards compatibility;
+  (``tldr-digest``, ``gemini-mcp``, ``ops-audit`` ...); ``source`` remains the entry
+  point (``filesearch`` / ``cli`` / ``mcp``);
+* **job** — the ID of one *target activity*, e.g. ``digest-2026-10-28``. All requests,
+  hops, provider signals, cooldown decisions and notes belonging to that activity share
+  it. When a client sends no job, ``<initiator>@<UTC date>`` groups the day;
+* **trace** — one execution of the job. It comes from ``X-Router-Trace``, from a W3C
+  ``traceparent`` header, or equals the job. Retries of the same activity get a new
+  trace while staying inside the same job;
+* **request_id / span_id** — one logical request and the local span for it. ``hop``
+  counts upstream attempts inside the selection walk; ``step`` names the client's
+  stage (``prefilter``, ``analysis``, ``dedup``, ``subject``, ``gemini-search`` ...);
 * **comment** — arbitrary human text with **no behaviour attached**. It is stored and
-  logged, nothing more: no routing decision, no quota effect, no header sent upstream.
+  logged, never used for routing and never sent upstream.
 
-The log format is one-line ``key=value`` (logfmt). journald, sqlite and grep can all
-read it, and a quoted value keeps spaces/comments intact.
+Logs are single-line logfmt, so journald, sqlite and grep all read them.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from typing import Any
 from urllib.parse import unquote
 
-#: Header names consumed by the proxy. They never reach Google (see
-#: ``proxy.CLIENT_CONTEXT_HEADERS``) — they are metadata for the router only.
 INITIATOR_HEADERS = ("x-router-initiator", "x-router-source")
 COMMENT_HEADERS = ("x-router-comment", "x-router-note")
-REQUEST_ID_HEADER = "x-router-request-id"
+REQUEST_ID_HEADERS = ("x-router-request-id", "x-router-span")
+JOB_HEADERS = ("x-router-job", "x-router-job-id")
+TRACE_HEADERS = ("x-router-trace", "x-router-trace-id")
+STEP_HEADERS = ("x-router-step", "x-router-stage")
+PARENT_SPAN_HEADERS = ("x-router-parent-span",)
+
+#: Router-only metadata. Consumed locally; never forwarded to the provider.
+CLIENT_CONTEXT_HEADERS = frozenset({
+    "x-router-initiator", "x-router-source", "x-router-comment", "x-router-note",
+    "x-router-request-id", "x-router-span", "x-router-job", "x-router-job-id",
+    "x-router-trace", "x-router-trace-id", "x-router-step", "x-router-stage",
+    "x-router-parent-span", "traceparent", "tracestate", "baggage",
+})
 
 MAX_COMMENT_CHARS = 500
-MAX_INITIATOR_CHARS = 64
+MAX_ID_CHARS = 128
+_PCT = re.compile(r"%[0-9A-Fa-f]{2}")
+_TRACEPARENT = re.compile(
+    r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})(?:-.*)?$", re.I)
 
 
 def router_version() -> str:
-    """Single source of truth for the version string (pyproject.toml via metadata)."""
+    """The version string, sourced from pyproject.toml via installed metadata."""
     try:
         return _pkg_version("gemini-router")
     except PackageNotFoundError:          # unpackaged run from a source checkout
         return "0.0.0.dev0"
 
 
-_PCT = re.compile(r"%[0-9A-Fa-f]{2}")
-
-
 def _clean(value: str | None, limit: int) -> str:
     if not value:
         return ""
-    # HTTP headers are ASCII-only. A Cyrillic comment (or any non-ASCII text) can be
-    # sent percent-encoded; decode it here so the audit trail keeps the real text.
+    # HTTP headers are ASCII-only. Percent-encoded text (e.g. a Cyrillic comment) is
+    # decoded here so the audit trail keeps the original characters.
     if _PCT.search(value):
         value = unquote(value, encoding="utf-8", errors="replace")
     return "".join(c if c.isprintable() else " " for c in value).strip()[:limit]
@@ -66,38 +84,81 @@ def _first(headers: Mapping[str, str], names: tuple[str, ...]) -> str:
     return ""
 
 
+def parse_traceparent(value: str) -> tuple[str, str, str]:
+    """W3C Trace Context → ``(trace_id, parent_span_id, version)``."""
+    m = _TRACEPARENT.match((value or "").strip())
+    if not m or m.group(1).lower() == "ff":
+        return "", "", ""
+    return m.group(2).lower(), m.group(3).lower(), m.group(1).lower()
+
+
+def _hex_id(value: str, size: int) -> str:
+    """A W3C-compatible hex field: pass valid hex through, hash anything else."""
+    raw = (value or "").replace("-", "").lower()
+    if len(raw) >= size and all(c in "0123456789abcdef" for c in raw[:size]):
+        return raw[:size]
+    return hashlib.blake2b((value or "").encode(), digest_size=size // 2).hexdigest()
+
+
+def make_traceparent(trace_id: str, span_id: str, sampled: bool = True) -> str:
+    """Emit a W3C ``traceparent``; free-form IDs are hashed into valid hex fields."""
+    return f"00-{_hex_id(trace_id, 32)}-{_hex_id(span_id, 16)}-{'01' if sampled else '00'}"
+
+
 @dataclass(slots=True)
 class RequestContext:
-    """Identity of one logical request, threaded through every attempt of a walk."""
+    """Identity of one logical request, shared by every hop of its walk."""
 
     initiator: str = ""
     comment: str = ""
     request_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
-    source: str = "cli"                  # transport/entry point, kept for old readers
+    source: str = "cli"
     version: str = field(default_factory=router_version)
     started: float = field(default_factory=time.time)
+    job: str = ""
+    trace_id: str = ""
+    step: str = ""
+    span_id: str = field(default_factory=lambda: uuid.uuid4().hex[:16])
+    parent_span: str = ""
 
     @classmethod
     def from_headers(cls, headers: Mapping[str, str], *, default_initiator: str = "",
                      source: str = "filesearch") -> RequestContext:
         # BaseHTTPRequestHandler headers are case-insensitive; a plain dict in tests is
-        # not, so look up both spellings explicitly.
+        # not, so normalise explicitly.
         h = {str(k).lower(): str(v) for k, v in headers.items()}
+        initiator = _clean(_first(h, INITIATOR_HEADERS) or default_initiator, 64)
+        tp_trace, parent, _ = parse_traceparent(h.get("traceparent", ""))
+        job = _clean(_first(h, JOB_HEADERS), MAX_ID_CHARS)
+        if not job:
+            day = datetime.now(UTC).date().isoformat()
+            job = f"{initiator or 'anonymous'}@{day}"
+        trace = _clean(_first(h, TRACE_HEADERS), 64) or tp_trace or job
         return cls(
-            initiator=_clean(_first(h, INITIATOR_HEADERS) or default_initiator,
-                             MAX_INITIATOR_CHARS),
+            initiator=initiator,
             comment=_clean(_first(h, COMMENT_HEADERS), MAX_COMMENT_CHARS),
-            request_id=_clean(h.get(REQUEST_ID_HEADER, ""), 64) or uuid.uuid4().hex[:12],
-            source=source,
-        )
-
-    def child(self, **over: Any) -> RequestContext:
-        return RequestContext(**{**self.as_dict(), **over})
+            request_id=_clean(_first(h, REQUEST_ID_HEADERS), 64) or uuid.uuid4().hex[:12],
+            source=source, job=job, trace_id=trace,
+            step=_clean(_first(h, STEP_HEADERS), 64),
+            parent_span=_clean(_first(h, PARENT_SPAN_HEADERS), 64) or parent)
 
     def as_dict(self) -> dict:
         return {"initiator": self.initiator, "comment": self.comment,
                 "request_id": self.request_id, "source": self.source,
-                "version": self.version, "started": self.started}
+                "version": self.version, "started": self.started,
+                "job": self.job, "trace_id": self.trace_id, "step": self.step,
+                "span_id": self.span_id, "parent_span": self.parent_span}
+
+    @property
+    def traceparent(self) -> str:
+        return make_traceparent(self.trace_id, self.span_id)
+
+    def log_fields(self) -> dict:
+        """Identity fields shared by every structured log line."""
+        return {"v": self.version, "rid": self.request_id, "job": self.job,
+                "trace": self.trace_id, "span": self.span_id,
+                "initiator": self.initiator or "-", "step": self.step or "-",
+                "comment": self.comment or "-"}
 
 
 def audit_line(event: str, **fields: Any) -> str:

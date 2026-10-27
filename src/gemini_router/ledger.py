@@ -1,21 +1,30 @@
-"""Persistent multi-process quota ledger (SPEC §3, docs/03 §3).
+"""Persistent multi-process quota ledger.
 
-Single source of truth: budgets are SQL queries over `calls`, never in-memory counters
-(D1). WAL + busy_timeout make daemon, stdio sessions and cron jobs share one file (D5).
-Accounting rules (D3, FR-C2/C7):
-- RPD (PT-day + rolling-24h dual gate) counts kind != 'count' with status in RPD_STATUSES,
-  plus 'planned' rows younger than planned_ttl_s: an in-flight request is spend, so
-  callers sharing this file cannot all pass the same check and overshoot the day.
-- RPM/TPM sliding windows count WINDOW_STATUSES; 'planned' rows expire after planned_ttl_s.
-- Provider calls that never draw on model quotas are named once in NON_SPENDING_KINDS and
-  excluded from every gate: countTokens ('count') and Files API uploads ('upload').
-- TPM pre-flight writes a 'planned' row (upgraded in place after the call) to close the
-  countTokens→send race between processes (D2).
-- A 5xx from the provider is *not* RPD spend: an overloaded model refused the request,
-  it did not consume a daily slot. Counting those as spend is what used to make a
-  503 storm look like an exhausted day (SPEC §12.2).
-- `pair_state` is the provider's own verdict for a (key, model) pair. It outranks any
-  counter in `calls`: a live 429 blocks the pair even when our counters say "fresh".
+One SQLite WAL database is shared by every process on the machine. It holds:
+
+* ``calls`` — one row per upstream attempt, with the full request identity
+  (version, initiator, job, trace, request, hop, step) and the provider's answer;
+* ``pair_state`` — the provider's own verdict for a ``(key, model)`` pair. It outranks
+  any counter in ``calls``: a live 429 blocks the pair even when the counters say fresh;
+* ``cooldowns`` — the compact mirror of ``pair_state`` consumed by services that read
+  only that table;
+* ``jobs`` / ``notes`` — the activity timeline: one row per target activity, its
+  counters, and free-form annotations or lifecycle events attached to it;
+* ``cache``, ``fs_affinity``, ``meta`` — response cache, per-project File Search
+  ownership and schema metadata.
+
+Accounting rules:
+
+* RPD (PT-day + rolling 24 h dual gate) counts spending kinds with status in
+  ``RPD_STATUSES`` plus fresh ``planned`` rows, so concurrent callers cannot all pass
+  the same check and overshoot the day.
+* RPM/TPM sliding windows count ``WINDOW_STATUSES``; ``planned`` rows expire after
+  ``planned_ttl_s``.
+* Provider calls that never draw on model quotas are listed in ``NON_SPENDING_KINDS``.
+* A 5xx is not RPD spend: an overloaded model refused the request and consumed no
+  daily slot. A 429 counts conservatively — that pair is at its limit.
+* Every row is attributable to a job and a trace. ``job`` is the target activity
+  (for example one digest build); ``trace`` is a single execution of it.
 """
 from __future__ import annotations
 
@@ -28,22 +37,14 @@ from datetime import time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-# Only answers that actually drew on a daily slot count. `http5xx` is deliberately
-# absent: a 503 overload is capacity, not budget (and 429 stays — conservative, a pair
-# that answered 429 is by definition at its limit).
 RPD_STATUSES = ("ok", "quota", "blocked")
 WINDOW_STATUSES = RPD_STATUSES + ("planned",)
-# 'drift' is a tariff-forecast miss note, not a provider call at all — same exclusion.
-# 'filesearch' is the pass-through's bookkeeping row for a File Search management call
-# (create/list/delete a store, document or operation). It draws on no model quota, so it
-# belongs here with the other excluded kinds — but it is recorded, so `router_logs` and
-# `calls` show what the MCP did.
 NON_SPENDING_KINDS = ("count", "upload", "drift", "filesearch")
 SPENDS = "kind NOT IN ({})".format(",".join(f"'{k}'" for k in NON_SPENDING_KINDS))
-# An upload belongs to a key, not a model, but the column is NOT NULL and feeds per-model
-# filters. A sentinel no model id can equal.
+# An upload belongs to a key, not a model; the column is NOT NULL and feeds per-model
+# filters, so it gets a sentinel no real model can equal.
 FILE_ROW_MODEL = "(file)"
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls(
@@ -54,45 +55,54 @@ CREATE TABLE IF NOT EXISTS calls(
   http_status INTEGER, tokens_in INTEGER, tokens_out INTEGER,
   quota_error TEXT, retry_after_s REAL, latency_ms INTEGER,
   overflow_tier INTEGER NOT NULL DEFAULT 0, bytes INTEGER,
-  -- v3: who/which build produced this row, and what the provider told us.
-  version TEXT, initiator TEXT, comment TEXT, quota_id TEXT, signal_kind TEXT);
+  version TEXT, initiator TEXT, comment TEXT, quota_id TEXT, signal_kind TEXT,
+  job TEXT, trace_id TEXT, step TEXT, hop INTEGER DEFAULT 0,
+  requested_model TEXT, request_bytes INTEGER, response_bytes INTEGER,
+  method TEXT, path TEXT, parent_span TEXT, provider_reason TEXT);
 CREATE INDEX IF NOT EXISTS idx_calls_model_ts ON calls(model, ts);
 CREATE INDEX IF NOT EXISTS idx_calls_key_model_ts ON calls(key_id, model, ts);
 CREATE INDEX IF NOT EXISTS idx_calls_req ON calls(request_id);
--- idx_calls_initiator is created in _migrate(): on a v1/v2 database the column does
--- not exist yet when this script runs.
 CREATE TABLE IF NOT EXISTS cooldowns(
   key_id TEXT NOT NULL, model TEXT NOT NULL, until_ts REAL NOT NULL, reason TEXT,
   PRIMARY KEY(key_id, model));
--- Provider truth (SPEC §12). One row per pair, upserted on every 429/503. `kind`:
---   day      — confirmed daily quota, hard skip until PT reset
---   minute   — Retry-After bench (may be promoted to `day` after repeated hits)
---   overload — short 503 bench
+-- Provider truth: one row per pair, upserted on every 429/503. `kind` is day
+-- (hard skip until PT reset), minute (Retry-After bench, promotable to day) or
+-- overload (short 503 bench).
 CREATE TABLE IF NOT EXISTS pair_state(
   key_id TEXT NOT NULL, model TEXT NOT NULL,
   kind TEXT NOT NULL, until_ts REAL NOT NULL, retry_after_s REAL,
   quota_id TEXT, quota_metric TEXT, quota_value TEXT,
   reason TEXT, hits INTEGER NOT NULL DEFAULT 1,
   first_ts REAL NOT NULL, updated_ts REAL NOT NULL,
-  initiator TEXT, version TEXT, detail TEXT,
+  initiator TEXT, version TEXT, detail TEXT, job TEXT, trace_id TEXT,
   PRIMARY KEY(key_id, model));
 CREATE INDEX IF NOT EXISTS idx_pair_state_until ON pair_state(until_ts);
--- Arbitrary operator annotations: stored and logged, no behavioural effect.
+-- Activity timeline. `event` is note | job_start | job_finish.
 CREATE TABLE IF NOT EXISTS notes(
   id INTEGER PRIMARY KEY,
   ts REAL NOT NULL, ts_iso TEXT NOT NULL,
-  version TEXT, initiator TEXT, comment TEXT NOT NULL, source TEXT);
+  version TEXT, initiator TEXT, comment TEXT NOT NULL, source TEXT,
+  job TEXT, trace_id TEXT, step TEXT, event TEXT NOT NULL DEFAULT 'note');
 CREATE INDEX IF NOT EXISTS idx_notes_ts ON notes(ts);
+-- One row per target activity, with rolling counters kept in sync on every call.
+CREATE TABLE IF NOT EXISTS jobs(
+  job TEXT PRIMARY KEY,
+  first_ts REAL NOT NULL, last_ts REAL NOT NULL, finished_ts REAL,
+  initiator TEXT, trace_id TEXT, version TEXT, comment TEXT,
+  status TEXT NOT NULL DEFAULT 'running',
+  calls INTEGER NOT NULL DEFAULT 0, ok INTEGER NOT NULL DEFAULT 0,
+  refusals INTEGER NOT NULL DEFAULT 0, quota_429 INTEGER NOT NULL DEFAULT 0,
+  models TEXT NOT NULL DEFAULT '[]', keys TEXT NOT NULL DEFAULT '[]');
+CREATE INDEX IF NOT EXISTS idx_jobs_last ON jobs(last_ts);
 CREATE TABLE IF NOT EXISTS cache(
   hash TEXT PRIMARY KEY, request_id TEXT, model TEXT NOT NULL, ts REAL NOT NULL,
   response TEXT NOT NULL, tokens_in INTEGER, tokens_out INTEGER);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
--- File Search affinity (proxy): a File Search store / Files API object lives in the
--- Google project of the key that created it, so the proxy must send every later request
--- for it under the SAME key. This is the only place that mapping can live: every process
--- sharing this file must agree on it (see SPEC §3).
+-- A File Search store / Files API object lives in the Google project of the key that
+-- created it, so every later request must go under the SAME key. Shared storage is
+-- the only place all processes can agree on that mapping.
 CREATE TABLE IF NOT EXISTS fs_affinity(
-  resource TEXT PRIMARY KEY,   -- 'fileSearchStores/<id>' | 'files/<id>'
+  resource TEXT PRIMARY KEY,
   key_id   TEXT NOT NULL,
   ts       REAL NOT NULL);
 """
@@ -126,22 +136,36 @@ class Ledger:
                 "INSERT OR REPLACE INTO meta(k,v) VALUES('schema_version',?)", (SCHEMA_VERSION,))
 
     def _migrate(self) -> None:
-        """Additive only: a shared database is opened by older code too (tldr-digest),
-        so an extra nullable column must never break the reader."""
-        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(calls)")}
-        for col, typ in (("bytes", "INTEGER"), ("version", "TEXT"),
-                         ("initiator", "TEXT"), ("comment", "TEXT"),
-                         ("quota_id", "TEXT"), ("signal_kind", "TEXT")):
-            if col not in cols:
-                self._conn.execute(f"ALTER TABLE calls ADD COLUMN {col} {typ}")
-        # A v2 database already has cooldown rows from the old library. They remain
-        # readable by old code; new gates read them too (cooldown()), while pair_state
-        # carries the richer verdict. Backfill historical initiator from source so
-        # old rows stay attributable.
+        """Additive only: every column is nullable, so any reader sharing this file
+        keeps working. Existing rows are backfilled with derivable identity."""
+        def add_columns(table: str, spec: tuple[tuple[str, str], ...]) -> None:
+            cols = {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+            for col, typ in spec:
+                if col not in cols:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+
+        add_columns("calls", (
+            ("bytes", "INTEGER"), ("version", "TEXT"), ("initiator", "TEXT"),
+            ("comment", "TEXT"), ("quota_id", "TEXT"), ("signal_kind", "TEXT"),
+            ("job", "TEXT"), ("trace_id", "TEXT"), ("step", "TEXT"),
+            ("hop", "INTEGER DEFAULT 0"), ("requested_model", "TEXT"),
+            ("request_bytes", "INTEGER"), ("response_bytes", "INTEGER"),
+            ("method", "TEXT"), ("path", "TEXT"), ("parent_span", "TEXT"),
+            ("provider_reason", "TEXT")))
+        add_columns("notes", (("job", "TEXT"), ("trace_id", "TEXT"),
+                              ("step", "TEXT"), ("event", "TEXT DEFAULT 'note'")))
+        add_columns("pair_state", (("job", "TEXT"), ("trace_id", "TEXT")))
         self._conn.execute("UPDATE calls SET initiator=source "
                            "WHERE initiator IS NULL AND source IS NOT NULL")
-        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_calls_initiator "
-                           "ON calls(initiator, ts)")
+        self._conn.execute("UPDATE calls SET job=(initiator || '@' || substr(ts_iso,1,10)) "
+                           "WHERE job IS NULL")
+        self._conn.execute("UPDATE calls SET trace_id=job WHERE trace_id IS NULL")
+        self._conn.execute("UPDATE notes SET event='note' WHERE event IS NULL")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_calls_initiator ON calls(initiator, ts)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_calls_job ON calls(job, ts)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_calls_trace ON calls(trace_id, ts)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_calls_step ON calls(step, ts)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_job ON notes(job, ts)")
 
     def close(self) -> None:
         with self._lock:
@@ -151,36 +175,58 @@ class Ledger:
     def plan(self, *, key_id: str, model: str, kind: str, est_tokens: int,
              request_id: str | None, source: str, overflow_tier: int = 0,
              now: float | None = None, initiator: str | None = None,
-             comment: str | None = None, version: str | None = None) -> int:
+             comment: str | None = None, version: str | None = None,
+             job: str | None = None, trace_id: str | None = None,
+             step: str | None = None, hop: int = 0,
+             requested_model: str | None = None, request_bytes: int | None = None,
+             method: str | None = None, path: str | None = None,
+             parent_span: str | None = None) -> int:
+        """Open one upstream attempt. Its identity is the same object the log line
+        uses, so a row can always be joined back to its job and trace."""
         now = now or time.time()
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "INSERT INTO calls(ts,ts_iso,request_id,source,kind,key_id,model,status,"
-                "tokens_in,overflow_tier,version,initiator,comment) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "tokens_in,overflow_tier,version,initiator,comment,job,trace_id,step,hop,"
+                "requested_model,request_bytes,method,path,parent_span) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (now, iso(now), request_id, source, kind, key_id, model, "planned",
-                 est_tokens, overflow_tier, version, initiator or source, comment or None))
-            return int(cur.lastrowid)
+                 est_tokens, overflow_tier, version, initiator or source, comment or None,
+                 job, trace_id or job, step, hop, requested_model, request_bytes,
+                 method, path, parent_span))
+            row_id = int(cur.lastrowid)
+            self._job_touch(job, initiator=initiator, version=version,
+                            trace_id=trace_id or job, comment=comment,
+                            model=model, key=key_id, now=now)
+            return row_id
 
     def resolve(self, row_id: int, status: str, *, http_status: int | None = None,
                 tokens_in: int | None = None, tokens_out: int | None = None,
                 latency_ms: int | None = None, quota_error: str | None = None,
                 retry_after_s: float | None = None, quota_id: str | None = None,
-                signal_kind: str | None = None) -> None:
+                signal_kind: str | None = None, response_bytes: int | None = None,
+                provider_reason: str | None = None) -> None:
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE calls SET status=?, http_status=COALESCE(?,http_status), "
                 "tokens_in=COALESCE(?,tokens_in), tokens_out=?, latency_ms=?, quota_error=?, "
                 "retry_after_s=?, quota_id=COALESCE(?,quota_id), "
-                "signal_kind=COALESCE(?,signal_kind) WHERE id=?",
+                "signal_kind=COALESCE(?,signal_kind), response_bytes=?, "
+                "provider_reason=COALESCE(?,provider_reason) WHERE id=?",
                 (status, http_status, tokens_in, tokens_out, latency_ms,
                  quota_error and quota_error[:500], retry_after_s, quota_id,
-                 signal_kind, row_id))
+                 signal_kind, response_bytes, provider_reason, row_id))
+            row = self._conn.execute(
+                "SELECT job, status FROM calls WHERE id=?", (row_id,)).fetchone()
+            if row and row["job"] and status != "planned":
+                self._job_count(row["job"], status, http_status)
 
     def record_upload(self, *, key_id: str, nbytes: int, source: str = "cli",
                       request_id: str | None = None, latency_ms: int | None = None,
                       now: float | None = None, initiator: str | None = None,
-                      comment: str | None = None, version: str | None = None) -> int:
+                      comment: str | None = None, version: str | None = None,
+                      job: str | None = None, trace_id: str | None = None,
+                      step: str | None = None) -> int:
         """One Files API upload, recorded but never counted against model quotas: the row
         is kind='upload' with the byte count in `bytes`, and every gate skips it. It is
         the local audit trail — the provider forgets the file within 48 hours."""
@@ -188,10 +234,11 @@ class Ledger:
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "INSERT INTO calls(ts,ts_iso,request_id,source,kind,key_id,model,status,"
-                "http_status,latency_ms,bytes,version,initiator,comment) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "http_status,latency_ms,bytes,version,initiator,comment,job,trace_id,step) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (now, iso(now), request_id, source, "upload", key_id, FILE_ROW_MODEL,
-                 "ok", 200, latency_ms, nbytes, version, initiator or source, comment))
+                 "ok", 200, latency_ms, nbytes, version, initiator or source, comment,
+                 job, trace_id or job, step))
             return int(cur.lastrowid)
 
     def record_drift(self, *, key_id: str, model: str, media_cls: str, level: str,
@@ -293,7 +340,7 @@ class Ledger:
                     pair_state[key] = {
                         "key_id": r["key_id"], "model": r["model"], "kind": "day",
                         "until_ts": r["until_ts"], "reason": r["reason"],
-                        "hits": 1, "initiator": "legacy", "version": "legacy"}
+                        "hits": 1, "initiator": "cooldowns", "version": "-"}
         return {"spent": spent, "window": window, "cooldown": cooldowns,
                 "pair_state": pair_state}
 
@@ -306,11 +353,13 @@ class Ledger:
 
     def calls_tail(self, n: int = 50, *, model: str | None = None, status: str | None = None,
                    source: str | None = None, request_id: str | None = None,
-                   initiator: str | None = None) -> list[dict]:
+                   initiator: str | None = None, job: str | None = None,
+                   trace_id: str | None = None, step: str | None = None) -> list[dict]:
         q = "SELECT * FROM calls WHERE 1=1"
         args: list = []
         for col, val in (("model", model), ("status", status), ("source", source),
-                         ("request_id", request_id), ("initiator", initiator)):
+                         ("request_id", request_id), ("initiator", initiator),
+                         ("job", job), ("trace_id", trace_id), ("step", step)):
             if val:
                 q += f" AND {col}=?"
                 args.append(val)
@@ -319,14 +368,13 @@ class Ledger:
         with self._lock:
             return [dict(r) for r in self._conn.execute(q, args)]
 
-    # ------------------------------------------------------- provider truth (v3)
+    # ------------------------------------------------------------- provider truth
     def provider_state(self, key_id: str, model: str,
                        now: float | None = None) -> dict | None:
         """Live provider verdict for one pair, or None. Pure read (hot path).
 
-        An older library build (gemini-mcp v0.1.1 is still on that API) writes only a
-        `cooldowns` row with reason `rpd_429`. Read it as an equivalent day verdict so
-        a mixed fleet shares the same truth instead of each process re-learning it.
+        Some consumers write only the compact `cooldowns` view. A `rpd_429` row there
+        is the same day verdict, so it is read back as provider truth.
         """
         now = now or time.time()
         with self._lock:
@@ -342,23 +390,25 @@ class Ledger:
             return None
         return {"key_id": key_id, "model": model, "kind": "day",
                 "until_ts": legacy["until_ts"], "reason": legacy["reason"],
-                "hits": 1, "initiator": "legacy", "version": "legacy"}
+                "hits": 1, "initiator": "cooldowns", "version": "-"}
 
     def set_pair_state(self, row: dict) -> None:
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO pair_state(key_id,model,kind,until_ts,retry_after_s,quota_id,"
                 "quota_metric,quota_value,reason,hits,first_ts,updated_ts,initiator,"
-                "version,detail) "
+                "version,detail,job,trace_id) "
                 "VALUES(:key_id,:model,:kind,:until_ts,:retry_after_s,:quota_id,:quota_metric,"
-                ":quota_value,:reason,:hits,:first_ts,:updated_ts,:initiator,:version,:detail) "
+                ":quota_value,:reason,:hits,:first_ts,:updated_ts,:initiator,:version,:detail,"
+                ":job,:trace_id) "
                 "ON CONFLICT(key_id,model) DO UPDATE SET "
                 "kind=excluded.kind, until_ts=excluded.until_ts, "
                 "retry_after_s=excluded.retry_after_s, quota_id=excluded.quota_id, "
                 "quota_metric=excluded.quota_metric, quota_value=excluded.quota_value, "
                 "reason=excluded.reason, hits=excluded.hits, first_ts=excluded.first_ts, "
                 "updated_ts=excluded.updated_ts, initiator=excluded.initiator, "
-                "version=excluded.version, detail=excluded.detail", row)
+                "version=excluded.version, detail=excluded.detail, job=excluded.job, "
+                "trace_id=excluded.trace_id", row)
 
     def clear_pair_state(self, key_id: str, model: str) -> None:
         """A 2xx proves the pair is usable again — drop the provider block and the
@@ -381,20 +431,131 @@ class Ledger:
 
     # --------------------------------------------------------------- annotations
     def add_note(self, comment: str, *, initiator: str = "", version: str = "",
-                 source: str = "cli", now: float | None = None) -> int:
-        """A free-form operator comment. No quota effect, no provider call, ever."""
+                 source: str = "cli", job: str | None = None,
+                 trace_id: str | None = None, step: str | None = None,
+                 event: str = "note", now: float | None = None) -> int:
+        """A free-form annotation or job lifecycle event. No quota effect, ever."""
         now = now or time.time()
         with self._lock, self._conn:
             cur = self._conn.execute(
-                "INSERT INTO notes(ts,ts_iso,version,initiator,comment,source) "
-                "VALUES(?,?,?,?,?,?)",
-                (now, iso(now), version, initiator, comment[:2000], source))
+                "INSERT INTO notes(ts,ts_iso,version,initiator,comment,source,job,"
+                "trace_id,step,event) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (now, iso(now), version, initiator, comment[:2000], source, job,
+                 trace_id or job, step, event))
             return int(cur.lastrowid)
 
-    def notes_tail(self, n: int = 20) -> list[dict]:
+    def notes_tail(self, n: int = 20, *, job: str | None = None) -> list[dict]:
+        with self._lock:
+            if job:
+                rows = self._conn.execute(
+                    "SELECT * FROM notes WHERE job=? ORDER BY ts DESC LIMIT ?",
+                    (job, n)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM notes ORDER BY ts DESC LIMIT ?", (n,)).fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------- jobs
+    def _job_touch(self, job: str | None, *, initiator: str | None, version: str | None,
+                   trace_id: str | None, comment: str | None, model: str,
+                   key: str, now: float) -> None:
+        """Create or refresh the activity row for a call. Called inside a transaction."""
+        if not job:
+            return
+        row = self._conn.execute('SELECT models, "keys" FROM jobs WHERE job=?',
+                                 (job,)).fetchone()
+        models = set(json.loads(row["models"] or "[]")) if row else set()
+        keys = set(json.loads(row["keys"] or "[]")) if row else set()
+        models.add(model)
+        keys.add(key)
+        self._conn.execute(
+            "INSERT INTO jobs(job,first_ts,last_ts,initiator,trace_id,version,comment,"
+            "status,calls,models,\"keys\") VALUES(?,?,?,?,?,?,?,'running',1,?,?) "
+            "ON CONFLICT(job) DO UPDATE SET last_ts=excluded.last_ts, "
+            "trace_id=COALESCE(excluded.trace_id,trace_id), "
+            "models=excluded.models, \"keys\"=excluded.\"keys\", "
+            "calls=calls+1",
+            (job, now, now, initiator or "", trace_id or job, version or "",
+             comment or "", json.dumps(sorted(models)), json.dumps(sorted(keys))))
+
+    def _job_count(self, job: str, status: str, http_status: int | None) -> None:
+        ok = int(status == "ok")
+        refusal = int(status in ("quota", "http5xx", "http4xx", "blocked", "network"))
+        was_429 = int(http_status == 429)
+        self._conn.execute(
+            "UPDATE jobs SET ok=ok+?, refusals=refusals+?, quota_429=quota_429+? "
+            "WHERE job=?", (ok, refusal, was_429, job))
+
+    def job_start(self, job: str, *, initiator: str = "", version: str = "",
+                  comment: str = "", trace_id: str | None = None,
+                  step: str | None = None, now: float | None = None) -> dict:
+        now = now or time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO jobs(job,first_ts,last_ts,initiator,trace_id,version,comment,"
+                "status) VALUES(?,?,?,?,?,?,?,'running') "
+                "ON CONFLICT(job) DO UPDATE SET status='running', "
+                "finished_ts=NULL, last_ts=excluded.last_ts, "
+                "trace_id=COALESCE(excluded.trace_id,trace_id), "
+                "comment=COALESCE(NULLIF(excluded.comment,''),comment)",
+                (job, now, now, initiator, trace_id or job, version, comment))
+            self._conn.execute(
+                "INSERT INTO notes(ts,ts_iso,version,initiator,comment,source,job,"
+                "trace_id,step,event) VALUES(?,?,?,?,?,'api',?,?,?,'job_start')",
+                (now, iso(now), version, initiator, comment or "job started", job,
+                 trace_id or job, step))
+        return self.job_summary(job)
+
+    def job_finish(self, job: str, *, status: str = "done", initiator: str = "",
+                   version: str = "", comment: str = "", step: str | None = None,
+                   now: float | None = None) -> dict:
+        if status not in ("done", "failed"):
+            raise ValueError("status must be done or failed")
+        now = now or time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO jobs(job,first_ts,last_ts,finished_ts,status) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(job) DO UPDATE SET "
+                "status=excluded.status, finished_ts=excluded.finished_ts, "
+                "last_ts=excluded.last_ts", (job, now, now, now, status))
+            self._conn.execute(
+                "INSERT INTO notes(ts,ts_iso,version,initiator,comment,source,job,"
+                "trace_id,step,event) VALUES(?,?,?,?,?,'api',?,NULL,?,'job_finish')",
+                (now, iso(now), version, initiator, comment or f"job {status}", job, step))
+        return self.job_summary(job)
+
+    def job_summary(self, job: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM jobs WHERE job=?", (job,)).fetchone()
+            if not row:
+                return None
+            out = dict(row)
+            out["models"] = json.loads(out["models"] or "[]")
+            out["keys"] = json.loads(out["keys"] or "[]")
+            out["traces"] = [r[0] for r in self._conn.execute(
+                "SELECT DISTINCT trace_id FROM calls WHERE job=? AND trace_id IS NOT NULL "
+                "ORDER BY trace_id", (job,))]
+            out["steps"] = [r[0] for r in self._conn.execute(
+                "SELECT DISTINCT step FROM calls WHERE job=? AND step IS NOT NULL "
+                "ORDER BY step", (job,))]
+        return out
+
+    def jobs_tail(self, n: int = 20) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM jobs ORDER BY last_ts DESC LIMIT ?",
+                                      (n,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["models"] = json.loads(d["models"] or "[]")
+            d["keys"] = json.loads(d["keys"] or "[]")
+            out.append(d)
+        return out
+
+    def job_calls(self, job: str, n: int = 200) -> list[dict]:
         with self._lock:
             return [dict(r) for r in self._conn.execute(
-                "SELECT * FROM notes ORDER BY ts DESC LIMIT ?", (n,))]
+                "SELECT * FROM calls WHERE job=? ORDER BY ts DESC LIMIT ?", (job, n))]
 
     # ---------------------------------------------------------------- cooldowns
     def cooldown(self, key_id: str, model: str, now: float | None = None) -> float | None:
@@ -465,6 +626,9 @@ class Ledger:
                 with self._conn:
                     self._conn.execute("DELETE FROM calls WHERE ts<?", (cut_calls,))
                     self._conn.execute("DELETE FROM notes WHERE ts<?", (cut_calls,))
+                    self._conn.execute(
+                        "DELETE FROM jobs WHERE last_ts<? AND status!='running'",
+                        (cut_calls,))
                     self._conn.execute("DELETE FROM cache WHERE ts<?", (cut_cache,))
                     self._conn.execute("DELETE FROM cooldowns WHERE until_ts<=?", (now,))
                     self._conn.execute("DELETE FROM pair_state WHERE until_ts<=?", (now,))
@@ -488,8 +652,10 @@ class Ledger:
         with self._lock:
             calls = self._conn.execute("SELECT COUNT(*) FROM calls").fetchone()[0]
             cache = self._conn.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
+            jobs = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
         size_mb = Path(self.path).stat().st_size / 1e6 if Path(self.path).exists() else 0
-        return {"calls": calls, "cache": cache, "size_mb": round(size_mb, 2)}
+        return {"calls": calls, "cache": cache, "jobs": jobs,
+                "size_mb": round(size_mb, 2)}
 
     # ------------------------------------------------- file search affinity (proxy)
     def fs_owner(self, resource: str) -> str | None:

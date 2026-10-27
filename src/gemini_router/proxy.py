@@ -5,18 +5,17 @@
 `google.golang.org/genai` SDK) run against this router's key pool instead of a single
 key, with the client's own token as the only credential it ever sees.
 
-Why a pass-through and not another `/v1/complete`-shaped endpoint: the SDK builds the
-URLs itself and reacts to provider-specific status codes, headers and error bodies.
-Re-serialising any of it breaks the contract — `sizeBytes` arrives as a string and the
-SDK's struct tags demand exactly that — so this layer forwards requests and responses
-byte-for-byte and adds only what the router is for:
+The SDK builds its URLs and reacts to provider-specific status codes, headers and
+error bodies. Re-serialising any of it breaks the contract — `sizeBytes` arrives as a
+string and the SDK's struct tags demand exactly that — so this layer forwards requests
+and responses byte-for-byte and adds only what the router is for:
 
     * client authentication (the client's key never reaches Google);
     * upstream key selection, with File Search resources pinned to the project that
       owns them (filesearch.py);
     * a resumable-upload session bound to that key, so a continuation cannot bypass
       authentication or land in another project;
-    * quota accounting into the shared ledger.
+    * quota accounting and job/trace correlation into the shared ledger.
 
 Two properties of the SDK shape the design and were measured, not assumed:
 
@@ -44,7 +43,13 @@ from urllib.parse import parse_qsl, urlparse
 import httpx
 
 from .config import Config, key_id
-from .context import RequestContext, audit_line, router_version
+from .context import (
+    CLIENT_CONTEXT_HEADERS,
+    RequestContext,
+    audit_line,
+    make_traceparent,
+    router_version,
+)
 from .feedback import ProviderSignal, QuotaTruth, parse_provider_signal
 from .filesearch import (
     INTERACTIONS_CREATE,
@@ -70,10 +75,8 @@ HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriza
 # The client's credential is the router's token, never an upstream key: it is consumed
 # here and must not travel a hop further.
 CLIENT_AUTH_HEADERS = {"x-goog-api-key", "authorization", "cookie"}
-# Router-only metadata. Consumed locally (identity/annotation), never forwarded to
-# Google: a free-form comment must not change an upstream request in any way.
-CLIENT_CONTEXT_HEADERS = {"x-router-initiator", "x-router-source", "x-router-comment",
-                          "x-router-note", "x-router-request-id"}
+# Router-only metadata (identity, job/trace, annotations) is stripped before upstream:
+# a free-form comment or trace header must never change a provider request.
 CHUNK = 1 << 20          # 1 MiB: streamed, so a 2 GB upload never lands in RAM twice
 RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
 
@@ -159,7 +162,8 @@ class GeminiProxy:
             endpoint=f"http://{self.cfg.proxy.bind}:{self.cfg.proxy.port}",
             upstream=self.cfg.base_url, keys=len(self.cfg.api_keys),
             overflow=self.cfg.overflow_default, policy=self.cfg.proxy.model_policy,
-            state=self.ledger.path, initiator="system",
+            state=self.ledger.path, initiator="system", job="system@startup",
+            trace="system@startup",
             comment="gemini-router proxy started"))
         try:
             httpd.serve_forever()
@@ -207,6 +211,14 @@ class GeminiProxy:
                 return self._handle_note(h, ctx)
             if path == "/v1/notes" and method == "GET":
                 return self._handle_notes(h, ctx, query)
+            if path == "/v1/job" and method == "POST":
+                return self._handle_job(h, ctx)
+            if path == "/v1/jobs" and method == "GET":
+                return self._handle_jobs(h, ctx, query)
+            if path == "/v1/job" and method == "GET":
+                return self._handle_job_get(h, ctx, query)
+            if path == "/v1/calls" and method == "GET":
+                return self._handle_calls(h, ctx, query)
 
             if not allowed_path(path):
                 return self._send(h, 404, b"application/json", google_error(
@@ -236,14 +248,20 @@ class GeminiProxy:
             return self._send(h, 400, b"application/json",
                               google_error(400, 'note needs a non-empty "comment"'), {})
         initiator = str(data.get("initiator") or ctx.initiator or "")[:64]
+        job = str(data.get("job") or ctx.job or "")[:128]
+        trace = str(data.get("trace") or ctx.trace_id or "")[:64]
+        step = str(data.get("step") or ctx.step or "")[:64]
+        ctx.job, ctx.trace_id, ctx.step = job, trace, step
         note_id = self.ledger.add_note(comment, initiator=initiator,
-                                       version=self.version, source="http")
-        log.info(audit_line("note", v=self.version, rid=ctx.request_id,
-                            initiator=initiator or "-", note_id=note_id,
-                            comment=comment))
+                                       version=self.version, source="http",
+                                       job=job or None, trace_id=trace or job,
+                                       step=step or None)
+        fields = ctx.log_fields()
+        fields.update(initiator=initiator or "-", note_id=note_id, comment=comment)
+        log.info(audit_line("note", **fields))
         self._send(h, 200, b"application/json",
                    json.dumps({"ok": True, "note_id": note_id, "version": self.version,
-                               "initiator": initiator}).encode(), {})
+                               "initiator": initiator, "job": job}).encode(), {})
 
     def _handle_notes(self, h, ctx: RequestContext, query: str) -> None:
         q = dict(parse_qsl(query))
@@ -253,14 +271,102 @@ class GeminiProxy:
             n = 20
         self._send(h, 200, b"application/json",
                    json.dumps({"ok": True, "version": self.version,
-                               "notes": self.ledger.notes_tail(n)}).encode(), {})
+                               "notes": self.ledger.notes_tail(
+                                   n, job=q.get("job"))}).encode(), {})
+
+    # -------------------------------------------------------------------- jobs
+    @staticmethod
+    def _body(h, cap: int = 64 << 10) -> dict:
+        length = int(h.headers.get("content-length") or 0)
+        raw = h.rfile.read(min(length, cap)) if length else b"{}"
+        try:
+            data = json.loads(raw or b"{}")
+        except ValueError:
+            data = {}
+        return data if isinstance(data, dict) else {}
+
+    def _handle_job(self, h, ctx: RequestContext) -> None:
+        """Start or finish a target activity. Local bookkeeping only."""
+        data = self._body(h)
+        job = str(data.get("job") or ctx.job or "")[:128].strip()
+        action = str(data.get("action") or "start").lower()
+        if not job:
+            return self._send(h, 400, b"application/json",
+                              google_error(400, 'job needs a non-empty "job"'), {})
+        comment = str(data.get("comment") or ctx.comment or "")[:2000]
+        initiator = str(data.get("initiator") or ctx.initiator or "")[:64]
+        status = str(data.get("status") or "done").lower()
+        ctx.job = job
+        ctx.trace_id = str(data.get("trace") or ctx.trace_id or "")[:64] or job
+        ctx.step = str(data.get("step") or ctx.step or "")[:64]
+        if action in ("start", "begin"):
+            result = self.ledger.job_start(job, initiator=initiator,
+                                           version=self.version, comment=comment,
+                                           trace_id=ctx.trace_id, step=ctx.step or None)
+        elif action in ("finish", "end", "stop"):
+            if status not in ("done", "failed"):
+                status = "done"
+            result = self.ledger.job_finish(job, status=status, initiator=initiator,
+                                            version=self.version, comment=comment,
+                                            step=ctx.step or None)
+        else:
+            return self._send(h, 400, b"application/json", google_error(
+                400, "action must be start or finish"), {})
+        fields = ctx.log_fields()
+        fields.update(job_action=action, job_status=result["status"],
+                      comment=comment or "-")
+        log.info(audit_line("job", **fields))
+        self._send(h, 200, b"application/json",
+                   json.dumps({"ok": True, "job": job, "action": action,
+                               "version": self.version,
+                               "summary": result}, default=str).encode(), {})
+
+    def _handle_jobs(self, h, ctx: RequestContext, query: str) -> None:
+        q = dict(parse_qsl(query))
+        try:
+            n = max(1, min(int(q.get("n", "20")), 200))
+        except ValueError:
+            n = 20
+        self._send(h, 200, b"application/json",
+                   json.dumps({"ok": True, "version": self.version,
+                               "jobs": self.ledger.jobs_tail(n)}, default=str).encode(), {})
+
+    def _handle_job_get(self, h, ctx: RequestContext, query: str) -> None:
+        q = dict(parse_qsl(query))
+        job = q.get("id") or q.get("job") or ctx.job
+        summary = self.ledger.job_summary(job) if job else None
+        if not summary:
+            return self._send(h, 404, b"application/json",
+                              google_error(404, f"job {job!r} not found"), {})
+        try:
+            n = max(1, min(int(q.get("n", "50")), 500))
+        except ValueError:
+            n = 50
+        self._send(h, 200, b"application/json", json.dumps({
+            "ok": True, "version": self.version, "job": job, "summary": summary,
+            "events": self.ledger.notes_tail(n, job=job),
+            "calls": self.ledger.job_calls(job, n)}, default=str).encode(), {})
+
+    def _handle_calls(self, h, ctx: RequestContext, query: str) -> None:
+        """Read the audit rows of one job/trace/step without touching the provider."""
+        q = dict(parse_qsl(query))
+        try:
+            n = max(1, min(int(q.get("n", "50")), 500))
+        except ValueError:
+            n = 50
+        rows = self.ledger.calls_tail(
+            n, model=q.get("model"), status=q.get("status"), source=q.get("source"),
+            request_id=q.get("request_id"), initiator=q.get("initiator"),
+            job=q.get("job"), trace_id=q.get("trace"), step=q.get("step"))
+        self._send(h, 200, b"application/json",
+                   json.dumps({"ok": True, "version": self.version, "calls": rows},
+                              default=str).encode(), {})
 
     def _local_throttle(self, selection: Selection,
                         ctx: RequestContext) -> tuple[int, dict, bytes, None]:
         """Answer 429 locally when provider truth says the whole pool is blocked."""
         retry = max(1, int(selection.retry_after_s or 60))
-        log.info(audit_line("pool_throttled", v=self.version, rid=ctx.request_id,
-                            initiator=ctx.initiator or "-", comment=ctx.comment or "-",
+        log.info(audit_line("pool_throttled", **ctx.log_fields(),
                             retry_after_s=retry, state=selection.state))
         return (429, {"Retry-After": str(retry)},
                 google_error(429, "all router key/model pairs are quota-blocked by the "
@@ -329,6 +435,7 @@ class GeminiProxy:
                          and body is not None)
         if model_in_body and not model:
             model = interactions_model(body)
+        requested_model = model
         selection: Selection | None = None
         if model and cfg.proxy.model_policy != "passthrough":
             # Key and model come from the shared selection walk (SPEC §11.6): resource
@@ -355,18 +462,27 @@ class GeminiProxy:
         spending = method == "POST" and (path.endswith(":generateContent")
                                          or path == INTERACTIONS_CREATE)
 
+        hop = 0
+
         def attempt() -> tuple[int, dict, bytes, ProviderSignal | None]:
             # Every upstream try is planned and resolved: a retried attempt spent real
             # provider quota and must not vanish from the ledger. Non-spending kinds
             # (store listings, uploads) are recorded but excluded from every gate.
-            # Version / initiator / comment ride on the row so a mixed fleet stays
-            # diagnosable after the fact.
+            # Identity (version, initiator, job, trace, step, hop) rides on the row so
+            # the whole activity can be reconstructed from one query.
+            nonlocal hop
+            this_hop = hop
+            hop += 1
             row_id = self.ledger.plan(
                 key_id=key_id(key), model=model or FILE_ROW_MODEL,
                 kind="single" if spending else "filesearch", est_tokens=0,
                 request_id=ctx.request_id, source=ctx.initiator or "filesearch",
                 initiator=ctx.initiator or "filesearch", comment=ctx.comment or None,
-                version=self.version) if (spending or cfg.proxy.audit) else None
+                version=self.version, job=ctx.job, trace_id=ctx.trace_id,
+                step=ctx.step or None, hop=this_hop, requested_model=requested_model,
+                request_bytes=length if body is not None else None,
+                method=method, path=path, parent_span=ctx.parent_span or None
+            ) if (spending or cfg.proxy.audit) else None
             st, hdrs_out, pl, signal = self._forward(
                 method, url, headers, body, stream, length, path, resource, pinned,
                 kid, key, model=model, ctx=ctx)
@@ -377,12 +493,14 @@ class GeminiProxy:
                     quota_error=signal.detail if signal and signal.blocks_pair else None,
                     retry_after_s=signal.retry_after_s if signal else None,
                     quota_id=signal.quota_id if signal else None,
-                    signal_kind=signal.kind if signal and signal.blocks_pair else None)
+                    signal_kind=signal.kind if signal and signal.blocks_pair else None,
+                    response_bytes=len(pl),
+                    provider_reason=signal.reason if signal and signal.blocks_pair else None)
             return st, hdrs_out, pl, signal
 
         # --- circuit breaker: provider truth already says the pool is out -----------
-        # Without this, three client requests each re-walk the same 12 blocked pairs,
-        # which is exactly how 48 identical 429s landed in ten seconds on 2026-10-21.
+        # Concurrent callers share the provider verdict instead of each re-walking
+        # the same blocked pairs.
         if (spending and model and stream is None and cfg.proxy.pool_circuit_breaker
                 and selection is not None and selection.state == "throttled"):
             status, out_headers, payload, _ = self._local_throttle(selection, ctx)
@@ -439,17 +557,22 @@ class GeminiProxy:
 
         if cfg.proxy.audit:
             log.info(audit_line(
-                "request", v=self.version, rid=ctx.request_id,
-                initiator=ctx.initiator or "-", comment=ctx.comment or "-",
-                method=method, path=path, status=status, key=kid,
-                resource=resource or "-", pinned=int(bool(pinned)),
-                bytes=length, latency_ms=int((time.time() - started) * 1000),
-                model=model or "-", response_bytes=len(payload)))
+                "request", **ctx.log_fields(), method=method, path=path,
+                status=status, key=kid, resource=resource or "-",
+                pinned=int(bool(pinned)), bytes=length,
+                latency_ms=int((time.time() - started) * 1000),
+                model=model or "-", requested_model=requested_model or "-",
+                hop=max(0, hop - 1), response_bytes=len(payload)))
         if model:
             # Who actually served a model call — so a caller's own run log can record
             # the pair without correlating against this proxy's audit stream by time.
             out_headers["x-router-model"] = model
             out_headers["x-router-key-id"] = kid
+        out_headers["x-router-version"] = self.version
+        out_headers["x-router-job"] = ctx.job
+        out_headers["x-router-trace"] = ctx.trace_id
+        out_headers["x-router-request-id"] = ctx.request_id
+        out_headers["x-router-traceparent"] = make_traceparent(ctx.trace_id, ctx.span_id)
         self._send(h, status, out_headers.pop("content-type", b"application/json"),
                    payload, out_headers)
 
@@ -463,9 +586,8 @@ class GeminiProxy:
         so both get exactly one attempt. Idempotent reads of a resource whose owner is
         unknown may try the other keys once, which is also how a lost affinity heals.
 
-        Every 429/503 is handed to `QuotaTruth` *with the real upstream headers*: the
-        Retry-After header used to be thrown away, which turned a day-long quota
-        verdict into a 65-second cooldown.
+        Every 429/503 is handed to `QuotaTruth` *with the real upstream headers*,
+        including `Retry-After` (delta-seconds or HTTP-date).
         """
         ctx = ctx or RequestContext(source="filesearch")
         attempts = [(url, headers, body, stream, kid, key)]

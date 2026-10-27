@@ -1,6 +1,5 @@
-"""Router: cascading chain, key pool, budget gates, wait policy (FR-C13), overflow
-tiers, cache. Budget checks are ledger queries (D1); statuses taxonomy ported from
-tldr-digest src/llm.py."""
+"""Router: cascading chain, key pool, ledger-backed budget gates, wait policy (FR-C13),
+overflow tiers and request cache. Job/trace identity flows into every ledger row."""
 from __future__ import annotations
 
 import asyncio
@@ -43,10 +42,15 @@ class RouterRequest:
     request_id: str | None = None           # idempotency / cache lookup
     source: str = "cli"                     # transport/entry point: mcp|cli|rest|filesearch
     # Who actually asked. Free-form, supplied by the initiator itself; defaults to
-    # `source` so old callers remain attributable. Stored in every ledger row.
+    # `source` when omitted. Stored in every ledger row.
     initiator: str | None = None
     # Arbitrary operator text. Logged and stored, never used in a routing decision.
     comment: str = ""
+    # Target activity (e.g. "digest-2026-10-28"), one execution of it, and the
+    # client's stage inside that execution. All rows of the job share `job`.
+    job: str | None = None
+    trace_id: str | None = None
+    step: str = ""
     overflow: str | None = None             # off|lite|lite+gemma; None → cfg.overflow_default
                                             # (FR-C8 stays opt-in: that default is "off")
     wait: bool | None = None                # None → cfg.wait.enabled_default (FR-C13)
@@ -64,12 +68,15 @@ class RouterResult:
     latency_s: float = 0.0
     cached: bool = False
     overflow_tier: int = 0
-    finish_reason: str | None = None         # v0.1.1: live-smoke finding (starvation diag)
+    finish_reason: str | None = None         # empty-answer diagnostics
     tokens_thought: int | None = None
     events: list[RouterEvent] = field(default_factory=list)
     quota_after: list[dict] = field(default_factory=list)
     request_id: str | None = None
     row_id: int | None = None
+    job: str | None = None
+    trace_id: str | None = None
+    step: str = ""
     files_used: list[UploadedFile] = field(default_factory=list)  # actual key's uploads
 
 
@@ -383,8 +390,11 @@ class Router:
                                            default=None)})
         return out
 
-    async def count_tokens(self, prompt: str, model: str | None = None) -> int:
-        """countTokens pre-flight; recorded with kind='count' → never spends RPD (FR-C7)."""
+    async def count_tokens(self, prompt: str, model: str | None = None, *,
+                           job: str | None = None, trace_id: str | None = None,
+                           step: str | None = None, initiator: str | None = None,
+                           request_id: str | None = None, comment: str | None = None) -> int:
+        """countTokens pre-flight; kind='count' never spends RPD (FR-C7)."""
         avail = await self._safe_avail()
         chosen = None
         for m in ([model] if model else self.cfg.chain):
@@ -400,8 +410,10 @@ class Router:
         m, key = chosen
         n = await self.client.count_tokens(key, m, prompt)
         row = self.ledger.plan(key_id=key_id(key), model=m, kind="count", est_tokens=n,
-                               request_id=None, source="count", initiator="count",
-                               version=router_version())
+                               request_id=request_id, source="count",
+                               initiator=initiator or "count", comment=comment,
+                               version=router_version(), job=job or "count",
+                               trace_id=trace_id, step=step)
         self.ledger.resolve(row, "ok", tokens_in=n, tokens_out=0)
         return n
 
@@ -414,11 +426,16 @@ class Router:
 
         A provider file is visible only to its uploading key. With matching local
         `file_paths`, re-upload once per new key after quota/availability switching;
-        without them keep the historical pin, never send a foreign URI under a key.
+        without them keep the pinned URI, never send a foreign URI under a key.
         The gateway supplies local sources for both single and packed PDFs."""
         events: list[RouterEvent] = []
         ctx = RequestContext(initiator=req.initiator or req.source, comment=req.comment,
-                             source=req.source, version=router_version())
+                             source=req.source, version=router_version(),
+                             job=req.job or f"{req.initiator or req.source}@"
+                                            f"{iso(self._now())[:10]}",
+                             trace_id=req.trace_id or req.job or f"{req.initiator or req.source}@"
+                                                                  f"{iso(self._now())[:10]}",
+                             step=req.step)
         if req.request_id:
             ctx.request_id = req.request_id
 
@@ -468,6 +485,7 @@ class Router:
                 return RouterResult(text=row["response"], model=row["model"], key_id="cache",
                                     tokens_in=row["tokens_in"], tokens_out=row["tokens_out"],
                                     cached=True, events=events, request_id=req.request_id,
+                                    job=ctx.job, trace_id=ctx.trace_id, step=ctx.step,
                                     quota_after=self.model_budgets())
 
         avail = await self._safe_avail()
@@ -546,6 +564,10 @@ class Router:
                         res.events = events
                         res.quota_after = self.model_budgets(tried)
                         res.files_used = serving or []
+                        res.job = ctx.job
+                        res.trace_id = ctx.trace_id
+                        res.step = ctx.step
+                        res.request_id = res.request_id or ctx.request_id
                         return res
                     if outcome in ("quota", "wait_skip"):
                         quota_blocked = True
@@ -557,16 +579,14 @@ class Router:
                 "ones: `gemini-mcp keys` shows the pool, `gemini-mcp keys add <key>` "
                 "validates and installs one without touching the unit file by hand")
         # A file job that exhausted its file-capable candidates is not a key problem, so
-        # this must be read before the pin clause below — and the pin clause itself must
-        # not fire on a quota block, or a 429-drained chain tells the user to re-upload a
-        # file under a key that was never the issue (found by test on 2026-10-11).
+        # this is read before the pin clause; a quota block must not ask for a re-upload
+        # under a key that was never the issue.
         if files and not quota_blocked and any(self._file_incapable.get(cls)
                                                 for cls in (fclasses or ())):
             raise RouterError(
                 "no configured model/key can read this file: " + self._incapable_note() +
                 " answered 400/500 to a file request. Capability is per model × media "
-                "kind and can change over time; Lite/PDF was content-verified on two "
-                "keys in 2026-10. Use a capable chain/overflow model or set "
+                "kind and key. Use a capable chain/overflow model or set "
                 "`file_capable_models:` to narrow the candidates.")
         if pins and not failures and not quota_blocked:
             raise RouterError(
@@ -593,7 +613,7 @@ class Router:
         raise RouterError("all candidates failed: " + "; ".join(failures[-5:]))
 
     def complete_sync(self, req: RouterRequest, on_event: Emitter | None = None) -> RouterResult:
-        """Blocking facade for legacy sync callers (tldr-digest migration, SPEC §2)."""
+        """Blocking facade for synchronous callers (SPEC §2)."""
         async def _run() -> RouterResult:
             client = GeminiClient(self.cfg)      # fresh client: bound to this event loop
             saved, self.client = self.client, client
@@ -677,7 +697,8 @@ class Router:
             self.ledger.record_upload(key_id=kid, nbytes=up.size,
                                       source=ctx.initiator or source, latency_ms=ms,
                                       initiator=ctx.initiator, comment=ctx.comment or None,
-                                      version=ctx.version)
+                                      version=ctx.version, job=ctx.job,
+                                      trace_id=ctx.trace_id, step=ctx.step or None)
             return replace(up, sha256=sha256, key_id=kid)
         raise RouterError(f"no key accepted the upload: {last_err}")
 
@@ -744,7 +765,7 @@ class Router:
             tiers.append((tier, models))
         if file_classes:
             # PDF-containing jobs use text's tier order. Other media keep the
-            # historical chain-only policy; Gemma still refuses PNG file_data.
+            # chain-only policy; Gemma refuses PNG file_data.
             # Allowlist narrowing is global; learned refusals are per key.
             if "pdf" not in file_classes:
                 tiers = tiers[:1]
@@ -790,7 +811,8 @@ class Router:
                 return RouterResult(text=row["response"], model=model, key_id=kid,
                                     tokens_in=row["tokens_in"], tokens_out=row["tokens_out"],
                                     cached=True, overflow_tier=tier,
-                                    request_id=req.request_id), "ok"
+                                    request_id=req.request_id, job=ctx.job,
+                                    trace_id=ctx.trace_id, step=ctx.step), "ok"
 
         waited_total = 0.0
         while g["wait_s"] > 0:                                   # FR-C13 wait loop
@@ -818,7 +840,10 @@ class Router:
         row_id = self.ledger.plan(key_id=kid, model=model, kind=req.kind, est_tokens=est,
                                   request_id=ctx.request_id, source=req.source,
                                   overflow_tier=tier, initiator=ctx.initiator,
-                                  comment=ctx.comment or None, version=ctx.version)
+                                  comment=ctx.comment or None, version=ctx.version,
+                                  job=ctx.job, trace_id=ctx.trace_id,
+                                  step=ctx.step or None, requested_model=req.model,
+                                  parent_span=ctx.parent_span)
         emit("dispatch", model=model, key_id=kid, detail={"row_id": row_id, "est_tokens": est})
         attempt = 0
         t0 = self._now()
@@ -845,7 +870,8 @@ class Router:
                     self.ledger.resolve(
                         row_id, "quota", http_status=e.status, latency_ms=ms,
                         quota_error=str(e), retry_after_s=signal.retry_after_s,
-                        quota_id=signal.quota_id, signal_kind=signal.kind)
+                        quota_id=signal.quota_id, signal_kind=signal.kind,
+                        provider_reason=signal.reason)
                     self.truth.apply(signal, key_id=kid, model=model, context=ctx)
                     # A *confirmed* minute quota with a short, explicit Retry-After is
                     # worth waiting out on the same pair (FR-C13). Everything else —
@@ -864,7 +890,9 @@ class Router:
                                 key_id=kid, model=model, kind=req.kind, est_tokens=est,
                                 request_id=ctx.request_id, source=req.source,
                                 overflow_tier=tier, initiator=ctx.initiator,
-                                comment=ctx.comment or None, version=ctx.version)
+                                comment=ctx.comment or None, version=ctx.version,
+                                job=ctx.job, trace_id=ctx.trace_id,
+                                step=ctx.step or None, requested_model=req.model)
                         await self._sleep(backoff)
                         continue
                     emit("switch", model=model, key_id=kid,
@@ -904,7 +932,8 @@ class Router:
                             key_id=kid, model=model, kind=req.kind, est_tokens=est,
                             request_id=ctx.request_id, source=req.source, overflow_tier=tier,
                             initiator=ctx.initiator, comment=ctx.comment or None,
-                            version=ctx.version)
+                            version=ctx.version, job=ctx.job, trace_id=ctx.trace_id,
+                            step=ctx.step or None, requested_model=req.model)
                     await self._sleep(backoff)
                     continue
                 self._resolve_err(row_id, e, ms)
@@ -934,7 +963,8 @@ class Router:
                             key_id=kid, model=model, kind=req.kind, est_tokens=est,
                             request_id=ctx.request_id, source=req.source, overflow_tier=tier,
                             initiator=ctx.initiator, comment=ctx.comment or None,
-                            version=ctx.version)
+                            version=ctx.version, job=ctx.job, trace_id=ctx.trace_id,
+                            step=ctx.step or None, requested_model=req.model)
                     await self._sleep(backoff)
                     continue
                 self.ledger.resolve(row_id, "blocked" if stream else "network",
@@ -977,7 +1007,8 @@ class Router:
                                 tokens_out=gr.tokens_out, latency_s=ms / 1000,
                                 overflow_tier=tier, request_id=req.request_id,
                                 row_id=row_id, finish_reason=gr.finish_reason,
-                                tokens_thought=gr.tokens_thought), "ok"
+                                tokens_thought=gr.tokens_thought, job=ctx.job,
+                                trace_id=ctx.trace_id, step=ctx.step), "ok"
 
     def _resolve_err(self, row_id: int, e: GeminiHTTPError, ms: int) -> None:
         status = ("http5xx" if (e.status or 0) >= 500 else
@@ -986,4 +1017,5 @@ class Router:
         self.ledger.resolve(row_id, status, http_status=e.status, latency_ms=ms,
                             quota_error=str(e)[:500], retry_after_s=e.retry_after,
                             quota_id=signal.quota_id if signal else None,
-                            signal_kind=signal.kind if signal else None)
+                            signal_kind=signal.kind if signal else None,
+                            provider_reason=signal.reason if signal else None)

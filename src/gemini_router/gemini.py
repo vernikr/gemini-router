@@ -243,10 +243,9 @@ class GeminiClient:
         # as null when unset: measured against the live free tier, an omitted
         # maxOutputTokens let one call return 29,899 candidate tokens with
         # finishReason=STOP, so the provider treats "absent" as unlimited here, not as
-        # the 8,192 the docs describe as the default. The old `= 8192` default arrived in
-        # the first commit with no stated rationale and was invisible in this path —
-        # routing.py always passes a value — so it only ever bit a direct caller of this
-        # client, silently, with no way to tell a cap from a short answer.
+        # the 8,192 the docs describe as the default. A direct caller of this client
+        # therefore gets either its own cap or none at all; routing.py always passes a
+        # value explicitly.
         gen: dict = {}
         if max_output_tokens is not None:
             gen["maxOutputTokens"] = max_output_tokens

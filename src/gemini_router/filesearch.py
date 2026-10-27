@@ -63,7 +63,7 @@ ALLOWED = (
     re.compile(r"^/v1beta/models$"),
     re.compile(r"^/upload/v1beta/files$"),
     re.compile(r"^/upload/v1beta/fileSearchStores/[^/:?]+:uploadToFileSearchStore$"),
-    # Interactions API (GA 2026; generateContent is legacy): create, retrieve,
+    # Interactions API (generateContent remains supported): create, retrieve,
     # delete, cancel. Server-side conversation state is project-scoped exactly
     # like a File Search store, so the same resource->key binding carries it.
     re.compile(r"^/v1beta/interactions$"),

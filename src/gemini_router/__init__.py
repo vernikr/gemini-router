@@ -17,7 +17,14 @@ from .config import (
                      estimate_tokens,
                      key_id,
 )
-from .context import RequestContext, audit_line, router_version
+from .context import (
+                     CLIENT_CONTEXT_HEADERS,
+                     RequestContext,
+                     audit_line,
+                     make_traceparent,
+                     parse_traceparent,
+                     router_version,
+)
 from .errors import (
                      FileNotReady,
                      FileUploadFailed,
@@ -59,7 +66,8 @@ __all__ = [
     "Config", "Limits", "RetryCfg", "WaitCfg", "ProxyCfg", "FeedbackCfg", "Ledger",
     "GeminiClient", "GenResult", "GeminiProxy",
     "RequestContext", "ProviderSignal", "QuotaTruth", "parse_provider_signal",
-    "body_facts", "router_version", "audit_line",
+    "body_facts", "router_version", "audit_line", "CLIENT_CONTEXT_HEADERS",
+    "parse_traceparent", "make_traceparent",
     "extract_json", "is_gemini3", "key_id", "estimate_tokens", "cache_hash",
     "gates_for", "pick_pair", "pick_gemma", "pt_midnight_ts", "iso",
     "forecast_media_tokens", "check_drift", "media_class", "TariffNotMeasured",

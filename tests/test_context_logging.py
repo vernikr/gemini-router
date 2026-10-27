@@ -31,8 +31,8 @@ def test_cyrillic_comment_can_travel_percent_encoded():
 
 
 def test_audit_line_quotes_free_text():
-    line = audit_line("note", v="0.11.0", comment="hello world = test", initiator="ops")
-    assert "event=note" in line and "v=0.11.0" in line and "initiator=ops" in line
+    line = audit_line("note", v="0.12.0", comment="hello world = test", initiator="ops")
+    assert "event=note" in line and "v=0.12.0" in line and "initiator=ops" in line
     assert '"hello world = test"' in line
 
 
