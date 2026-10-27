@@ -11,3 +11,8 @@ logs/
 dist/
 *.egg-info/
 .DS_Store
+
+# npm helper
+node_modules/
+*.tgz
+.npmrc

@@ -5,7 +5,7 @@ The router's own contract. Companion docs live in `vernikr/gemini-mcp/docs/02` +
 
 ## 1. What it is
 
-Quota-aware Gemini Flash router extracted from `tldr-digest/src/llm.py`, generalized:
+Quota-aware Gemini Flash router shared by Python, CLI and HTTP consumers:
 
 - cascading model chain with runtime `listModels` validation (the configurable
   default lives in `src/gemini_router/config.py:DEFAULT_CHAIN`);
@@ -14,18 +14,21 @@ Quota-aware Gemini Flash router extracted from `tldr-digest/src/llm.py`, general
 - key pool (`GEMINI_API_KEYS` / `GEMINI_API_KEY_1..10`); selection prefers the pair with
   the largest remaining budget;
 - persistent multi-process ledger (SQLite WAL) — shared by connected consumers on
-  the same machine (MCP daemon, stdio sessions, CLI); other programs can join it,
-  but the `tldr-digest` migration is not complete;
-- 429/5xx/4xx taxonomy inherited from tldr-digest (`RETRYABLE_STATUS`,
-  `MODEL_SWITCH_STATUS`, `Retry-After`, backoff+jitter, provider deadline);
+  the same machine (`gemini-mcp`, `tldr-digest`, CLI, HTTP clients);
+- 429/5xx/4xx taxonomy (`RETRYABLE_STATUS`, `MODEL_SWITCH_STATUS`, `Retry-After`,
+  backoff+jitter, provider deadline);
 - opt-in overflow tiers (`gemini-3.5-flash-lite`, best `gemma-*`) — never automatic;
 - request cache (hash of model+params+prompt, TTL) — hits spend 0 RPD;
 - event stream (`on_event`) for progress reporting by frontends;
 - `thinking_level` (low|medium|high) per request; 3.x rules applied (no
   temperature/top_p for Gemini 3.x; `thinking_level` not `thinking_budget`);
-- CLI: `quota`, `models`, `calls`, `prune`, `doctor`; sync facade for legacy callers.
+- **job/trace audit**: every call, hop, provider verdict and annotation belongs to a
+  target activity; schema v4 `jobs` aggregates them (§13);
+- CLI: `quota`, `models`, `calls`, `note`, `notes`, `jobs`, `job`, `job-start`,
+  `job-finish`, `prune`, `doctor`, `proxy`; a blocking facade serves synchronous callers.
 
-Zero MCP/web-framework deps: `httpx`, `pydantic`, `rich`, stdlib `sqlite3`. Python ≥3.12.
+Zero MCP/web-framework deps: `httpx`, `pydantic`, `pyyaml`, `rich`, stdlib `sqlite3`.
+Python ≥3.12. The npm package `gemini-router` is a zero-dependency HTTP client helper.
 
 ## 2. Public API
 
@@ -43,6 +46,8 @@ res: RouterResult = await router.complete(
         kind="single|chunk|consolidate|count" = "single",
         request_id=None, source="cli", overflow=None,   # off|lite|lite+gemma;
                                       # None → cfg.overflow_default (FR-C8: that default is "off")
+        initiator=None, comment="",   # stored + logged; no routing effect
+        job=None, trace_id=None, step="",  # one target activity, its run, the stage (§13)
         wait=True,                    # wait out minute-scale gates (RPM/TPM/short cooldown,
                                       # ≤ wait.max_s), countdown via `waiting` events;
                                       # daily RPD resets are NEVER waited on
@@ -53,10 +58,11 @@ res: RouterResult = await router.complete(
 
 res.text, res.model, res.key_id, res.tokens_in, res.tokens_out
 res.latency_s, res.cached, res.overflow_tier, res.events, res.quota_after
+res.request_id, res.row_id, res.finish_reason, res.tokens_thought
 await router.count_tokens(text, model=None) -> int
 await router.quota_table() -> list[QuotaRow]   # key_id, model, rpd_left, rpm_wait_s,
                                                # tpm_wait_s, cooldown_until, recommended
-router.complete_sync(...)                      # blocking facade (tldr-digest migration)
+router.complete_sync(...)                      # blocking facade for synchronous callers
 ```
 
 ### File input (Files API, §8)
@@ -122,12 +128,14 @@ the signal to re-measure the table, never an error: the request ran on the measu
 
 ## 3. Ledger (SQLite, `GEMINI_ROUTER_STATE`, default `/opt/apps/shared/gemini-router/state.db`)
 
-Tables `calls`, `cooldowns`, `cache`, `meta` — full DDL and accounting rules:
-gemini-mcp `docs/03-architecture.md` §3 (single canonical definition).
-Rules summary: WAL + busy_timeout 5 s; TPM pre-flight writes a `status='planned'` row,
-upgraded after the call; RPD counts `ok|quota|http5xx` attempts (conservative),
-not client-validation 4xx/network; PT-midnight + rolling-24h dual gate; retention prune
-via `gemini-router prune` and by frontends' daily task.
+Tables `calls`, `cooldowns`, `pair_state`, `jobs`, `notes`, `cache`, `meta`,
+`fs_affinity`, `drift` — the DDL in `ledger.py` is the canonical definition. Schema v4 is
+additive, with in-place migration of older databases. Rules: WAL + busy_timeout 5 s; a TPM
+pre-flight writes `status='planned'` and is upgraded after the call; RPD counts
+`ok|quota|blocked` attempts (conservative), not 5xx overloads, client-validation 4xx or
+network errors; PT-midnight + rolling-24h dual gate; retention via `gemini-router prune`.
+`calls` carries job/trace/step/hop, request id, version, initiator, comment, model,
+requested model, method/path and request/response byte counts (§13).
 
 Non-spending provider calls are named once (`NON_SPENDING_KINDS`: `countTokens`, Files API
 uploads) and excluded from every gate, from the pacing clock and from cooldowns. An upload
@@ -147,8 +155,11 @@ from; a library request may override it per call, the pass-through proxy walks i
 `wait {enabled_default,max_s,poll_s}` (FR-C13 semantics), `window_s`, `planned_ttl_s`,
 `models_refresh_h`, `cache_ttl_h`, `state_path`, `base_url`, `temperature` (pre-3.x models
 only), `max_output_tokens_default`, `chars_per_token` (unset = script-aware estimate),
-`proxy {bind,port,token_env,max_upload_bytes,request_timeout_s,body_inspect_bytes,audit,
-model_policy,file_search_models}` and `file_search_key` (§11). Defaults per gemini-mcp `docs/03-architecture.md` §8. Secrets never logged
+`feedback {throttle_min_s,throttle_max_s,buffer_s,reset_buffer_s,overload_cooldown_s,
+promote_hits,promote_window_s}`, `proxy {bind,port,token_env,max_upload_bytes,
+request_timeout_s,body_inspect_bytes,audit,model_policy,file_search_models,
+default_initiator,walk_wait,pool_circuit_breaker}` and `file_search_key` (§11, §12).
+Defaults live in `config.py` and `config.example.yaml`. Secrets never logged
 (`key_id = sha256(key)[:8]`).
 
 ## 5. Integration guide (external consumers)
@@ -160,22 +171,22 @@ uv add gemini-router      # PyPI
 Service-style consumption (no Python): REST `POST /v1/complete`, `GET /v1/quota` on the
 gemini-mcp daemon (localhost:8790, bearer) — same ledger, same rules.
 
-## 6. Extraction mapping from tldr-digest/src/llm.py
+## 6. Scope and boundaries
 
-| tldr-digest | router | Change |
-|---|---|---|
-| `DEFAULT_MODEL_PRIORITY`/`llm_model_priority` | `config.chain` | Gemini-only in v1; groq/openrouter stay in tldr until a provider abstraction is justified |
-| `_resolve_models`/`_list_models`/`_best_available` | `routing.resolve_chain` | + refresh interval, + preview-slot heuristics |
-| `RETRYABLE_STATUS`/`MODEL_SWITCH_STATUS`/`_parse_retry_after`/backoff | `routing` | ported as-is |
-| `Provider.can_call/register_call` (in-memory) | `ledger` queries | persistent, per key×model, + TPM |
-| `_call_gemini` | `gemini.generate` | async httpx, thinking_level, usageMetadata accounting |
-| `extract_json` | `gemini.extract_json` | ported as-is |
-| `complete_json` | `complete(output_format="json")` | superset |
+The router serves the Gemini API only: model resolution (`listModels`), quota accounting,
+key rotation, File Search and Files API pass-through. Other providers stay outside this
+package. Status taxonomy, `Retry-After` parsing, backoff/jitter and `extract_json` are
+implemented here; a provider abstraction is not part of the public API. The blocking
+facade and the native-Gemini proxy let synchronous and non-Python callers use the same
+ledger without duplicating routing rules.
 
 ## 7. Versioning & CI
 
-SemVer; tags `v*`; gemini-mcp pins a tag. CI: ruff + pytest (respx mocks, no network) on
-push/PR. Conventional Commits.
+SemVer; tags `v*`; `gemini-mcp` pins a tag. CI: ruff + pytest (respx mocks, no network) on
+push/PR. Conventional Commits. Release artifacts: `gemini-router` on PyPI (library +
+CLI) and `gemini-router` on npm (zero-dependency HTTP helper in `npm/`). Both publish from
+the tagged commit; the tag, `pyproject.toml` and `npm/package.json` carry the same
+version.
 
 ## 8. File input (Files API)
 
@@ -206,51 +217,28 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
   switching transports cannot help a revoked credential, and the operator needs the cause
   in front of them, not a generic upload failure.
 - **PDF-containing jobs use text's model/key tiers.** This includes opt-in
-  Lite/Gemma overflow, quota and wait rules. Image/audio/video-only jobs retain the
-  historical chain-only policy. Known 400/500 file refusals are remembered per
+  Lite/Gemma overflow, quota and wait rules. Image/audio/video-only jobs use the
+  chain-only policy. Known 400/500 file refusals are remembered per
   media × model × key and skipped on later requests. An optional
   `file_capable_models:` allowlist may narrow models by media class. One key's
   refusal never erases the evidence that another key read a PDF.
 
-  **Two sources, deliberately kept apart** (this repo's rule, owner, 2026-10-11):
+  Capability facts are per media × model × key: PDF via `file_data` follows the normal
+  text routing policy (chain, Lite/Gemma overflow, per-key quotas and waits), while
+  image/audio/video-only requests stay on the chain. An optional
+  `file_capable_models:` allowlist narrows models by media class; learned 400/500
+  refusals narrow incompatible candidates. `countTokens` measures price, not capability:
+  a successful count does not prove `generateContent` accepts the part. The scheduled
+  `capability-check.yml` runs a bounded `generateContent` canary and verifies content in
+  the answer; `tariff-drift.yml` only counts. Drift raises an alert for review and does
+  not change production gates automatically. A quota-drained chain reports the key that
+  cannot serve file-capable models instead of asking for a re-upload.
 
-  *Practice* — measured 2026-10-11 on two keys, matrix in
-  gemini-mcp `docs/worklog/archive/2026.10.11-remaining-work/plan.md` §E: PDF via `file_data` →
-  HTTP 500 on `gemini-3.5-flash-lite`, HTTP 400 on `gemini-3-flash-preview`, OK on
-  `gemini-3.6-flash`; PNG via `file_data` → OK on lite and preview, 400 on
-  `gemma-4-31b-it`, whose inline-image path works. Historical gate excluded
-  all file overflow, but the owner later chose **PDF routing like text**: same
-  chain, Lite/Gemma overflow preference, per-key quotas and wait rules for PDFs.
-  Other file-only requests retain their former tier policy. Explicit allowlists
-  and per-key learned 400/500 refusals still narrow incompatible candidates.
-
-  *Official* — `ai.google.dev` model pages (fetched 2026-10-11) list PDF as a supported
-  input for `gemini-3.5-flash-lite`; the Gemma 4 card lists text and images. The docs and
-  practice disagreed for lite + PDF on 2026-10-11, and both dated statements stay
-  here on purpose. On 2026-10-12 **two independent keys** (new VPS and existing CI)
-  each read the hidden PDF code on Lite, while Gemma/PNG returned HTTP 500 on both.
-  This is content-verified drift. The owner subsequently approved PDF using the
-  normal text routing policy, with no more probing of the third key. The gateway
-  still marks unrequested Lite/Gemma with ⚠️ when they serve a request. Evidence:
-  `docs/worklog/archive/2026.10.12-third-key-capability-probe/` and
-  `docs/worklog/archive/2026.10.11-capability-canary/`.
-
-  Corollary for measurement: **`countTokens` is lenient** — it accepted a PDF part for lite
-  and preview while `generateContent` refused it, so a successful count is a price, never a
-  capability proof. The scheduled `capability-check.yml` therefore runs a bounded
-  generateContent canary on a CI key and verifies a hidden PDF marker/image color in
-  the answer (not just HTTP 200), separate from the free `tariff-drift.yml` count.
-  Drift is an alert for review, never an automatic change to the production gates;
-  see this repo's `docs/worklog/archive/2026.10.11-capability-canary/` for its case matrix.
-
-  Companion fix (same day): a quota-drained chain no longer tells the caller to re-upload
-  the file under another key — that message now appears only when the key itself cannot
-  serve the file-capable models.
 - **Token estimate is script-aware.** `estimate_tokens` classifies characters and divides
   each class by its own ratio, because one divisor cannot serve mixed text: Latin prose
-  runs ~5.4 chars/token, Cyrillic ~1.7, digits ~1.8. The old `len // 4` under-estimated
-  Russian by ~40%, and under-estimating is what lets the TPM gate pass and the provider
-  answer 429. Inputs above `sample_chars` are estimated from a scaled head+tail sample,
+  runs ~5.4 chars/token, Cyrillic ~1.7, digits ~1.8. A single `len // 4` divisor
+  under-estimates Russian, which lets the TPM gate pass and the provider answer 429.
+  Inputs above `sample_chars` are estimated from a scaled head+tail sample,
   so cost stays flat at ~5 ms regardless of document size. Setting `chars_per_token`
   restores the single-divisor behaviour.
 - **One `listModels` call, not one per key.** The model list is a property of the
@@ -260,7 +248,8 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
   wizard. A key is never marked dead by a failed `listModels` — refusing a key is
   `generateContent`'s job, and one key's failure says nothing about the others.
 - Ledger statuses: `planned|ok|quota|http4xx|http5xx|network|blocked|skipped`;
-  RPD-conservative set = `ok,quota,http5xx,blocked` plus in-flight `planned` rows (D3).
+  RPD-conservative set = `ok,quota,blocked` plus in-flight `planned` rows (D3);
+  `http5xx` is overload and does not spend RPD.
   An in-flight request counts as spent so processes sharing one state file cannot all
   clear the day's gate; rows older than `planned_ttl_s` are abandoned attempts and stop
   counting, so a caller that died mid-request does not eat a day's budget forever.
@@ -276,15 +265,15 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
 
 ## 10. Keys and transports (`keyauth`)
 
-Google issues two shapes of Gemini API key today — classic `AIzaSy…` (Standard, Cloud
-Console) and newer `AQ.…` (Auth, AI Studio) — and has changed more than once which surface
-accepts which shape or transport. The library therefore does not assume: every provider
+Google issues two shapes of Gemini API key — classic `AIzaSy…` (Standard, Cloud Console)
+and `AQ.…` (Auth, AI Studio) — and the accepted transport depends on the surface. The
+library does not assume a shape: every provider
 call goes through `keyauth`, which carries an ordered transport list and starts with the
 one that last worked for that key.
 
 | transport | wire form | when |
 |---|---|---|
-| `header` (default) | `x-goog-api-key: <key>` | everything the library did before — the common path adds no calls |
+| `header` (default) | `x-goog-api-key: <key>` | the common path; adds no calls |
 | `query` | `?key=<key>` | fallback for surfaces that refuse the header |
 | `bearer` | `Authorization: Bearer <key>` | fallback for surfaces that expect a token |
 
@@ -293,7 +282,7 @@ Rules:
   transport; a 400/403 does so only when its body talks about keys/credentials, so a
   model-permission 403 still means "switch model" and costs nothing extra.
 - **The winner is remembered per key** (process-local, keyed by fingerprint): after one
-  rotation a key costs exactly one request per call, as before.
+  rotation a key costs exactly one request per call.
 - **A leaked-key block is never rotated** — see §9 — and `probe_key()` reports it plainly.
 - `probe_key(key, base_url)` (sync, free: `listModels`) is the same logic for CLIs, so
   `keys add` / `keys list --check` show the transport the daemon will use. No second
@@ -314,7 +303,8 @@ transport errors; blocked/truncated answers are candidate failures and cannot en
 Stream retries reserve separate calls and recheck gates. Interrupted/cancelled streamed
 attempts count conservatively as `blocked` in daily and sliding-window quotas, with an
 interruption note. This existing status keeps older processes sharing the ledger accurate.
-Cancellation propagates after resolving its reservation. Non-streaming APIs are unchanged.
+Cancellation propagates after resolving its reservation; non-streaming calls use the
+same ledger rules.
 
 ## 11. Native Gemini API pass-through (`gemini-router proxy`)
 
@@ -415,23 +405,23 @@ duplicated — the proxy only maps its policy onto the walk's inputs:
   rewrites and keeps the caller's landing key.
 - when every pair is day-drained the head candidate is forwarded anyway — the provider
   stays the source of truth and its own 429 body reaches the client untranslated.
-- **a live 429/503 continues the same walk.** The ledger only sees traffic that went
-  through the router; a key drained out-of-band looks fresh until the provider answers
-  429. That answer (or a 503 overload) cools the pair down (429 via the usual taxonomy,
-  503 for `OVERLOAD_COOLDOWN_S` seconds) and the same request re-runs the walk — next
-  key, then next tier — up to `WALK_RETRIES` further candidates before the last provider
-  error is forwarded. Only an unbound, buffered `generateContent` walks on (a pinned call
-  has no alternative; a streamed body cannot be replayed). Every upstream attempt is
-  planned and resolved in the ledger: retried attempts spent real provider quota.
+- **a live 429/503 updates provider truth and continues the same walk.** A 429/503
+  benches its exact `(key, model)` pair in `pair_state` (§12) and the walk picks the next
+  unvisited candidate — next key, then next tier — up to `_walk_bound()` further
+  candidates. Minute-scale gates are waited out; when every pair is benched the proxy
+  returns a local `429 + Retry-After`. Only an unbound, buffered `generateContent` walks
+  on (a pinned call has no alternative; a streamed body cannot be replayed). Each
+  upstream attempt is planned and resolved in the ledger.
 
 `strict` is the default because of what the client actually sends: `file-search` asks for
 its own hardcoded `gemini-2.5-flash`, which the router's keys cannot serve, so honouring
 the request would fail every query. The chain exists precisely to answer "which model can
 take this request right now", and the caller's model id is a default, not a requirement.
 
-Every model-path response carries `x-router-model` and `x-router-key-id`, so a caller's
-own run log can record which pair served it without correlating against this proxy's
-audit stream by time.
+Every response carries `x-router-model`, `x-router-key-id` (model paths),
+`x-router-version`, `x-router-job`, `x-router-trace`, `x-router-request-id` and
+`x-router-traceparent`, so a caller's own run log can record the serving pair and its
+correlation identity without matching the proxy's audit stream by time (§13).
 
 ### 11.7 Idempotency and retries
 
@@ -461,31 +451,14 @@ Loopback only: reach it through an SSH tunnel. The service is stateless apart fr
 shared ledger, so several processes (and the CLI) may run against one `state.db`.
 Sizing: stdlib `http.server`, no new dependencies, `MemoryMax=128M` is ample.
 
-## 12. Provider truth and request identity (v0.11)
+## 12. Provider truth and request identity
 
 ### 12.1 The principle
 
-`calls` is a *forecast* of quota usage. The provider's answer is the *measurement*.
-On any 429/503 the measurement must immediately outrank the forecast for the exact
-`(key_id, model)` pair, for the current request and for every future request until the
-provider's own reset time. Three independent defects broke this before v0.11:
-
-1. `_quota_cooldown()` rebuilt an `httpx.Response` from the body alone, discarding the
-   upstream `Retry-After` header. `_classify()` then defaulted to 60 s and the code took
-   `min(next_PT_midnight, now + 65)` — a **daily** verdict expired after 65 seconds.
-2. The pass-through's walk called `choose()` from scratch on every hop, with no memory
-   of pairs already tried. `pick_pair` also returned `reason="wait"` pairs that the
-   proxy fired immediately (the library's wait loop was never used on this path).
-   With `WALK_RETRIES=16` and 12 real pairs, one request could hit the same pair twice;
-   three concurrent client requests produced 48 upstream 429s in ten seconds on
-   2026-10-21, of which only three reached clients.
-3. `RPD_STATUSES` included `http5xx`, so a 503 overload storm silently consumed the
-   daily budget in the ledger. `gemini-router quota` then showed `0/20` while a direct
-   probe with the same key answered 200.
-
-Every key belongs to a **separate account**: per-key×model isolation is the correct
-model. There is no shared project bucket to compensate for; the 2026-10-21 event was a
-short provider-side capacity blip plus the amplification defects above.
+`calls` is a *forecast* of quota usage. The provider's answer is the *measurement*. On
+any 429/503 the measurement outranks the forecast for the exact `(key_id, model)` pair,
+for the current request and for every future request until the provider's own reset time.
+Every key belongs to a separate Google account, so isolation is per key × model.
 
 ### 12.2 `feedback.py` — one parser, one writer
 
@@ -493,55 +466,129 @@ short provider-side capacity blip plus the amplification defects above.
 
 | Input | Result |
 |---|---|
-| 429 + `quotaId: ...PerDay...` | `kind="day"`, `until_ts` = next PT midnight + 30 s. `Retry-After` is recorded but **never caps** the reset. |
+| 429 + `quotaId: ...PerDay...` | `kind="day"`, `until_ts` = next PT midnight + 30 s. `Retry-After` is recorded and never caps the reset. |
 | 429 + `quotaId: ...PerMinute...` | `kind="minute"`, bench = `Retry-After + buffer` (floor 1 s). |
 | 429, no quota details | `kind="minute"`, `unconfirmed=True`, bench = `max(Retry-After + buffer, throttle_min_s=60)`, capped at `throttle_max_s=900`. |
-| 503/502 | `kind="overload"`, bench = `overload_cooldown_s=60`. |
+| 503/502 | `kind="overload"`, bench = `overload_cooldown_s=60`; no RPD spend. |
 | anything else | `kind="none"`. |
 
 `Retry-After` accepts delta-seconds and HTTP-dates; `retryDelay` / "Please retry in Ns"
 and `quotaId`/`quotaMetric`/`quotaValue` are extracted from arbitrary JSON shapes.
 
-`QuotaTruth.apply()` upserts `pair_state` and **mirrors** the decision into `cooldowns`
-(older library builds read only that table). Repeated unexplained 429s (`promote_hits=3`
-inside `promote_window_s=300`) escalate to a day block. A `2xx` calls
-`clear_pair_state()` — a success proves the pair is available again.
-
-`RPD_STATUSES = ("ok", "quota", "blocked")`: 429 counts conservatively, 5xx does not.
+`QuotaTruth.apply()` upserts `pair_state` (including `job`, `trace_id`, `initiator` and
+`version`) and mirrors the decision into `cooldowns`, which older readers use. Repeated
+unexplained 429s (`promote_hits=3` inside `promote_window_s=300`) escalate to a day
+block. A `2xx` calls `clear_pair_state()`; success proves the pair is available.
+`RPD_STATUSES = ("ok", "quota", "blocked")`.
 
 ### 12.3 Selection, waiting and the circuit breaker
 
 - `gates_from(..., provider_state=...)` sets `rpd_left=0` for a live `day` verdict and a
   waitable `cooldown`/`wait_s` for `minute`/`overload`. Provider truth is read from the
-  same `gate_snapshot` query as the counters (one extra table, no extra round trips).
-- `pick_pair(..., exclude=visited)` skips pairs already tried **in this request**. When
-  no clean candidate remains and provider verdicts exist, it returns
-  `reason="throttled"` with the shortest reset, not a fake "fresh" pair.
+  same `gate_snapshot` query as the counters.
+- `pick_pair(..., exclude=visited)` skips pairs already tried in this request. When no
+  clean candidate remains and provider verdicts exist, it returns `reason="throttled"`
+  with the shortest reset.
 - `FileSearchRouting.choose()` returns a `Selection` (`state` = `ok` / `wait` /
-  `throttled` / `exhausted`) instead of a bare 2-tuple.
-- The proxy waits out `state=="wait"` when `wait_s <= wait.max_s` (`proxy.walk_wait`),
+  `throttled` / `exhausted`).
+- The proxy waits out `state=="wait"` when `wait_s <= wait.max_s` (`proxy.walk_wait`)
   and answers locally with `429 + Retry-After` on `state=="throttled"` when
   `proxy.pool_circuit_breaker` is on. A purely counter-based `exhausted` state still
   asks the provider once — it is the authority.
 
-### 12.4 Identity: version, initiator, comment
+### 12.4 Identity and annotations
 
-`context.RequestContext` is threaded through the proxy and the library. Every `calls`
-row gains `version`, `initiator`, `comment`, `quota_id`, `signal_kind` (additive schema
-v3; `initiator` is backfilled from `source` on old databases). `notes` stores
-standalone annotations; `note` (CLI + `POST /v1/note`) and `notes` (`GET /v1/notes`)
-have **no provider call and no quota effect**.
+`context.RequestContext` is threaded through the proxy and the library. Every `calls` row
+carries `version`, `initiator`, `comment`, `request_id`, `job`, `trace_id`, `step`,
+`quota_id`, `signal_kind` and the hop/byte/method/path fields. `notes` stores standalone
+annotations and job lifecycle events. `note` (CLI + `POST /v1/note`), `notes`
+(`GET /v1/notes`) and the job endpoints (§13) make no provider call and have no quota
+effect. A `comment` is arbitrary text: stored and logged, never used for routing and
+never sent upstream.
 
-Headers consumed locally, never forwarded upstream:
-
-```
-X-Router-Initiator: tldr-digest       (alias: X-Router-Source)
-X-Router-Comment: free text           (alias: X-Router-Note; percent-encoded if non-ASCII)
-X-Router-Request-Id: digest-20261028
-```
-
-Audit output is logfmt: `event=request v=0.11.0 rid=... initiator=... comment=...
+`CLIENT_CONTEXT_HEADERS` lists every router-only header; they are stripped before an
+upstream request. Audit output is one-line logfmt:
+`event=request v=<version> rid=... job=... trace=... step=... initiator=... comment=...
 key=... model=... status=...`. `event=startup` carries the version, config and state
-path; `event=provider_feedback` carries the parsed signal; `event=note` carries the
-annotation; `event=pool_throttled` marks a locally answered 429. `/healthz` and all CLI
-tables show the running version.
+path; `event=provider_feedback` the parsed signal; `event=note` an annotation;
+`event=job` a lifecycle change; `event=pool_throttled` a locally answered 429.
+`/healthz` and all CLI tables show the running version.
+
+## 13. Job / trace correlation
+
+### 13.1 Model
+
+A **job** identifies one target activity (`digest-2026-10-28`, `mcp-session-…`). A
+**trace** identifies one execution of that job; retries use a new trace and stay in the
+job. `step` names a stage inside the execution, `request_id`/`span_id` identify one
+logical request, and `hop` counts upstream attempts inside its selection walk. All
+records of an activity — calls, hops, provider verdicts, cooldowns, notes and lifecycle
+events — share `job`. A client that sends no job gets `<initiator>@<UTC date>`; a client
+that sends no trace uses the job as its trace.
+
+### 13.2 Wire format
+
+Request headers, consumed locally and never forwarded upstream:
+
+```
+X-Router-Initiator: tldr-digest          (aliases: X-Router-Source)
+X-Router-Job: digest-2026-10-28          (aliases: X-Router-Job-Id)
+X-Router-Trace: 7f3a9c2e                 (aliases: X-Router-Trace-Id)
+X-Router-Step: prefilter                 (aliases: X-Router-Stage)
+X-Router-Request-Id: digest-20261028-001 (aliases: X-Router-Span)
+X-Router-Comment: free text              (aliases: X-Router-Note)
+X-Router-Parent-Span: <16 hex>           (link a child request to its parent)
+traceparent: 00-<32 hex>-<16 hex>-01     (W3C Trace Context)
+tracestate / baggage: forwarded to logs only
+```
+
+Values are ASCII; percent-encoded text is decoded for the audit trail, identifiers are
+capped at 128 characters and comments at 500. `RequestContext.from_headers()` parses
+`traceparent` into `trace_id`/`parent_span`; `make_traceparent()` emits the response
+header. Python callers set `RouterRequest.job`, `.trace_id`, `.step`, `.initiator`,
+`.comment`.
+
+Response headers on every forwarded path: `x-router-version`, `x-router-job`, `x-router-trace`,
+`x-router-request-id`, `x-router-traceparent`; model paths also carry `x-router-model`
+and `x-router-key-id`.
+
+### 13.3 Storage (schema v4)
+
+`jobs(job PK, first_ts, last_ts, finished_ts, status, initiator, trace_id, version,
+comment, calls, ok, refusals, quota_429, models JSON, keys JSON)` is created and updated
+by `_job_touch()` on every call, by `job_start()` / `job_finish()` and by `_job_count()`
+on resolution. `calls` gains `job`, `trace_id`, `step`, `hop`, `requested_model`,
+`request_bytes`, `response_bytes`, `method`, `path`, `parent_span`; `notes` gains `job`,
+`trace_id`, `step`, `event` (`note` | `job_start` | `job_finish`); `pair_state` gains `job`,
+`trace_id`. Indexes cover `(job, ts)`, `(trace_id, ts)`, `(step, ts)`, `(initiator, ts)`,
+`request_id` and `notes(job, ts)`. All columns are nullable and added in place; existing v1–v3
+databases migrate on open. Read APIs: `calls_tail(...)`, `notes_tail(...)`,
+`job_summary()`, `jobs_tail()`, `job_calls()`.
+
+### 13.4 HTTP endpoints
+
+| endpoint | method | purpose |
+|---|---|---|
+| `/v1/job` | POST | `{"action":"start|finish","job":…,"status":"done|failed","trace":…,"comment":…}` — lifecycle event + counters |
+| `/v1/jobs` | GET | `?n=` — recent activities with status and counters |
+| `/v1/job` | GET | `?id=…&n=` — summary, lifecycle events and every call of one activity |
+| `/v1/note` | POST | `{"comment":…,"job":…,"initiator":…}` — annotation, no provider call |
+| `/v1/notes` | GET | `?n=&job=` — annotations and job events |
+| `/v1/calls` | GET | `?n=&job=&trace=&step=&initiator=&model=&status=&source=&request_id=` — audit rows |
+
+All require the proxy token. `/healthz` is open and reports the version.
+
+### 13.5 CLI and npm
+
+```bash
+gemini-router job-start digest-2026-10-28 --initiator tldr-digest --trace 7f3a9c2e
+gemini-router jobs -n 20
+gemini-router job digest-2026-10-28 --json
+gemini-router job-finish digest-2026-10-28 --status done
+gemini-router calls --job digest-2026-10-28 --step prefilter --wide
+gemini-router notes --job digest-2026-10-28
+```
+
+The npm package `gemini-router` exports `createContext`, `headers`, `note`, `jobStart`,
+`jobFinish`, `jobs`, `jobGet`, `calls` and `routerFetch`. It has no runtime dependencies
+and only calls the HTTP endpoints above; see `npm/README.md`.

@@ -1,0 +1,52 @@
+{
+  "name": "gemini-router",
+  "version": "0.12.0",
+  "description": "Zero-dependency client helpers for gemini-router job/trace correlation, annotations and the native Gemini pass-through proxy",
+  "license": "MIT",
+  "author": "vernikr",
+  "type": "module",
+  "main": "./index.cjs",
+  "module": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js",
+      "require": "./index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "index.cjs",
+    "index.d.ts",
+    "lib.cjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "keywords": [
+    "gemini",
+    "router",
+    "quota",
+    "trace",
+    "job",
+    "observability",
+    "w3c-trace-context"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vernikr/gemini-router.git",
+    "directory": "npm"
+  },
+  "homepage": "https://github.com/vernikr/gemini-router#readme",
+  "bugs": {
+    "url": "https://github.com/vernikr/gemini-router/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

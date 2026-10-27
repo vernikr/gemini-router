@@ -1,12 +1,12 @@
 [project]
 name = "gemini-router"
-version = "0.11.0"
-description = "Quota-aware Gemini Flash router: cascading fallback, per-key/model RPD/RPM/TPM ledger (SQLite WAL), key pool, wait policy, CLI"
+version = "0.12.0"
+description = "Quota-aware Gemini Flash router: cascading fallback, per-key/model RPD/RPM/TPM ledger (SQLite WAL), provider-truth feedback, job/trace audit, CLI and native Gemini pass-through proxy"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "vernikr" }]
-keywords = ["gemini", "router", "quota", "rate-limit", "llm", "mcp"]
+keywords = ["gemini", "router", "quota", "rate-limit", "llm", "mcp", "tracing"]
 dependencies = [
     "httpx>=0.27",
     "pydantic>=2.7",
@@ -22,6 +22,11 @@ dev = [
     "ruff>=0.6",
 ]
 
+[project.urls]
+Homepage = "https://github.com/vernikr/gemini-router"
+Repository = "https://github.com/vernikr/gemini-router"
+Changelog = "https://github.com/vernikr/gemini-router/blob/main/CHANGELOG.md"
+
 [project.scripts]
 gemini-router = "gemini_router.cli:main"
 
@@ -31,6 +36,23 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gemini_router"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/gemini_router",
+    "tests",
+    "docs",
+    "scripts",
+    "packaging",
+    "npm",
+    ".github/workflows",
+    "README.md",
+    "CHANGELOG.md",
+    "AGENTS.md",
+    "config.example.yaml",
+    "pyproject.toml",
+    "uv.lock",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

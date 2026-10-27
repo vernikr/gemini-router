@@ -1,5 +1,6 @@
-# Example config for gemini-router 0.11.0. Secrets come from the environment only.
-# See docs/SPEC.md §12 for the semantics of the feedback block.
+# Example config for gemini-router 0.12.0. Secrets come from the environment only.
+# The feedback block controls provider-truth benches (docs/SPEC.md §12); job/trace
+# correlation needs no config — clients send X-Router-* headers (§13).
 router:
   chain: [gemini-3.8-flash, gemini-3.6-flash, gemini-3-flash-preview]
   overflow_tiers: [gemini-3.5-flash-lite, gemma-auto]

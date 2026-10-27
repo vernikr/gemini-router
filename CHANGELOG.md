@@ -1,41 +1,59 @@
 # Changelog
 
-## 0.11.0 — provider truth, bounded walks, request identity
-
-### Fixed
-- A confirmed daily 429 now blocks the `(key, model)` pair until the next Pacific-time
-  reset. Previously `min(midnight, now + Retry-After + 5)` reduced it to ~65 seconds.
-- Upstream `Retry-After` (delta-seconds **and** HTTP-date) is preserved; `retryDelay`
-  and quota metadata are parsed from the error body; `quota_id` lands in the audit row.
-- The pass-through walk no longer re-selects pairs already tried in the same request.
-  When every pair is benched by the provider it answers locally with
-  `429 + Retry-After` instead of replaying refusals (2026-10-21: 48/10 s → ≤12 total).
-- The proxy now respects minute-scale waits (`proxy.walk_wait`) instead of firing at a
-  cooling pair; a `2xx` clears the provider block for that pair.
-- `503/502` overloads no longer count as RPD spend — an overload storm no longer fakes
-  an exhausted day in `gemini-router quota`.
-- The library path applies the same provider truth on 429 (no more in-place retries of
-  an unexplained refusal) while still waiting out a confirmed short minute quota.
+## 0.12.0 — job/trace correlation, npm client
 
 ### Added
-- `feedback.py`: `parse_provider_signal`, `ProviderSignal`, `QuotaTruth` — one place
-  where a provider answer becomes durable ledger state. `pair_state` (schema v3) is the
-  authority over the counters; `cooldowns` is mirrored for older readers.
-- `context.py`: `RequestContext`, logfmt `audit_line`, `router_version`. Every audit row
-  and log line carries version, initiator and an arbitrary behaviour-free comment.
+- `context.RequestContext` carries `job`, `trace_id`, `step`, `span_id`, `parent_span`
+  and W3C `traceparent` support. Client headers: `X-Router-Job`, `X-Router-Trace`,
+  `X-Router-Step`, `X-Router-Initiator`, `X-Router-Request-Id`, `X-Router-Comment`,
+  `traceparent` (aliases listed in `CLIENT_CONTEXT_HEADERS`).
+- Schema v4: `jobs` table with per-activity counters/status; `job`, `trace_id`, `step`,
+  `hop`, `requested_model`, `request_bytes`, `response_bytes`, `method`, `path` and
+  `parent_span` on `calls`; job/trace/step on `notes` and `pair_state`. All columns are
+  additive, with in-place migration of existing databases.
+- `POST /v1/job` (`action=start|finish`, `status=done|failed`), `GET /v1/jobs?n=`,
+  `GET /v1/job?id=…&n=…`; job-aware `POST /v1/note`, `GET /v1/notes`, `GET /v1/calls`.
+  Response headers include `x-router-version`, `x-router-job`, `x-router-trace`,
+  `x-router-request-id`, `x-router-traceparent`.
+- CLI: `jobs`, `job`, `job-start`, `job-finish`; `note --job --trace`, `notes --job`,
+  `calls --job --trace --step --wide`.
+- Library: `RouterRequest.job`, `.trace_id`, `.step`; job/trace fields in provider
+  feedback logs and `pair_state`.
+- npm package `gemini-router`: zero-dependency ESM/CJS helpers — `createContext`,
+  `headers`, `note`, `jobStart`, `jobFinish`, `jobs`, `jobGet`, `calls`, `routerFetch`.
+  Published from [`npm/`](npm/).
+- `event=job` structured log lines, `requested_model`, request/response byte counts and
+  hop counters in the audit trail.
+
+### Docs
+- `README.md`, `docs/SPEC.md`, `config.example.yaml` and module comments describe the
+  current behaviour.
+
+## 0.11.0 — provider truth, bounded walks, request identity
+
+### Added
+- `feedback.py`: `parse_provider_signal`, `ProviderSignal`, `QuotaTruth`. A provider
+  answer becomes durable `pair_state`; `cooldowns` mirrors it for older readers.
+- `context.py`: `RequestContext`, logfmt `audit_line`, `router_version`. Audit rows and
+  logs carry version, initiator and a behaviour-free comment.
 - `X-Router-Initiator` / `X-Router-Comment` / `X-Router-Request-Id` headers (stripped
   before upstream), `RouterRequest.initiator` / `.comment`, `calls --wide`,
   `calls --initiator`.
 - `gemini-router note` / `notes` CLI and `POST /v1/note`, `GET /v1/notes`: annotations
-  with no provider call and no quota effect. Example: `gemini-router note "начинаем
-  тестирование новой версии" --initiator ops-audit`.
+  with no provider call and no quota effect.
 - `event=startup/provider_feedback/note/pool_throttled/request` structured logs;
   `/healthz` reports the version.
-- Config: `feedback.*` (throttle floors/ceilings, promotion, overload cooldown),
-  `proxy.default_initiator`, `proxy.walk_wait`,
-  `proxy.pool_circuit_breaker`. See `config.example.yaml`.
+- Config: `feedback.*`, `proxy.default_initiator`, `proxy.walk_wait`,
+  `proxy.pool_circuit_breaker`.
 
-### Notes
-- Schema v3 is additive and backwards compatible: v1/v2 databases migrate in place,
-  old library builds keep reading `calls` and `cooldowns`.
-- 220 tests pass (23 new). All HTTP is mocked; no real keys are used in CI.
+### Behaviour
+- A confirmed daily 429 blocks the `(key, model)` pair until the next Pacific-time
+  reset. `Retry-After` (delta-seconds and HTTP-date), `retryDelay` and quota metadata
+  are parsed; `quota_id` lands in the audit row.
+- A pass-through walk skips pairs already visited in the same request, waits out
+  minute-scale gates and answers locally with `429 + Retry-After` when every pair is
+  benched. `2xx` clears a provider block.
+- `503/502` overloads are not RPD spend. The library path applies the same provider
+  truth on 429 while waiting out confirmed short minute quotas.
+- Schema v3 (`pair_state`, identity columns) is additive; v1/v2 databases migrate in
+  place and older readers keep reading `calls` and `cooldowns`.

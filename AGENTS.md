@@ -6,7 +6,9 @@ with functional changes). Repo-specific rules:
 
 ## Context
 - Contract: `docs/SPEC.md`; system-wide requirements/architecture/plan live in
-  `vernikr/gemini-mcp/docs/02-requirements.md` + `docs/03-architecture.md`. Keep SPEC.md true to the code.
+  `vernikr/gemini-mcp/docs/02-requirements.md` + `docs/03-architecture.md`. Keep
+  SPEC.md, README.md and module docstrings true to the code, in present tense; release
+  history belongs in `CHANGELOG.md`.
 - This library MUST stay dependency-light (`httpx`, `pydantic`, `rich`, stdlib) and
   MCP-agnostic — it is consumed by gemini-mcp, tldr-digest (sync facade) and outsiders.
 - Mixed-version consumers share the ledger: use spending statuses understood by older
@@ -18,7 +20,7 @@ with functional changes). Repo-specific rules:
 
 ## Commands
 - `uv sync` · `uv run pytest` · `uv run ruff check src tests`
-- `uv run gemini-router quota|models|calls|prune|doctor`
+- `uv run gemini-router quota|models|calls|jobs|job|note|notes|prune|doctor`
 
 ## Testing & secrets
 - respx-mocked HTTP only (no network, no real keys in CI/fixtures).
@@ -43,6 +45,5 @@ Never write a real key or token into any file here — not even a test fixture, 
 "just for a moment": this repository is public and its sdist ships `tests/`. Fixtures use
 real-looking shapes carrying the marker word `DUMMY`; `scripts/check_secrets.py` runs
 before lint in CI and in the release pipeline and fails on any credential-shaped literal
-without that marker. History: 2026-10-11, two real Gemini keys went into a public test file
-of the sibling repo while the author was writing fixture strings (incident report:
-gemini-mcp `docs/worklog/archive/2026.10.11-secret-in-tests/`).
+without that marker. npm/PyPI/GitHub tokens are passed only through the environment of
+the publishing shell; they never appear in source, config examples or release notes.

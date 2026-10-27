@@ -1,12 +1,10 @@
 name: release
-# Publish on tag v*: test → PyPI via trusted publishing (OIDC — no API token in
-# secrets), same pattern as gemini-mcp/.github/workflows/release.yml. One-time store
-# setup: gemini-mcp docs/09-ci.md §1 (PyPI trusted publisher + a `pypi` environment).
-# Until that is done the `pypi` job fails on tags and nothing else breaks — publish
-# manually and re-run the job for the record.
+# Publish the tagged commit to PyPI and npm. The tag, pyproject.toml and
+# npm/package.json carry the same version; the lockstep guards enforce it.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -16,22 +14,50 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --extra dev
-      - run: python3 scripts/check_secrets.py   # fixtures carry DUMMY, never a live key
+      - run: python3 scripts/check_secrets.py
       - run: uv run ruff check .
       - run: uv run pytest -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm test
+        working-directory: npm
   pypi:
     needs: test
     runs-on: ubuntu-latest
-    environment: pypi                     # matches the PyPI trusted-publisher config
+    environment: pypi
     permissions:
-      contents: read                      # job-level permissions REPLACE workflow-level
-      id-token: write                     # the OIDC handshake with PyPI needs both
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then v="${GITHUB_REF_NAME#v}"; \
+          else v="$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml)"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
       - name: Lockstep guard — pyproject version must equal the tag
-        run: grep -q "^version = \"${GITHUB_REF_NAME#v}\"$" pyproject.toml
-      - run: rm -rf dist && uv build      # dist hygiene: never ship stale artifacts
+        run: grep -q "^version = \"${{ steps.ver.outputs.version }}\"$" pyproject.toml
+      - run: rm -rf dist && uv build
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          skip-existing: true             # re-tag/re-run safe
+          skip-existing: true
+  npm:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - name: Lockstep guard — npm version must equal the PyPI version
+        run: |
+          v="$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml)"
+          test "$(node -p "require('./npm/package.json').version")" = "$v"
+      - run: npm publish --access public
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
