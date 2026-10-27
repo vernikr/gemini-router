@@ -50,7 +50,6 @@ class FeedbackCfg(BaseModel):
     overload_cooldown_s: float = 60.0   # 503 = capacity, not budget
     promote_hits: int = 3               # repeated unconfirmed 429 -> day block
     promote_window_s: float = 300.0
-    circuit_breaker: bool = True        # short-circuit when every pair is blocked
 
 
 class ProxyCfg(BaseModel):

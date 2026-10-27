@@ -175,8 +175,7 @@ provider verdicts emit `event=provider_feedback`, annotations emit `event=note`.
 
 New config keys (all optional, see `config.example.yaml`): `feedback.throttle_min_s`,
 `throttle_max_s`, `buffer_s`, `reset_buffer_s`, `overload_cooldown_s`, `promote_hits`,
-`promote_window_s`, `circuit_breaker`; `proxy.default_initiator`, `walk_wait`,
-`pool_circuit_breaker`. Schema v3 is purely additive — older readers keep working.
+`promote_window_s`; `proxy.default_initiator`, `walk_wait`, `pool_circuit_breaker`. Schema v3 is purely additive — older readers keep working.
 
 Full design: [SPEC §12](docs/SPEC.md#12-provider-truth-and-request-identity-v011).
 

@@ -31,8 +31,8 @@
   тестирование новой версии" --initiator ops-audit`.
 - `event=startup/provider_feedback/note/pool_throttled/request` structured logs;
   `/healthz` reports the version.
-- Config: `feedback.*` (throttle floors/ceilings, promotion, overload cooldown,
-  circuit breaker), `proxy.default_initiator`, `proxy.walk_wait`,
+- Config: `feedback.*` (throttle floors/ceilings, promotion, overload cooldown),
+  `proxy.default_initiator`, `proxy.walk_wait`,
   `proxy.pool_circuit_breaker`. See `config.example.yaml`.
 
 ### Notes

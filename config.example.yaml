@@ -18,7 +18,6 @@ router:
     overload_cooldown_s: 60        # 503 = capacity, not budget
     promote_hits: 3                # unexplained 429s before a day block
     promote_window_s: 300
-    circuit_breaker: true
 
   proxy:
     model_policy: strict
