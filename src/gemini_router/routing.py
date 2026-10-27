@@ -16,6 +16,7 @@ from pathlib import Path
 import httpx
 
 from .config import Config, estimate_tokens, key_id
+from .context import RequestContext, router_version
 from .errors import (
     FileNotReady,
     GeminiHTTPError,
@@ -23,6 +24,7 @@ from .errors import (
     RouterError,
 )
 from .events import RouterEvent
+from .feedback import QuotaTruth
 from .gemini import GeminiClient, UploadedFile, file_parts
 from .ledger import Ledger, iso, pt_midnight_ts
 from .tariffs import media_class
@@ -39,7 +41,12 @@ class RouterRequest:
     max_output_tokens: int | None = None    # None → no cap sent to the provider
     kind: str = "single"                    # single|chunk|consolidate|count
     request_id: str | None = None           # idempotency / cache lookup
-    source: str = "cli"                     # mcp|cli|rest|tldr
+    source: str = "cli"                     # transport/entry point: mcp|cli|rest|filesearch
+    # Who actually asked. Free-form, supplied by the initiator itself; defaults to
+    # `source` so old callers remain attributable. Stored in every ledger row.
+    initiator: str | None = None
+    # Arbitrary operator text. Logged and stored, never used in a routing decision.
+    comment: str = ""
     overflow: str | None = None             # off|lite|lite+gemma; None → cfg.overflow_default
                                             # (FR-C8 stays opt-in: that default is "off")
     wait: bool | None = None                # None → cfg.wait.enabled_default (FR-C13)
@@ -68,28 +75,46 @@ class RouterResult:
 
 def gates_from(cfg: Config, model: str, kid: str, spent: tuple[int, int],
                window: tuple[int, int, float | None], cd: float | None,
-               est_tokens: int, now: float) -> dict:
+               est_tokens: int, now: float, *, provider_state: dict | None = None) -> dict:
     """The gate arithmetic (FR-C2), fed either by the per-pair ledger accessors or by
     a Ledger.gate_snapshot. wait_s>0 means a minute-scale gate (RPM/TPM/cooldown) —
-    waitable per FR-C13; rpd_left==0 means day-scale — never waited."""
+    waitable per FR-C13; rpd_left==0 means day-scale — never waited.
+
+    `provider_state` is the authority: a live 429 with a PerDay quota id sets
+    rpd_left=0 no matter how fresh our counters look. A minute/overload verdict is a
+    waitable cooldown (it also lands in `cooldowns` for older readers).
+    """
     lim = cfg.limits_for(model)
     spent_day, spent_roll = spent
     calls, toks, oldest = window
+    state = provider_state or {}
+    kind = state.get("kind")
+    state_until = state.get("until_ts") or 0.0
+    live = state_until > now
+    day_block = bool(live and kind == "day")
     expire_in = max(0.0, oldest + cfg.window_s - now) if oldest is not None else 0.0
     rpm_wait = expire_in if (lim.rpm and calls >= lim.rpm) else 0.0
     tpm_wait = expire_in if (est_tokens and lim.tpm and toks + est_tokens > lim.tpm) else 0.0
     cd_wait = max(0.0, cd - now) if cd else 0.0
+    if live and kind in ("minute", "overload"):
+        cd_wait = max(cd_wait, state_until - now)
     waits = {"rpm": rpm_wait, "tpm": tpm_wait, "cooldown": cd_wait}
     wait_s = max(waits.values())
     return {"key_id": kid, "model": model,
-            "rpd_left": max(0, lim.rpd - max(spent_day, spent_roll)),
+            "rpd_left": 0 if day_block else max(0, lim.rpd - max(spent_day, spent_roll)),
             "rpd_left_day": max(0, lim.rpd - spent_day),
             "rpd_left_roll": max(0, lim.rpd - spent_roll),
             "rpd_limit": lim.rpd, "rpm_used": calls, "rpm_limit": lim.rpm,
             "tpm_used": toks, "tpm_limit": lim.tpm,
             "rpm_wait_s": round(rpm_wait, 1), "tpm_wait_s": round(tpm_wait, 1),
-            "cooldown_until": cd, "wait_s": round(wait_s, 1),
-            "reason": max(waits, key=waits.get) if wait_s > 0 else None}
+            "cooldown_until": max([x for x in (cd, state_until if live else None) if x],
+                                 default=None),
+            "wait_s": round(wait_s, 1),
+            "reason": max(waits, key=waits.get) if wait_s > 0 else None,
+            "provider_blocked": kind if live and not day_block else ("day" if day_block else None),
+            "provider_reason": state.get("reason") if live else None,
+            "provider_until": state_until if live else None,
+            "provider_hits": state.get("hits") if live else None}
 
 
 def gates_for(cfg: Config, ledger: Ledger, model: str, key: str,
@@ -102,7 +127,8 @@ def gates_for(cfg: Config, ledger: Ledger, model: str, key: str,
                                        now - 86400, now - cfg.planned_ttl_s),
                       ledger.window_usage(kid, model, now - cfg.window_s,
                                           now - cfg.planned_ttl_s),
-                      ledger.cooldown(kid, model, now), est_tokens, now)
+                      ledger.cooldown(kid, model, now), est_tokens, now,
+                      provider_state=ledger.provider_state(kid, model, now))
 
 
 def cache_hash(model: str, req: RouterRequest, mot: int | None,
@@ -159,13 +185,15 @@ class PairChoice:
     key: str | None
     gates: dict | None
     tier: int = 0
-    reason: str = "exhausted"               # ok | wait | exhausted
+    reason: str = "exhausted"               # ok | wait | throttled | exhausted
+    retry_after_s: float | None = None      # for `throttled`: shortest provider reset
 
 
 def pick_pair(cfg: Config, ledger: Ledger, *, overflow: str = "off",
               chain_override: list[str] | None = None, keys: list[str] | None = None,
               avail: dict[str, set[str] | None] | None = None, est_tokens: int = 0,
-              now: float | None = None) -> PairChoice:
+              now: float | None = None,
+              exclude: set[tuple[str, str]] | None = None) -> PairChoice:
     """The same walk `Router.complete` makes — tiers from `tier_plan`, keys from
     `keys_sorted`, gates from `gates_for` — reduced to one up-front answer for callers
     that forward a single request instead of running an attempt loop (the pass-through
@@ -173,12 +201,17 @@ def pick_pair(cfg: Config, ledger: Ledger, *, overflow: str = "off",
 
     `chain_override` substitutes tier 0 (the proxy's `file_search_models`); `keys`
     narrows the pool (resource affinity); `avail` is an optional key_id → listModels
-    filter. Preference: a pair that can run now ("ok"); else the budgeted pair with the
-    shortest minute-scale wait ("wait"); else "exhausted" — day budgets spent everywhere.
+    filter; `exclude` are pairs already tried **in this request** — without it a walk
+    can re-select the same exhausted pair on every hop, which is how 48 identical 429s
+    were produced in ten seconds. Preference: a pair that can run now ("ok"); else the
+    budgeted pair with the shortest minute-scale wait ("wait"); else "throttled" when
+    provider feedback blocked everything (with the shortest reset), else "exhausted".
     """
     now = now or time.time()
     pool = list(keys) if keys is not None else list(cfg.api_keys)
     best_wait: PairChoice | None = None
+    provider_resets: list[float] = []
+    clean_pair_seen = False
     tiers = tier_plan(cfg, overflow=overflow)
     if chain_override:
         tiers[0] = (0, list(dict.fromkeys(chain_override)))
@@ -192,17 +225,35 @@ def pick_pair(cfg: Config, ledger: Ledger, *, overflow: str = "off",
             models = [g] if g else []
         for model in models:
             for key in keys_sorted(cfg, ledger, model, keys=pool, now=now):
+                pair = (key_id(key), model)
+                if exclude and pair in exclude:
+                    continue
                 s = (avail or {}).get(key_id(key))
                 if s is not None and model not in s:
                     continue
                 gates = gates_for(cfg, ledger, model, key, est_tokens, now)
+                if gates["provider_until"]:
+                    provider_resets.append(gates["provider_until"] - now)
                 if gates["rpd_left"] <= 0:
                     continue
+                if not gates["provider_blocked"]:
+                    clean_pair_seen = True
                 if gates["wait_s"] <= 0:
                     return PairChoice(model, key, gates, tier, "ok")
                 if best_wait is None or gates["wait_s"] < best_wait.gates["wait_s"]:
-                    best_wait = PairChoice(model, key, gates, tier, "wait")
-    return best_wait or PairChoice(None, None, None, 0, "exhausted")
+                    best_wait = PairChoice(model, key, gates, tier, "wait",
+                                           retry_after_s=max(0.0, gates["wait_s"]))
+    if not clean_pair_seen and provider_resets:
+        # Every surviving pair is benched by the provider itself. Re-asking Google
+        # would only replay the same 429s; hand the caller a bounded Retry-After.
+        return PairChoice(None, None, None, 0, "throttled",
+                          retry_after_s=max(1.0, min(provider_resets)))
+    if best_wait is not None:
+        return best_wait
+    if provider_resets:
+        return PairChoice(None, None, None, 0, "throttled",
+                          retry_after_s=max(1.0, min(provider_resets)))
+    return PairChoice(None, None, None, 0, "exhausted")
 
 
 def pick_gemma(models: Iterable[str]) -> str | None:
@@ -223,6 +274,7 @@ class Router:
         self.cfg = cfg
         self.ledger = ledger or Ledger(cfg.state_path)
         self.client = client or GeminiClient(cfg)
+        self.truth = QuotaTruth(self.ledger, cfg, now_fn=now or time.time)
         self._sleep = sleep or asyncio.sleep
         self._now = now or time.time
         self._avail: tuple[float, dict[str, set[str] | None]] | None = None
@@ -298,7 +350,8 @@ class Router:
         return gates_from(self.cfg, model, kid,
                           snap["spent"].get((kid, model), (0, 0)),
                           snap["window"].get((kid, model), (0, 0, None)),
-                          snap["cooldown"].get((kid, model)), 0, now)
+                          snap["cooldown"].get((kid, model)), 0, now,
+                          provider_state=snap.get("pair_state", {}).get((kid, model)))
 
     def quota_table(self, now: float | None = None) -> list[dict]:
         """Per key×model budget rows for chain + literal overflow tiers (BR3)."""
@@ -347,7 +400,8 @@ class Router:
         m, key = chosen
         n = await self.client.count_tokens(key, m, prompt)
         row = self.ledger.plan(key_id=key_id(key), model=m, kind="count", est_tokens=n,
-                               request_id=None, source="count")
+                               request_id=None, source="count", initiator="count",
+                               version=router_version())
         self.ledger.resolve(row, "ok", tokens_in=n, tokens_out=0)
         return n
 
@@ -363,6 +417,10 @@ class Router:
         without them keep the historical pin, never send a foreign URI under a key.
         The gateway supplies local sources for both single and packed PDFs."""
         events: list[RouterEvent] = []
+        ctx = RequestContext(initiator=req.initiator or req.source, comment=req.comment,
+                             source=req.source, version=router_version())
+        if req.request_id:
+            ctx.request_id = req.request_id
 
         def emit(stage: str, **kw) -> None:
             ev = RouterEvent(stage=stage, **kw)
@@ -460,7 +518,8 @@ class Router:
                             for original, path in zip(files, file_paths, strict=True):
                                 up = await self.upload_file(
                                     path, mime=original.mime, model=model,
-                                    source=req.source, key=key, sha256=original.sha256)
+                                    source=req.source, key=key, sha256=original.sha256,
+                                    context=ctx)
                                 serving.append(up.with_resolution(original.media_resolution)
                                                if original.media_resolution else up)
                         except (RouterError, httpx.HTTPError):
@@ -481,7 +540,8 @@ class Router:
                              detail={"reason": "key_switch", "files": len(serving)})
                     res, outcome = await self._try_candidate(
                         req, tier, model, key, est, mot, wait_enabled, deadline, emit,
-                        failures, dead_keys, serving if files else None, fhashes, stream)
+                        failures, dead_keys, serving if files else None, fhashes, stream,
+                        context=ctx)
                     if res is not None:
                         res.events = events
                         res.quota_after = self.model_budgets(tried)
@@ -552,7 +612,8 @@ class Router:
                           model: str | None = None, source: str = "cli",
                           display_name: str | None = None, key: str | None = None,
                           overflow: str | None = None, sha256: str | None = None,
-                          ready_timeout_s: float = 30.0) -> UploadedFile:
+                          ready_timeout_s: float = 30.0,
+                          context: RequestContext | None = None) -> UploadedFile:
         """Upload a blob and hand back the provider record, pinned to the key that will
         serve the analysis. The key is chosen the way `complete` would choose it, minus
         keys whose day is spent or which sit in cooldown — uploading a file for a key
@@ -611,8 +672,12 @@ class Router:
                 raise
             kid = key_id(k)
             ms = int((self._now() - t0) * 1000)
-            self.ledger.record_upload(key_id=kid, nbytes=up.size, source=source,
-                                      latency_ms=ms)
+            ctx = context or RequestContext(initiator=source, source=source,
+                                            version=router_version())
+            self.ledger.record_upload(key_id=kid, nbytes=up.size,
+                                      source=ctx.initiator or source, latency_ms=ms,
+                                      initiator=ctx.initiator, comment=ctx.comment or None,
+                                      version=ctx.version)
             return replace(up, sha256=sha256, key_id=kid)
         raise RouterError(f"no key accepted the upload: {last_err}")
 
@@ -697,12 +762,20 @@ class Router:
     def _gates(self, model: str, key: str, est_tokens: int = 0) -> dict:
         return gates_for(self.cfg, self.ledger, model, key, est_tokens, self._now())
 
+    def truth_fallback(self, e: GeminiHTTPError):
+        """Old/foreign exceptions carry no parsed signal — rebuild one from the text."""
+        from .feedback import parse_provider_signal
+        return parse_provider_signal(e.status or 429, {}, str(e), self.cfg,
+                                     now=self._now())
+
     async def _try_candidate(self, req: RouterRequest, tier: int, model: str, key: str,
                              est: int, mot: int | None, wait_enabled: bool, deadline: float,
                              emit: Emitter, failures: list[str], dead_keys: set[str],
                              files: list[UploadedFile] | None = None,
-                             fhashes: list[str] | None = None, stream: bool = False):
+                             fhashes: list[str] | None = None, stream: bool = False,
+                             context: RequestContext | None = None):
         cfg = self.cfg
+        ctx = context or RequestContext(source=req.source, version=router_version())
         kid = key_id(key)
         g = self._gates(model, key, est)
         if g["rpd_left"] <= 0:                                   # day gate — never waited (D9)
@@ -743,8 +816,9 @@ class Router:
             await self._sleep(d)
 
         row_id = self.ledger.plan(key_id=kid, model=model, kind=req.kind, est_tokens=est,
-                                  request_id=req.request_id, source=req.source,
-                                  overflow_tier=tier)
+                                  request_id=ctx.request_id, source=req.source,
+                                  overflow_tier=tier, initiator=ctx.initiator,
+                                  comment=ctx.comment or None, version=ctx.version)
         emit("dispatch", model=model, key_id=kid, detail={"row_id": row_id, "est_tokens": est})
         attempt = 0
         t0 = self._now()
@@ -766,14 +840,37 @@ class Router:
                     # Cannot read (at least) one of these classes: remember per class.
                     for cls in {media_class(f.mime) for f in files}:
                         self._file_incapable.setdefault(cls, set()).add((model, kid))
-                if e.quota_day:                                  # FR-C4: live daily 429
-                    self.ledger.resolve(row_id, "quota", http_status=e.status, latency_ms=ms,
-                                        quota_error=str(e), retry_after_s=e.retry_after)
-                    until = pt_midnight_ts(cfg.quota_day_tz, days_ahead=1)
-                    if e.retry_after is not None:
-                        until = min(until, self._now() + e.retry_after + 5)
-                    self.ledger.set_cooldown(kid, model, until, "rpd_429")
-                    emit("switch", model=model, key_id=kid, detail={"reason": "rpd_429"})
+                if e.status == 429:                    # FR-C4 / SPEC §12: live 429
+                    signal = e.signal or self.truth_fallback(e)
+                    self.ledger.resolve(
+                        row_id, "quota", http_status=e.status, latency_ms=ms,
+                        quota_error=str(e), retry_after_s=signal.retry_after_s,
+                        quota_id=signal.quota_id, signal_kind=signal.kind)
+                    self.truth.apply(signal, key_id=kid, model=model, context=ctx)
+                    # A *confirmed* minute quota with a short, explicit Retry-After is
+                    # worth waiting out on the same pair (FR-C13). Everything else —
+                    # a daily verdict or an unexplained capacity blip — switches away.
+                    if (signal.kind == "minute" and not signal.unconfirmed
+                            and wait_enabled and attempt < cfg.retry.max
+                            and (signal.retry_after_s or 0) <= cfg.wait.max_s
+                            and self._now() < deadline):
+                        attempt += 1
+                        backoff = min(signal.retry_after_s or 0.0,
+                                      max(0.0, deadline - self._now()))
+                        emit("waiting", model=model, key_id=kid, wait_s=round(backoff, 1),
+                             detail={"reason": "http_429", "attempt": attempt})
+                        if stream:
+                            row_id = self.ledger.plan(
+                                key_id=kid, model=model, kind=req.kind, est_tokens=est,
+                                request_id=ctx.request_id, source=req.source,
+                                overflow_tier=tier, initiator=ctx.initiator,
+                                comment=ctx.comment or None, version=ctx.version)
+                        await self._sleep(backoff)
+                        continue
+                    emit("switch", model=model, key_id=kid,
+                         detail={"reason": signal.reason, "signal_kind": signal.kind})
+                    # Never hammer the same pair in place: the provider just told us it
+                    # is out. The walk moves to another key/model instead.
                     return None, "quota"
                 if e.key_rejected:                # dead credentials: drop this key only
                     self._resolve_err(row_id, e, ms)
@@ -805,7 +902,9 @@ class Router:
                             return None, "quota"
                         row_id = self.ledger.plan(
                             key_id=kid, model=model, kind=req.kind, est_tokens=est,
-                            request_id=req.request_id, source=req.source, overflow_tier=tier)
+                            request_id=ctx.request_id, source=req.source, overflow_tier=tier,
+                            initiator=ctx.initiator, comment=ctx.comment or None,
+                            version=ctx.version)
                     await self._sleep(backoff)
                     continue
                 self._resolve_err(row_id, e, ms)
@@ -833,7 +932,9 @@ class Router:
                             return None, "quota"
                         row_id = self.ledger.plan(
                             key_id=kid, model=model, kind=req.kind, est_tokens=est,
-                            request_id=req.request_id, source=req.source, overflow_tier=tier)
+                            request_id=ctx.request_id, source=req.source, overflow_tier=tier,
+                            initiator=ctx.initiator, comment=ctx.comment or None,
+                            version=ctx.version)
                     await self._sleep(backoff)
                     continue
                 self.ledger.resolve(row_id, "blocked" if stream else "network",
@@ -864,6 +965,8 @@ class Router:
             tin = gr.tokens_in if gr.tokens_in is not None else est
             self.ledger.resolve(row_id, "ok", http_status=200, tokens_in=tin,
                                 tokens_out=gr.tokens_out, latency_ms=ms)
+            # Provider truth is symmetric: a success clears an earlier 429/503 block.
+            self.ledger.clear_pair_state(kid, model)
             if h:
                 self.ledger.cache_put(h, req.request_id, model, gr.text, tin, gr.tokens_out)
             emit("ok", model=model, key_id=kid,
@@ -879,5 +982,8 @@ class Router:
     def _resolve_err(self, row_id: int, e: GeminiHTTPError, ms: int) -> None:
         status = ("http5xx" if (e.status or 0) >= 500 else
                   "quota" if e.status == 429 else "http4xx")
+        signal = e.signal
         self.ledger.resolve(row_id, status, http_status=e.status, latency_ms=ms,
-                            quota_error=str(e)[:500], retry_after_s=e.retry_after)
+                            quota_error=str(e)[:500], retry_after_s=e.retry_after,
+                            quota_id=signal.quota_id if signal else None,
+                            signal_kind=signal.kind if signal else None)

@@ -23,6 +23,7 @@ import hmac
 import json
 import re
 import time
+from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlencode, urlparse
 
 import httpx
@@ -31,6 +32,20 @@ from . import keyauth
 from .config import Config, key_id
 from .ledger import Ledger
 from .routing import gates_for, pick_pair
+
+
+@dataclass(frozen=True, slots=True)
+class Selection:
+    """The full verdict of the shared walk, not just a (key, model) pair.
+
+    `state` lets the caller distinguish "send now" from "wait a minute" and from
+    "every pair is blocked by the provider — answer locally with Retry-After".
+    """
+    key_id: str
+    model: str | None
+    state: str = "ok"                  # ok | wait | throttled | exhausted
+    retry_after_s: float | None = None
+    wait_s: float = 0.0
 
 # ---------------------------------------------------------------- path shapes
 STORE_RX = re.compile(r"/v1beta/(fileSearchStores/[^/:?]+)")
@@ -348,8 +363,9 @@ class FileSearchRouting:
             return None
         return None
 
-    def choose(self, requested: str | None, kid_pin: str | None = None) -> tuple[str, str | None]:
-        """(key_id, model) for a model-path request, per `proxy.model_policy` (SPEC §11.6).
+    def choose(self, requested: str | None, kid_pin: str | None = None,
+               exclude: set[tuple[str, str]] | None = None) -> Selection:
+        """Selection for a model-path request, per `proxy.model_policy` (SPEC §11.6).
 
         The walk itself is `routing.pick_pair` — the single selection procedure every
         entry point shares (tiers incl. `overflow_default`, keys by remaining budget,
@@ -360,34 +376,44 @@ class FileSearchRouting:
         - `auto` keeps the caller's model when a key can serve it and falls back to
           the shared walk otherwise; `strict` always walks; `passthrough` never
           rewrites and keeps the key the caller landed on.
+        - `exclude` carries pairs already tried in this request, so a 429 walk cannot
+          keep re-selecting the same exhausted pair.
         """
         policy = self.cfg.proxy.model_policy
         if policy == "passthrough" or not requested:
-            return (kid_pin or self.pin()), requested
+            return Selection(kid_pin or self.pin(), requested)
         keys: list[str] | None = None
         if kid_pin:
             key = self._resolve(kid_pin)
             if key is None:
-                return kid_pin, requested   # the proxy answers the lost key itself
+                return Selection(kid_pin, requested)  # proxy answers the lost key itself
             keys = [key]
         if policy == "auto":
             if requested in self.cfg.chain:
                 # Already a router model: nothing to gain from a rewrite.
-                return (kid_pin or self._richest(requested)), requested
+                return Selection(kid_pin or self._richest(requested), requested)
             probe_kid = kid_pin or self._richest(self.cfg.chain[0] if self.cfg.chain else None)
             probe = self._resolve(probe_kid)
             if probe is not None:
                 available = self.available_models(probe)
                 if available is None or requested in available:
-                    return probe_kid, requested   # unknown availability must not break a query
+                    return Selection(probe_kid, requested)  # unknown availability must not break
         choice = pick_pair(self.cfg, self.ledger,
                            overflow=self.cfg.overflow_default,
                            chain_override=self.cfg.proxy.file_search_models,
-                           keys=keys,
+                           keys=keys, exclude=exclude,
                            now=self._now() if self._now else None)
         if choice.model is None or choice.key is None:
-            # Day budgets spent everywhere: forward the head candidate anyway — the
-            # provider stays the source of truth and answers with its own 429 body.
             cands = self.cfg.proxy.file_search_models or list(self.cfg.chain)
-            return (kid_pin or self.pin()), (cands[0] if cands else requested)
-        return key_id(choice.key), choice.model
+            head = cands[0] if cands else requested
+            if choice.reason == "throttled":
+                return Selection(kid_pin or self.pin(), head, "throttled",
+                                 retry_after_s=choice.retry_after_s or 60.0)
+            # No provider verdict, just spent counters: still ask the provider once —
+            # it is the authority and may have reset out of band.
+            return Selection(kid_pin or self.pin(), head, "exhausted")
+        if choice.reason == "wait":
+            return Selection(key_id(choice.key), choice.model, "wait",
+                             retry_after_s=choice.retry_after_s,
+                             wait_s=choice.gates["wait_s"] if choice.gates else 0.0)
+        return Selection(key_id(choice.key), choice.model, "ok")

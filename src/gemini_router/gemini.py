@@ -32,6 +32,8 @@ from .errors import (
     KeyLeakedError,
     RouterError,
 )
+from .feedback import parse_provider_signal
+from .feedback import parse_retry_after as _parse_retry_seconds
 
 CHUNK = 1 << 20          # upload read size; small enough for a 1 GB box, big enough for LAN
 
@@ -86,12 +88,8 @@ def is_gemini3(model: str) -> bool:
 
 
 def _parse_retry_after(value: str | None) -> float | None:
-    if not value:
-        return None
-    try:
-        return max(0.0, float(value))
-    except (TypeError, ValueError):
-        return None
+    """Backwards-compatible shim: Retry-After may be seconds *or* an HTTP-date."""
+    return _parse_retry_seconds(value)
 
 
 class GeminiClient:
@@ -147,7 +145,7 @@ class GeminiClient:
                      "X-Goog-Upload-Header-Content-Type": mime},
             json={"file": {"display_name": display_name or path.name}}, timeout=timeout_s)
         if start.status_code >= 400:
-            raise self._classify(start)
+            raise self._error(start)
         url = start.headers.get("x-goog-upload-url")
         if not url:
             raise FileUploadFailed("upload start returned no x-goog-upload-url")
@@ -157,7 +155,7 @@ class GeminiClient:
                           "content-type": "application/octet-stream"},
             content=_chunks(path), timeout=timeout_s)
         if done.status_code >= 400:
-            raise self._classify(done)
+            raise self._error(done)
         info = (done.json() or {}).get("file") or {}
         if not info.get("uri"):
             raise FileUploadFailed(f"upload finalize returned no file record: {done.text[:200]}")
@@ -166,7 +164,7 @@ class GeminiClient:
     async def file_state(self, key: str, name: str) -> UploadedFile:
         r = await self._authed("GET", f"{self.cfg.base_url}/files/{_file_id(name)}", key=key)
         if r.status_code >= 400:
-            raise self._classify(r)
+            raise self._error(r)
         info = (r.json() or {}) or {}
         return UploadedFile.from_api(info, mime=info.get("mimeType", ""))
 
@@ -199,7 +197,7 @@ class GeminiClient:
         r = await self._authed("POST", f"{self.cfg.base_url}/models/{model}:countTokens",
                                key=key, json={"contents": [{"parts": [part]}]})
         if r.status_code >= 400:
-            raise self._classify(r)
+            raise self._error(r)
         return int((r.json() or {}).get("totalTokens") or 0)
 
     async def delete_file(self, key: str, name: str) -> None:
@@ -207,7 +205,7 @@ class GeminiClient:
         success: the provider expires them on its own."""
         r = await self._authed("DELETE", f"{self.cfg.base_url}/files/{_file_id(name)}", key=key)
         if r.status_code >= 400 and r.status_code != 404:
-            raise self._classify(r)
+            raise self._error(r)
 
     # ------------------------------------------------------------------
     async def list_models(self, key: str) -> set[str]:
@@ -233,7 +231,7 @@ class GeminiClient:
         r = await self._authed("POST", f"{self.cfg.base_url}/models/{model}:countTokens",
                                key=key, json=payload)
         if r.status_code >= 400:
-            raise self._classify(r)
+            raise self._error(r)
         return int(r.json().get("totalTokens", 0))
 
     async def generate(self, key: str, model: str, *, prompt: str, system: str | None = None,
@@ -269,7 +267,7 @@ class GeminiClient:
         r = await self._authed("POST", f"{self.cfg.base_url}/models/{model}:generateContent",
                                key=key, json=payload)
         if r.status_code >= 400:
-            raise self._classify(r)
+            raise self._error(r)
         data = r.json()
         candidates = data.get("candidates") or []
         if not candidates:
@@ -299,9 +297,9 @@ class GeminiClient:
                     await response.aread()
                     if (not keyauth.leaked(response.status_code, response.text)
                             and keyauth.auth_failure(response.status_code, response.text)):
-                        failure = self._classify(response)
+                        failure = self._error(response)
                         continue
-                    raise self._classify(response)
+                    raise self._error(response)
                 keyauth.remember(key, transport)
                 chunks: list[str] = []
                 usage: dict = {}
@@ -348,15 +346,22 @@ class GeminiClient:
         raise failure
 
     # ------------------------------------------------------------------
+    def _error(self, resp: httpx.Response) -> GeminiHTTPError:
+        """Instance wrapper: attach the parsed provider signal using this client's cfg."""
+        return self._classify(resp, cfg=self.cfg, now=time.time())
+
     @staticmethod
-    def _classify(resp: httpx.Response) -> GeminiHTTPError:
+    def _classify(resp: httpx.Response, *, cfg: Config | None = None,
+                  now: float | None = None) -> GeminiHTTPError:
         status = resp.status_code
         body = resp.text[:300]
         retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+        signal = parse_provider_signal(status, dict(resp.headers), resp.content,
+                                       cfg or Config(), now=now)
         quota_day = quota_minute = False
         if status == 429:
             low = resp.text.lower()
-            quota_day = "perday" in low or "per_day" in low
+            quota_day = ("perday" in low or "per_day" in low or signal.kind == "day")
             quota_minute = not quota_day
             if retry_after is None:
                 retry_after = 60.0
@@ -372,7 +377,8 @@ class GeminiClient:
         return GeminiHTTPError(f"HTTP {status}: {body}", status=status, retryable=retryable,
                                switch_model=switch, retry_after=retry_after,
                                quota_day=quota_day, quota_minute=quota_minute,
-                               key_rejected=key_rejected)
+                               key_rejected=key_rejected,
+                               signal=signal if signal.blocks_pair else None)
 
 
 # What the provider accepts under a media part. Measured 2026-10-11 on gemini-3.6-flash:

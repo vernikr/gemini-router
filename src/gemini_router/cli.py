@@ -12,6 +12,7 @@ from rich.table import Table
 
 from . import __version__
 from .config import Config
+from .context import audit_line
 from .errors import RouterError
 from .ledger import Ledger, iso, pt_midnight_ts
 from .routing import Router, pick_gemma
@@ -102,21 +103,63 @@ def cmd_calls(args, cfg: Config | None = None) -> int:
     cfg = cfg if cfg is not None else _load_cfg(args)
     rows = Ledger(cfg.state_path).calls_tail(
         args.n, model=args.model, status=args.status, source=args.source,
-        request_id=args.request_id)
+        request_id=getattr(args, "request_id", None),
+        initiator=getattr(args, "initiator", None))
+    wide = getattr(args, "wide", False)
     if args.json:
         print(json.dumps(rows, indent=1, default=str))
         return 0
-    t = Table(title=f"Last {len(rows)} calls", expand=True)
-    for col in ("ts (UTC)", "src", "kind", "key", "model", "status", "http",
-                "in", "out", "ms", "tier"):
+    t = Table(title=f"Last {len(rows)} calls · gemini-router {__version__}", expand=True)
+    cols = ["ts (UTC)", "src", "initiator", "v", "kind", "key", "model", "status", "http",
+            "in", "out", "ms", "tier"]
+    if wide:
+        cols += ["rid", "signal", "quota_id", "comment"]
+    for col in cols:
         t.add_column(col, overflow="fold")
     for r in reversed(rows):
         style = {"ok": "green", "quota": "red", "http5xx": "yellow",
                  "network": "yellow", "blocked": "magenta"}.get(r["status"], "dim")
-        t.add_row(r["ts_iso"][:19], r["source"], r["kind"], r["key_id"], r["model"],
-                  f"[{style}]{r['status']}[/{style}]", str(r["http_status"] or ""),
-                  str(r["tokens_in"] or ""), str(r["tokens_out"] or ""),
-                  str(r["latency_ms"] or ""), str(r["overflow_tier"]))
+        row = [r["ts_iso"][:19], r["source"], r.get("initiator") or "-",
+               r.get("version") or "-", r["kind"], r["key_id"], r["model"],
+               f"[{style}]{r['status']}[/{style}]", str(r["http_status"] or ""),
+               str(r["tokens_in"] or ""), str(r["tokens_out"] or ""),
+               str(r["latency_ms"] or ""), str(r["overflow_tier"])]
+        if wide:
+            row += [r.get("request_id") or "-", r.get("signal_kind") or "-",
+                    (r.get("quota_id") or "-")[:28], (r.get("comment") or "-")[:60]]
+        t.add_row(*row)
+    console.print(t)
+    return 0
+
+
+def cmd_note(args, cfg: Config | None = None) -> int:
+    """Write an arbitrary comment into the shared audit trail. Nothing else happens."""
+    cfg = cfg if cfg is not None else _load_cfg(args)
+    led = Ledger(cfg.state_path)
+    initiator = getattr(args, "initiator", "cli") or "cli"
+    note_id = led.add_note(args.comment, initiator=initiator,
+                           version=__version__, source="cli")
+    line = audit_line("note", v=__version__, initiator=initiator,
+                      note_id=note_id, comment=args.comment)
+    print(line)
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": True, "note_id": note_id, "version": __version__}))
+    else:
+        console.print(f"[green]note #{note_id} recorded[/green] (no provider call, no quota)")
+    return 0
+
+
+def cmd_notes(args, cfg: Config | None = None) -> int:
+    cfg = cfg if cfg is not None else _load_cfg(args)
+    rows = Ledger(cfg.state_path).notes_tail(args.n)
+    if args.json:
+        print(json.dumps(rows, indent=1, default=str))
+        return 0
+    t = Table(title=f"Last {len(rows)} notes · gemini-router {__version__}", expand=True)
+    for col in ("ts (UTC)", "v", "initiator", "comment"):
+        t.add_column(col, overflow="fold")
+    for r in reversed(rows):
+        t.add_row(r["ts_iso"][:19], r["version"] or "-", r["initiator"] or "-", r["comment"])
     console.print(t)
     return 0
 
@@ -236,7 +279,8 @@ def _proxy_cfg(args) -> dict:
 
 
 _COMMANDS = {"quota": cmd_quota, "models": cmd_models, "calls": cmd_calls,
-             "prune": cmd_prune, "doctor": cmd_doctor, "proxy": cmd_proxy}
+             "prune": cmd_prune, "doctor": cmd_doctor, "proxy": cmd_proxy,
+             "note": cmd_note, "notes": cmd_notes}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -254,8 +298,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("calls", help="audit log tail")
     p.add_argument("-n", type=int, default=50)
-    for flag in ("--model", "--status", "--source", "--request-id"):
+    for flag in ("--model", "--status", "--source", "--request-id", "--initiator"):
         p.add_argument(flag)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--wide", action="store_true",
+                   help="also show request id, provider signal, quota id and comment")
+    p = sub.add_parser("note", help="record a free-form comment (no provider call)")
+    p.add_argument("comment", help='e.g. "начинаем тестирование новой версии"')
+    p.add_argument("--initiator", default="cli", help='who wrote it, e.g. "ops"')
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("notes", help="show recent annotations")
+    p.add_argument("-n", type=int, default=20)
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("prune", help="apply retention (audit days, cache TTL)")
     p.add_argument("--audit-days", type=float, default=30)

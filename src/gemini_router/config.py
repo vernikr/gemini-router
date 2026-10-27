@@ -36,6 +36,23 @@ class WaitCfg(BaseModel):
     poll_s: float = 2.0
 
 
+class FeedbackCfg(BaseModel):
+    """How a live provider answer overrides the ledger's predicted budgets.
+
+    The ledger counts requests; only the provider knows its real quota. These limits
+    bound how aggressively an observed 429/503 changes local truth (SPEC §12).
+    """
+
+    throttle_min_s: float = 60.0        # floor for an unconfirmed 429 bench
+    throttle_max_s: float = 900.0       # ceiling, even if Retry-After says an hour
+    buffer_s: float = 5.0               # safety margin over Retry-After
+    reset_buffer_s: float = 30.0        # avoid a race exactly at PT midnight
+    overload_cooldown_s: float = 60.0   # 503 = capacity, not budget
+    promote_hits: int = 3               # repeated unconfirmed 429 -> day block
+    promote_window_s: float = 300.0
+    circuit_breaker: bool = True        # short-circuit when every pair is blocked
+
+
 class ProxyCfg(BaseModel):
     """Settings of the native-Gemini pass-through (`gemini-router proxy`, SPEC §11).
 
@@ -64,6 +81,15 @@ class ProxyCfg(BaseModel):
     #   passthrough     never rewrite; account only
     model_policy: str = "strict"
     file_search_models: list[str] | None = None   # None = cfg.chain for rewriting
+    # Initiator used when the client sent no X-Router-Initiator header. Callers SHOULD
+    # identify themselves; this is only a fallback for legacy SDKs.
+    default_initiator: str = "filesearch"
+    # Respect minute-scale waits reported by the shared selection walk instead of
+    # firing immediately at a pair that is known to be cooling down.
+    walk_wait: bool = True
+    # Answer locally with 429 + Retry-After when provider feedback says the whole pool
+    # is blocked, instead of re-asking Google (circuit breaker, SPEC §12.4).
+    pool_circuit_breaker: bool = True
 
 
 class Config(BaseModel):
@@ -80,6 +106,7 @@ class Config(BaseModel):
     quota_day_tz: str = "America/Los_Angeles"
     retry: RetryCfg = Field(default_factory=RetryCfg)
     wait: WaitCfg = Field(default_factory=WaitCfg)
+    feedback: FeedbackCfg = Field(default_factory=FeedbackCfg)
     window_s: float = 60.0                     # sliding RPM/TPM window
     planned_ttl_s: float = 300.0               # stale 'planned' rows stop counting after this
     models_refresh_h: float = 12.0

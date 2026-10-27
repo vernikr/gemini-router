@@ -460,3 +460,88 @@ GEMINI_ROUTER_PROXY_TOKEN=$(openssl rand -hex 32) gemini-router proxy     # 127.
 Loopback only: reach it through an SSH tunnel. The service is stateless apart from the
 shared ledger, so several processes (and the CLI) may run against one `state.db`.
 Sizing: stdlib `http.server`, no new dependencies, `MemoryMax=128M` is ample.
+
+## 12. Provider truth and request identity (v0.11)
+
+### 12.1 The principle
+
+`calls` is a *forecast* of quota usage. The provider's answer is the *measurement*.
+On any 429/503 the measurement must immediately outrank the forecast for the exact
+`(key_id, model)` pair, for the current request and for every future request until the
+provider's own reset time. Three independent defects broke this before v0.11:
+
+1. `_quota_cooldown()` rebuilt an `httpx.Response` from the body alone, discarding the
+   upstream `Retry-After` header. `_classify()` then defaulted to 60 s and the code took
+   `min(next_PT_midnight, now + 65)` — a **daily** verdict expired after 65 seconds.
+2. The pass-through's walk called `choose()` from scratch on every hop, with no memory
+   of pairs already tried. `pick_pair` also returned `reason="wait"` pairs that the
+   proxy fired immediately (the library's wait loop was never used on this path).
+   With `WALK_RETRIES=16` and 12 real pairs, one request could hit the same pair twice;
+   three concurrent client requests produced 48 upstream 429s in ten seconds on
+   2026-10-21, of which only three reached clients.
+3. `RPD_STATUSES` included `http5xx`, so a 503 overload storm silently consumed the
+   daily budget in the ledger. `gemini-router quota` then showed `0/20` while a direct
+   probe with the same key answered 200.
+
+Every key belongs to a **separate account**: per-key×model isolation is the correct
+model. There is no shared project bucket to compensate for; the 2026-10-21 event was a
+short provider-side capacity blip plus the amplification defects above.
+
+### 12.2 `feedback.py` — one parser, one writer
+
+`parse_provider_signal(status, headers, body, cfg, now)` is a pure function:
+
+| Input | Result |
+|---|---|
+| 429 + `quotaId: ...PerDay...` | `kind="day"`, `until_ts` = next PT midnight + 30 s. `Retry-After` is recorded but **never caps** the reset. |
+| 429 + `quotaId: ...PerMinute...` | `kind="minute"`, bench = `Retry-After + buffer` (floor 1 s). |
+| 429, no quota details | `kind="minute"`, `unconfirmed=True`, bench = `max(Retry-After + buffer, throttle_min_s=60)`, capped at `throttle_max_s=900`. |
+| 503/502 | `kind="overload"`, bench = `overload_cooldown_s=60`. |
+| anything else | `kind="none"`. |
+
+`Retry-After` accepts delta-seconds and HTTP-dates; `retryDelay` / "Please retry in Ns"
+and `quotaId`/`quotaMetric`/`quotaValue` are extracted from arbitrary JSON shapes.
+
+`QuotaTruth.apply()` upserts `pair_state` and **mirrors** the decision into `cooldowns`
+(older library builds read only that table). Repeated unexplained 429s (`promote_hits=3`
+inside `promote_window_s=300`) escalate to a day block. A `2xx` calls
+`clear_pair_state()` — a success proves the pair is available again.
+
+`RPD_STATUSES = ("ok", "quota", "blocked")`: 429 counts conservatively, 5xx does not.
+
+### 12.3 Selection, waiting and the circuit breaker
+
+- `gates_from(..., provider_state=...)` sets `rpd_left=0` for a live `day` verdict and a
+  waitable `cooldown`/`wait_s` for `minute`/`overload`. Provider truth is read from the
+  same `gate_snapshot` query as the counters (one extra table, no extra round trips).
+- `pick_pair(..., exclude=visited)` skips pairs already tried **in this request**. When
+  no clean candidate remains and provider verdicts exist, it returns
+  `reason="throttled"` with the shortest reset, not a fake "fresh" pair.
+- `FileSearchRouting.choose()` returns a `Selection` (`state` = `ok` / `wait` /
+  `throttled` / `exhausted`) instead of a bare 2-tuple.
+- The proxy waits out `state=="wait"` when `wait_s <= wait.max_s` (`proxy.walk_wait`),
+  and answers locally with `429 + Retry-After` on `state=="throttled"` when
+  `proxy.pool_circuit_breaker` is on. A purely counter-based `exhausted` state still
+  asks the provider once — it is the authority.
+
+### 12.4 Identity: version, initiator, comment
+
+`context.RequestContext` is threaded through the proxy and the library. Every `calls`
+row gains `version`, `initiator`, `comment`, `quota_id`, `signal_kind` (additive schema
+v3; `initiator` is backfilled from `source` on old databases). `notes` stores
+standalone annotations; `note` (CLI + `POST /v1/note`) and `notes` (`GET /v1/notes`)
+have **no provider call and no quota effect**.
+
+Headers consumed locally, never forwarded upstream:
+
+```
+X-Router-Initiator: tldr-digest       (alias: X-Router-Source)
+X-Router-Comment: free text           (alias: X-Router-Note; percent-encoded if non-ASCII)
+X-Router-Request-Id: digest-20261028
+```
+
+Audit output is logfmt: `event=request v=0.11.0 rid=... initiator=... comment=...
+key=... model=... status=...`. `event=startup` carries the version, config and state
+path; `event=provider_feedback` carries the parsed signal; `event=note` carries the
+annotation; `event=pool_throttled` marks a locally answered 429. `/healthz` and all CLI
+tables show the running version.

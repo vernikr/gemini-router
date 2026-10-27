@@ -11,6 +11,11 @@ Accounting rules (D3, FR-C2/C7):
   excluded from every gate: countTokens ('count') and Files API uploads ('upload').
 - TPM pre-flight writes a 'planned' row (upgraded in place after the call) to close the
   countTokens→send race between processes (D2).
+- A 5xx from the provider is *not* RPD spend: an overloaded model refused the request,
+  it did not consume a daily slot. Counting those as spend is what used to make a
+  503 storm look like an exhausted day (SPEC §12.2).
+- `pair_state` is the provider's own verdict for a (key, model) pair. It outranks any
+  counter in `calls`: a live 429 blocks the pair even when our counters say "fresh".
 """
 from __future__ import annotations
 
@@ -23,7 +28,10 @@ from datetime import time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-RPD_STATUSES = ("ok", "quota", "http5xx", "blocked")
+# Only answers that actually drew on a daily slot count. `http5xx` is deliberately
+# absent: a 503 overload is capacity, not budget (and 429 stays — conservative, a pair
+# that answered 429 is by definition at its limit).
+RPD_STATUSES = ("ok", "quota", "blocked")
 WINDOW_STATUSES = RPD_STATUSES + ("planned",)
 # 'drift' is a tariff-forecast miss note, not a provider call at all — same exclusion.
 # 'filesearch' is the pass-through's bookkeeping row for a File Search management call
@@ -35,7 +43,7 @@ SPENDS = "kind NOT IN ({})".format(",".join(f"'{k}'" for k in NON_SPENDING_KINDS
 # An upload belongs to a key, not a model, but the column is NOT NULL and feeds per-model
 # filters. A sentinel no model id can equal.
 FILE_ROW_MODEL = "(file)"
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls(
@@ -45,13 +53,36 @@ CREATE TABLE IF NOT EXISTS calls(
   key_id TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL,
   http_status INTEGER, tokens_in INTEGER, tokens_out INTEGER,
   quota_error TEXT, retry_after_s REAL, latency_ms INTEGER,
-  overflow_tier INTEGER NOT NULL DEFAULT 0, bytes INTEGER);
+  overflow_tier INTEGER NOT NULL DEFAULT 0, bytes INTEGER,
+  -- v3: who/which build produced this row, and what the provider told us.
+  version TEXT, initiator TEXT, comment TEXT, quota_id TEXT, signal_kind TEXT);
 CREATE INDEX IF NOT EXISTS idx_calls_model_ts ON calls(model, ts);
 CREATE INDEX IF NOT EXISTS idx_calls_key_model_ts ON calls(key_id, model, ts);
 CREATE INDEX IF NOT EXISTS idx_calls_req ON calls(request_id);
+-- idx_calls_initiator is created in _migrate(): on a v1/v2 database the column does
+-- not exist yet when this script runs.
 CREATE TABLE IF NOT EXISTS cooldowns(
   key_id TEXT NOT NULL, model TEXT NOT NULL, until_ts REAL NOT NULL, reason TEXT,
   PRIMARY KEY(key_id, model));
+-- Provider truth (SPEC §12). One row per pair, upserted on every 429/503. `kind`:
+--   day      — confirmed daily quota, hard skip until PT reset
+--   minute   — Retry-After bench (may be promoted to `day` after repeated hits)
+--   overload — short 503 bench
+CREATE TABLE IF NOT EXISTS pair_state(
+  key_id TEXT NOT NULL, model TEXT NOT NULL,
+  kind TEXT NOT NULL, until_ts REAL NOT NULL, retry_after_s REAL,
+  quota_id TEXT, quota_metric TEXT, quota_value TEXT,
+  reason TEXT, hits INTEGER NOT NULL DEFAULT 1,
+  first_ts REAL NOT NULL, updated_ts REAL NOT NULL,
+  initiator TEXT, version TEXT, detail TEXT,
+  PRIMARY KEY(key_id, model));
+CREATE INDEX IF NOT EXISTS idx_pair_state_until ON pair_state(until_ts);
+-- Arbitrary operator annotations: stored and logged, no behavioural effect.
+CREATE TABLE IF NOT EXISTS notes(
+  id INTEGER PRIMARY KEY,
+  ts REAL NOT NULL, ts_iso TEXT NOT NULL,
+  version TEXT, initiator TEXT, comment TEXT NOT NULL, source TEXT);
+CREATE INDEX IF NOT EXISTS idx_notes_ts ON notes(ts);
 CREATE TABLE IF NOT EXISTS cache(
   hash TEXT PRIMARY KEY, request_id TEXT, model TEXT NOT NULL, ts REAL NOT NULL,
   response TEXT NOT NULL, tokens_in INTEGER, tokens_out INTEGER);
@@ -98,9 +129,19 @@ class Ledger:
         """Additive only: a shared database is opened by older code too (tldr-digest),
         so an extra nullable column must never break the reader."""
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(calls)")}
-        for col in ("bytes",):
+        for col, typ in (("bytes", "INTEGER"), ("version", "TEXT"),
+                         ("initiator", "TEXT"), ("comment", "TEXT"),
+                         ("quota_id", "TEXT"), ("signal_kind", "TEXT")):
             if col not in cols:
-                self._conn.execute(f"ALTER TABLE calls ADD COLUMN {col} INTEGER")
+                self._conn.execute(f"ALTER TABLE calls ADD COLUMN {col} {typ}")
+        # A v2 database already has cooldown rows from the old library. They remain
+        # readable by old code; new gates read them too (cooldown()), while pair_state
+        # carries the richer verdict. Backfill historical initiator from source so
+        # old rows stay attributable.
+        self._conn.execute("UPDATE calls SET initiator=source "
+                           "WHERE initiator IS NULL AND source IS NOT NULL")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_calls_initiator "
+                           "ON calls(initiator, ts)")
 
     def close(self) -> None:
         with self._lock:
@@ -109,31 +150,37 @@ class Ledger:
     # ---------------------------------------------------------------- calls
     def plan(self, *, key_id: str, model: str, kind: str, est_tokens: int,
              request_id: str | None, source: str, overflow_tier: int = 0,
-             now: float | None = None) -> int:
+             now: float | None = None, initiator: str | None = None,
+             comment: str | None = None, version: str | None = None) -> int:
         now = now or time.time()
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "INSERT INTO calls(ts,ts_iso,request_id,source,kind,key_id,model,status,"
-                "tokens_in,overflow_tier) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "tokens_in,overflow_tier,version,initiator,comment) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (now, iso(now), request_id, source, kind, key_id, model, "planned",
-                 est_tokens, overflow_tier))
+                 est_tokens, overflow_tier, version, initiator or source, comment or None))
             return int(cur.lastrowid)
 
     def resolve(self, row_id: int, status: str, *, http_status: int | None = None,
                 tokens_in: int | None = None, tokens_out: int | None = None,
                 latency_ms: int | None = None, quota_error: str | None = None,
-                retry_after_s: float | None = None) -> None:
+                retry_after_s: float | None = None, quota_id: str | None = None,
+                signal_kind: str | None = None) -> None:
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE calls SET status=?, http_status=COALESCE(?,http_status), "
                 "tokens_in=COALESCE(?,tokens_in), tokens_out=?, latency_ms=?, quota_error=?, "
-                "retry_after_s=? WHERE id=?",
+                "retry_after_s=?, quota_id=COALESCE(?,quota_id), "
+                "signal_kind=COALESCE(?,signal_kind) WHERE id=?",
                 (status, http_status, tokens_in, tokens_out, latency_ms,
-                 quota_error and quota_error[:500], retry_after_s, row_id))
+                 quota_error and quota_error[:500], retry_after_s, quota_id,
+                 signal_kind, row_id))
 
     def record_upload(self, *, key_id: str, nbytes: int, source: str = "cli",
                       request_id: str | None = None, latency_ms: int | None = None,
-                      now: float | None = None) -> int:
+                      now: float | None = None, initiator: str | None = None,
+                      comment: str | None = None, version: str | None = None) -> int:
         """One Files API upload, recorded but never counted against model quotas: the row
         is kind='upload' with the byte count in `bytes`, and every gate skips it. It is
         the local audit trail — the provider forgets the file within 48 hours."""
@@ -141,9 +188,10 @@ class Ledger:
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "INSERT INTO calls(ts,ts_iso,request_id,source,kind,key_id,model,status,"
-                "http_status,latency_ms,bytes) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "http_status,latency_ms,bytes,version,initiator,comment) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (now, iso(now), request_id, source, "upload", key_id, FILE_ROW_MODEL,
-                 "ok", 200, latency_ms, nbytes))
+                 "ok", 200, latency_ms, nbytes, version, initiator or source, comment))
             return int(cur.lastrowid)
 
     def record_drift(self, *, key_id: str, model: str, media_cls: str, level: str,
@@ -231,10 +279,23 @@ class Ledger:
             window = {(r[0], r[1]): (int(r[2]), int(r[3]), r[4])
                       for r in self._conn.execute(
                           win_q, (win_start, *RPD_STATUSES, planned_min))}
-            cooldowns = {(r[0], r[1]): r[2] for r in self._conn.execute(
-                "SELECT key_id, model, until_ts FROM cooldowns WHERE until_ts>?",
-                (now,))}
-        return {"spent": spent, "window": window, "cooldown": cooldowns}
+            cd_rows = self._conn.execute(
+                "SELECT key_id, model, until_ts, reason FROM cooldowns WHERE until_ts>?",
+                (now,)).fetchall()
+            cooldowns = {(r["key_id"], r["model"]): r["until_ts"] for r in cd_rows}
+            pair_state = {(r["key_id"], r["model"]): dict(r) for r in self._conn.execute(
+                "SELECT * FROM pair_state WHERE until_ts>?", (now,))}
+            for r in cd_rows:
+                if not (r["reason"] or "").startswith("rpd_429"):
+                    continue
+                key = (r["key_id"], r["model"])
+                if key not in pair_state or pair_state[key]["kind"] != "day":
+                    pair_state[key] = {
+                        "key_id": r["key_id"], "model": r["model"], "kind": "day",
+                        "until_ts": r["until_ts"], "reason": r["reason"],
+                        "hits": 1, "initiator": "legacy", "version": "legacy"}
+        return {"spent": spent, "window": window, "cooldown": cooldowns,
+                "pair_state": pair_state}
 
     def last_call_ts(self, key_id: str, model: str) -> float | None:
         with self._lock:
@@ -244,11 +305,12 @@ class Ledger:
         return row[0]
 
     def calls_tail(self, n: int = 50, *, model: str | None = None, status: str | None = None,
-                   source: str | None = None, request_id: str | None = None) -> list[dict]:
+                   source: str | None = None, request_id: str | None = None,
+                   initiator: str | None = None) -> list[dict]:
         q = "SELECT * FROM calls WHERE 1=1"
         args: list = []
         for col, val in (("model", model), ("status", status), ("source", source),
-                         ("request_id", request_id)):
+                         ("request_id", request_id), ("initiator", initiator)):
             if val:
                 q += f" AND {col}=?"
                 args.append(val)
@@ -256,6 +318,83 @@ class Ledger:
         args.append(n)
         with self._lock:
             return [dict(r) for r in self._conn.execute(q, args)]
+
+    # ------------------------------------------------------- provider truth (v3)
+    def provider_state(self, key_id: str, model: str,
+                       now: float | None = None) -> dict | None:
+        """Live provider verdict for one pair, or None. Pure read (hot path).
+
+        An older library build (gemini-mcp v0.1.1 is still on that API) writes only a
+        `cooldowns` row with reason `rpd_429`. Read it as an equivalent day verdict so
+        a mixed fleet shares the same truth instead of each process re-learning it.
+        """
+        now = now or time.time()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM pair_state WHERE key_id=? AND model=? AND until_ts>?",
+                (key_id, model, now)).fetchone()
+            if row:
+                return dict(row)
+            legacy = self._conn.execute(
+                "SELECT until_ts, reason FROM cooldowns WHERE key_id=? AND model=? "
+                "AND until_ts>? AND reason LIKE 'rpd_429%'", (key_id, model, now)).fetchone()
+        if not legacy:
+            return None
+        return {"key_id": key_id, "model": model, "kind": "day",
+                "until_ts": legacy["until_ts"], "reason": legacy["reason"],
+                "hits": 1, "initiator": "legacy", "version": "legacy"}
+
+    def set_pair_state(self, row: dict) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO pair_state(key_id,model,kind,until_ts,retry_after_s,quota_id,"
+                "quota_metric,quota_value,reason,hits,first_ts,updated_ts,initiator,"
+                "version,detail) "
+                "VALUES(:key_id,:model,:kind,:until_ts,:retry_after_s,:quota_id,:quota_metric,"
+                ":quota_value,:reason,:hits,:first_ts,:updated_ts,:initiator,:version,:detail) "
+                "ON CONFLICT(key_id,model) DO UPDATE SET "
+                "kind=excluded.kind, until_ts=excluded.until_ts, "
+                "retry_after_s=excluded.retry_after_s, quota_id=excluded.quota_id, "
+                "quota_metric=excluded.quota_metric, quota_value=excluded.quota_value, "
+                "reason=excluded.reason, hits=excluded.hits, first_ts=excluded.first_ts, "
+                "updated_ts=excluded.updated_ts, initiator=excluded.initiator, "
+                "version=excluded.version, detail=excluded.detail", row)
+
+    def clear_pair_state(self, key_id: str, model: str) -> None:
+        """A 2xx proves the pair is usable again — drop the provider block and the
+        mirrored cooldown. Truth is symmetric: refusals block, successes unblock."""
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM pair_state WHERE key_id=? AND model=?",
+                               (key_id, model))
+            self._conn.execute(
+                "DELETE FROM cooldowns WHERE key_id=? AND model=? AND ("
+                "reason LIKE 'rpd_429%' OR reason LIKE 'rpm_429%' "
+                "OR reason LIKE 'throttle_429%' OR reason LIKE 'unavailable_5%')",
+                (key_id, model))
+
+    def pair_states(self, now: float | None = None) -> dict[tuple[str, str], dict]:
+        now = now or time.time()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM pair_state WHERE until_ts>?", (now,)).fetchall()
+        return {(r["key_id"], r["model"]): dict(r) for r in rows}
+
+    # --------------------------------------------------------------- annotations
+    def add_note(self, comment: str, *, initiator: str = "", version: str = "",
+                 source: str = "cli", now: float | None = None) -> int:
+        """A free-form operator comment. No quota effect, no provider call, ever."""
+        now = now or time.time()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO notes(ts,ts_iso,version,initiator,comment,source) "
+                "VALUES(?,?,?,?,?,?)",
+                (now, iso(now), version, initiator, comment[:2000], source))
+            return int(cur.lastrowid)
+
+    def notes_tail(self, n: int = 20) -> list[dict]:
+        with self._lock:
+            return [dict(r) for r in self._conn.execute(
+                "SELECT * FROM notes ORDER BY ts DESC LIMIT ?", (n,))]
 
     # ---------------------------------------------------------------- cooldowns
     def cooldown(self, key_id: str, model: str, now: float | None = None) -> float | None:
@@ -325,8 +464,10 @@ class Ledger:
             if not dry:
                 with self._conn:
                     self._conn.execute("DELETE FROM calls WHERE ts<?", (cut_calls,))
+                    self._conn.execute("DELETE FROM notes WHERE ts<?", (cut_calls,))
                     self._conn.execute("DELETE FROM cache WHERE ts<?", (cut_cache,))
                     self._conn.execute("DELETE FROM cooldowns WHERE until_ts<=?", (now,))
+                    self._conn.execute("DELETE FROM pair_state WHERE until_ts<=?", (now,))
         return {"calls_pruned": 0 if dry else n_calls, "cache_pruned": 0 if dry else n_cache,
                 "calls_would_prune": n_calls, "cache_would_prune": n_cache}
 

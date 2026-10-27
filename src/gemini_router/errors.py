@@ -2,6 +2,11 @@
 free-tier quota semantics (day vs minute 429) per gemini-mcp docs/02 FR-C4/C8/C13."""
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .feedback import ProviderSignal
+
 RETRYABLE_STATUS = {408, 409, 500, 502, 503, 504}
 MODEL_SWITCH_STATUS = {400, 403, 404, 405, 422}
 KEY_REJECT_STATUS = {401}   # credentials refused → the key is dead, not the model
@@ -15,8 +20,9 @@ class GeminiHTTPError(RouterError):
     def __init__(self, message: str, *, status: int | None = None, retryable: bool = False,
                  switch_model: bool = False, retry_after: float | None = None,
                  quota_day: bool = False, quota_minute: bool = False,
-                 key_rejected: bool = False):
+                 key_rejected: bool = False, signal: ProviderSignal | None = None):
         super().__init__(message)
+        self.signal = signal                # parsed provider truth (quota id, reset, ...)
         self.status = status
         self.retryable = retryable
         self.switch_model = switch_model

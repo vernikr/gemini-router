@@ -44,10 +44,12 @@ from urllib.parse import parse_qsl, urlparse
 import httpx
 
 from .config import Config, key_id
-from .errors import GeminiHTTPError
+from .context import RequestContext, audit_line, router_version
+from .feedback import ProviderSignal, QuotaTruth, parse_provider_signal
 from .filesearch import (
     INTERACTIONS_CREATE,
     FileSearchRouting,
+    Selection,
     UploadTickets,
     allowed_path,
     interactions_model,
@@ -58,7 +60,6 @@ from .filesearch import (
     resource_of,
     set_interactions_model,
 )
-from .gemini import GeminiClient
 from .ledger import FILE_ROW_MODEL, Ledger
 
 log = logging.getLogger("gemini_router.proxy")
@@ -69,6 +70,10 @@ HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriza
 # The client's credential is the router's token, never an upstream key: it is consumed
 # here and must not travel a hop further.
 CLIENT_AUTH_HEADERS = {"x-goog-api-key", "authorization", "cookie"}
+# Router-only metadata. Consumed locally (identity/annotation), never forwarded to
+# Google: a free-form comment must not change an upstream request in any way.
+CLIENT_CONTEXT_HEADERS = {"x-router-initiator", "x-router-source", "x-router-comment",
+                          "x-router-note", "x-router-request-id"}
 CHUNK = 1 << 20          # 1 MiB: streamed, so a 2 GB upload never lands in RAM twice
 RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
 
@@ -117,6 +122,8 @@ class GeminiProxy:
         self.origin = origin or f"http://{cfg.proxy.bind}:{cfg.proxy.port}"
         self.tickets = UploadTickets(self.token, self.origin)
         self.routing = FileSearchRouting(cfg, self.ledger)
+        self.truth = QuotaTruth(self.ledger, cfg)
+        self.version = router_version()
         self._client = httpx.Client(timeout=cfg.proxy.request_timeout_s)
 
     # ------------------------------------------------------------------ serving
@@ -147,9 +154,13 @@ class GeminiProxy:
 
     def serve_forever(self) -> None:
         httpd = self.server()
-        log.info("gemini-router proxy on http://%s:%d -> %s (keys=%d)",
-                 self.cfg.proxy.bind, self.cfg.proxy.port, self.cfg.base_url,
-                 len(self.cfg.api_keys))
+        log.info(audit_line(
+            "startup", v=self.version, component="proxy",
+            endpoint=f"http://{self.cfg.proxy.bind}:{self.cfg.proxy.port}",
+            upstream=self.cfg.base_url, keys=len(self.cfg.api_keys),
+            overflow=self.cfg.overflow_default, policy=self.cfg.proxy.model_policy,
+            state=self.ledger.path, initiator="system",
+            comment="gemini-router proxy started"))
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
@@ -173,6 +184,7 @@ class GeminiProxy:
             if path == "/healthz":
                 return self._send(h, 200, b"application/json",
                                   json.dumps({"ok": True, "service": "gemini-router-proxy",
+                                              "version": self.version,
                                               "keys": len(self.cfg.api_keys)}).encode(), {})
             if path.startswith("/.well-known/") or path in ("/register", "/authorize",
                                                             "/token"):
@@ -186,12 +198,22 @@ class GeminiProxy:
                     401, f"unauthorized: send the router token in x-goog-api-key or "
                          f"Authorization: Bearer (see {self.cfg.proxy.token_env})"),
                     {"WWW-Authenticate": 'Bearer realm="gemini-router"'})
+            ctx = RequestContext.from_headers(
+                h.headers, default_initiator=self.cfg.proxy.default_initiator,
+                source="filesearch")
+            # Annotations are local-only: they write one audit row and change nothing
+            # else. They deliberately bypass allowed_path() and never reach Google.
+            if path == "/v1/note" and method == "POST":
+                return self._handle_note(h, ctx)
+            if path == "/v1/notes" and method == "GET":
+                return self._handle_notes(h, ctx, query)
+
             if not allowed_path(path):
                 return self._send(h, 404, b"application/json", google_error(
                     404, f"{path} is not served by this pass-through: only File Search, "
                          "Files API, models and resumable upload"), {})
 
-            self._proxy(h, path, query, method, started)
+            self._proxy(h, path, query, method, started, ctx)
         except Exception as exc:                     # noqa: BLE001 — never 200-with-error
             log.exception("proxy: unhandled failure on %s %s", h.command, path)
             try:
@@ -200,6 +222,51 @@ class GeminiProxy:
             except OSError:
                 pass
 
+    # ------------------------------------------------------------------ notes
+    def _handle_note(self, h, ctx: RequestContext) -> None:
+        """Record a free-form comment. No upstream call, no quota, no side effect."""
+        length = int(h.headers.get("content-length") or 0)
+        raw = h.rfile.read(min(length, 64 << 10)) if length else b"{}"
+        try:
+            data = json.loads(raw or b"{}")
+        except ValueError:
+            data = {}
+        comment = str(data.get("comment") or ctx.comment or "")[:2000].strip()
+        if not comment:
+            return self._send(h, 400, b"application/json",
+                              google_error(400, 'note needs a non-empty "comment"'), {})
+        initiator = str(data.get("initiator") or ctx.initiator or "")[:64]
+        note_id = self.ledger.add_note(comment, initiator=initiator,
+                                       version=self.version, source="http")
+        log.info(audit_line("note", v=self.version, rid=ctx.request_id,
+                            initiator=initiator or "-", note_id=note_id,
+                            comment=comment))
+        self._send(h, 200, b"application/json",
+                   json.dumps({"ok": True, "note_id": note_id, "version": self.version,
+                               "initiator": initiator}).encode(), {})
+
+    def _handle_notes(self, h, ctx: RequestContext, query: str) -> None:
+        q = dict(parse_qsl(query))
+        try:
+            n = max(1, min(int(q.get("n", "20")), 200))
+        except ValueError:
+            n = 20
+        self._send(h, 200, b"application/json",
+                   json.dumps({"ok": True, "version": self.version,
+                               "notes": self.ledger.notes_tail(n)}).encode(), {})
+
+    def _local_throttle(self, selection: Selection,
+                        ctx: RequestContext) -> tuple[int, dict, bytes, None]:
+        """Answer 429 locally when provider truth says the whole pool is blocked."""
+        retry = max(1, int(selection.retry_after_s or 60))
+        log.info(audit_line("pool_throttled", v=self.version, rid=ctx.request_id,
+                            initiator=ctx.initiator or "-", comment=ctx.comment or "-",
+                            retry_after_s=retry, state=selection.state))
+        return (429, {"Retry-After": str(retry)},
+                google_error(429, "all router key/model pairs are quota-blocked by the "
+                                  "provider; retry after the advertised delay",
+                             detail=f"state={selection.state}"), None)
+
     # --------------------------------------------------------------------- steps
     def _authorized(self, h: BaseHTTPRequestHandler) -> bool:
         import hmac as _hmac
@@ -207,7 +274,11 @@ class GeminiProxy:
                     or (h.headers.get("Authorization") or "").removeprefix("Bearer "))
         return bool(supplied) and _hmac.compare_digest(supplied, self.token)
 
-    def _proxy(self, h, path: str, query: str, method: str, started: float) -> None:
+    def _proxy(self, h, path: str, query: str, method: str, started: float,
+               ctx: RequestContext | None = None) -> None:
+        ctx = ctx or RequestContext.from_headers(
+            h.headers, default_initiator=self.cfg.proxy.default_initiator,
+            source="filesearch")
         length = int(h.headers.get("content-length") or 0)
         limit = self.cfg.proxy.body_inspect_bytes
         cfg = self.cfg
@@ -258,12 +329,14 @@ class GeminiProxy:
                          and body is not None)
         if model_in_body and not model:
             model = interactions_model(body)
+        selection: Selection | None = None
         if model and cfg.proxy.model_policy != "passthrough":
             # Key and model come from the shared selection walk (SPEC §11.6): resource
             # affinity pins the key and only the model walks; an unbound model call
             # (plain generateContent/countTokens) walks both — the pool rotates by
             # remaining budget instead of riding the File Search pin.
-            new_kid, chosen = self.routing.choose(model, kid if resource else None)
+            selection = self.routing.choose(model, kid if resource else None)
+            new_kid, chosen = selection.key_id, selection.model
             if chosen and chosen != model:
                 if model_in_body:
                     body = set_interactions_model(body, chosen)
@@ -282,54 +355,72 @@ class GeminiProxy:
         spending = method == "POST" and (path.endswith(":generateContent")
                                          or path == INTERACTIONS_CREATE)
 
-        def attempt() -> tuple[int, dict, bytes]:
-            # A generateContent call spends the model's quota, so EVERY upstream try is
-            # planned and resolved like any other router call — a retried attempt spent
-            # real provider quota and must not vanish from the ledger. Everything else
-            # is recorded but excluded from every gate (NON_SPENDING_KINDS), so `quota`
-            # and `calls` stay truthful without ever blocking a store listing on a day
-            # when the text budget is gone.
+        def attempt() -> tuple[int, dict, bytes, ProviderSignal | None]:
+            # Every upstream try is planned and resolved: a retried attempt spent real
+            # provider quota and must not vanish from the ledger. Non-spending kinds
+            # (store listings, uploads) are recorded but excluded from every gate.
+            # Version / initiator / comment ride on the row so a mixed fleet stays
+            # diagnosable after the fact.
             row_id = self.ledger.plan(
                 key_id=key_id(key), model=model or FILE_ROW_MODEL,
                 kind="single" if spending else "filesearch", est_tokens=0,
-                request_id=None,
-                source="filesearch") if (spending or cfg.proxy.audit) else None
-            st, hdrs_out, pl = self._forward(
+                request_id=ctx.request_id, source=ctx.initiator or "filesearch",
+                initiator=ctx.initiator or "filesearch", comment=ctx.comment or None,
+                version=self.version) if (spending or cfg.proxy.audit) else None
+            st, hdrs_out, pl, signal = self._forward(
                 method, url, headers, body, stream, length, path, resource, pinned,
-                kid, key, model=model)
+                kid, key, model=model, ctx=ctx)
             if row_id is not None:
-                self.ledger.resolve(row_id,
-                                    "ok" if st < 400 else self._status_name(st),
-                                    http_status=st,
-                                    latency_ms=int((time.time() - started) * 1000))
-            return st, hdrs_out, pl
+                self.ledger.resolve(
+                    row_id, "ok" if st < 400 else self._status_name(st),
+                    http_status=st, latency_ms=int((time.time() - started) * 1000),
+                    quota_error=signal.detail if signal and signal.blocks_pair else None,
+                    retry_after_s=signal.retry_after_s if signal else None,
+                    quota_id=signal.quota_id if signal else None,
+                    signal_kind=signal.kind if signal and signal.blocks_pair else None)
+            return st, hdrs_out, pl, signal
 
-        status, out_headers, payload = attempt()
+        # --- circuit breaker: provider truth already says the pool is out -----------
+        # Without this, three client requests each re-walk the same 12 blocked pairs,
+        # which is exactly how 48 identical 429s landed in ten seconds on 2026-10-21.
+        if (spending and model and stream is None and cfg.proxy.pool_circuit_breaker
+                and selection is not None and selection.state == "throttled"):
+            status, out_headers, payload, _ = self._local_throttle(selection, ctx)
+        else:
+            if (spending and model and stream is None and cfg.proxy.walk_wait
+                    and selection is not None and selection.state == "wait"
+                    and selection.wait_s <= cfg.wait.max_s):
+                time.sleep(min(selection.wait_s, cfg.wait.max_s))
+            status, out_headers, payload, _ = attempt()
 
-        # --- keep walking on a live quota/overload answer (SPEC §11.6) -------------
-        # The ledger only sees traffic that went through the router; a key drained by
-        # another consumer looks fresh until the provider answers 429. That answer
-        # (or a 503 overload) cools the pair down, so re-running the same selection
-        # walk now lands on the next candidate — another key, or the next tier.
-        # Forwarding the first failure would push this walk onto every caller.
-        # Bounded; only a buffered model call is retried (a streamed body cannot be
-        # replayed). A resource-pinned path-model call (File Search generateContent)
-        # stays put as before; an interactions chain is pinned to its KEY but may
-        # still walk MODELS on that key — the model is interaction-scoped, only the
-        # history belongs to the project.
+        # --- keep walking on a live quota/overload answer (SPEC §11.6 / §12) -------
+        # Every 429/503 is applied to the ledger BEFORE the next hop (`_observe`), so
+        # the pair that just refused is hard-skipped for this request (`visited`) and
+        # for later ones (`pair_state`). Forwarding the first failure would push this
+        # discovery onto every caller. Bounded; only buffered model calls are retried.
         if spending and model and stream is None and (not resource or model_in_body):
+            visited = {(kid, model)}
             for _ in range(self._walk_bound()):
                 if status not in (429, 503):
                     break
-                if status == 503:                 # 429 cooled down inside _forward
-                    self.ledger.set_cooldown(kid, model,
-                                             time.time() + self.OVERLOAD_COOLDOWN_S,
-                                             "unavailable_503")
-                next_kid, next_model = self.routing.choose(model, kid if resource else None)
+                sel = self.routing.choose(model, kid if resource else None, exclude=visited)
+                if sel.state == "throttled" and cfg.proxy.pool_circuit_breaker:
+                    status, out_headers, payload, _ = self._local_throttle(sel, ctx)
+                    break
+                if sel.state == "exhausted":
+                    break                         # no new candidate from the shared walk
+                if sel.state == "wait":
+                    if cfg.proxy.walk_wait and sel.wait_s <= cfg.wait.max_s:
+                        time.sleep(min(sel.wait_s, cfg.wait.max_s))
+                    else:
+                        status, out_headers, payload, _ = self._local_throttle(sel, ctx)
+                        break
+                next_kid, next_model = sel.key_id, sel.model
                 next_key = self.routing._resolve(next_kid)
-                if next_key is None or (next_kid, next_model) == (kid, model):
+                if next_key is None or (next_kid, next_model) in visited:
                     break                         # the walk has nothing new to offer
-                if next_model != model:
+                visited.add((next_kid, next_model))
+                if next_model and next_model != model:
                     if model_in_body:
                         body = set_interactions_model(body, next_model)
                         length = len(body)
@@ -339,7 +430,7 @@ class GeminiProxy:
                 kid, key = next_kid, next_key
                 headers["x-goog-api-key"] = key
                 url = self._upstream_url(path, upstream_query)
-                status, out_headers, payload = attempt()
+                status, out_headers, payload, _ = attempt()
 
         # --- learn what a create produced, so the next call needs no probing -------
         if is_create(path, method):
@@ -347,9 +438,13 @@ class GeminiProxy:
             self.routing.learn_interaction(path, method, status, payload, kid)
 
         if cfg.proxy.audit:
-            log.info("proxy %s %s -> %d key=%s resource=%s pinned=%s bytes=%d %.0fms",
-                     method, path, status, kid, resource or "-", pinned, length,
-                     (time.time() - started) * 1000)
+            log.info(audit_line(
+                "request", v=self.version, rid=ctx.request_id,
+                initiator=ctx.initiator or "-", comment=ctx.comment or "-",
+                method=method, path=path, status=status, key=kid,
+                resource=resource or "-", pinned=int(bool(pinned)),
+                bytes=length, latency_ms=int((time.time() - started) * 1000),
+                model=model or "-", response_bytes=len(payload)))
         if model:
             # Who actually served a model call — so a caller's own run log can record
             # the pair without correlating against this proxy's audit stream by time.
@@ -359,14 +454,20 @@ class GeminiProxy:
                    payload, out_headers)
 
     def _forward(self, method, url, headers, body, stream, length, path, resource,
-                 pinned, kid, key, model=None) -> tuple[int, dict, bytes]:
+                 pinned, kid, key, model=None, ctx: RequestContext | None = None
+                 ) -> tuple[int, dict, bytes, ProviderSignal | None]:
         """Send upstream, retrying only where that is safe (SPEC §11.7).
 
         A non-idempotent POST (create a store, import a file) is never repeated once it
         may have taken effect, and a consumed body stream cannot be replayed at all —
         so both get exactly one attempt. Idempotent reads of a resource whose owner is
         unknown may try the other keys once, which is also how a lost affinity heals.
+
+        Every 429/503 is handed to `QuotaTruth` *with the real upstream headers*: the
+        Retry-After header used to be thrown away, which turned a day-long quota
+        verdict into a 65-second cooldown.
         """
+        ctx = ctx or RequestContext(source="filesearch")
         attempts = [(url, headers, body, stream, kid, key)]
         if method in ("GET", "DELETE", "HEAD") and not pinned and resource:
             for other in self.routing.probe_order(resource, model or model_of(path))[1:]:
@@ -374,7 +475,8 @@ class GeminiProxy:
                 if k is not None:
                     attempts.append((url, {**headers, "x-goog-api-key": k}, body,
                                      None, other, k))
-        last: tuple[int, dict, bytes] = (502, {}, google_error(502, "upstream unreachable"))
+        Result = tuple[int, dict, bytes, ProviderSignal | None]
+        last: Result = (502, {}, google_error(502, "upstream unreachable"), None)
         for i, (u, hdrs, b, st, cur_kid, _cur_key) in enumerate(attempts):
             try:
                 status, out, payload = self._send_upstream(
@@ -382,22 +484,36 @@ class GeminiProxy:
             except httpx.HTTPError as exc:
                 log.warning("proxy: upstream transport error on %s: %s", path, exc)
                 last = (502, {}, google_error(
-                    502, f"upstream unreachable: {type(exc).__name__}"))
+                    502, f"upstream unreachable: {type(exc).__name__}"), None)
                 if st is not None or b:
                     return last
                 continue
+            signal = self._observe(status, out, payload, cur_kid,
+                                   model or model_of(path), ctx)
+            if status < 400 and (model or model_of(path)):
+                # Truth is symmetric: a success clears any earlier provider block.
+                self.ledger.clear_pair_state(cur_kid, model or model_of(path))
             if status in (403, 404) and resource and i + 1 < len(attempts):
                 continue                                  # another project may own it
             if status == 429:
-                self._quota_cooldown(cur_kid, model or model_of(path), payload)
                 if not pinned and i + 1 < len(attempts):
                     continue
-                last = (status, out, payload)
+                last = (status, out, payload, signal)
                 continue
             if resource and status < 400 and not pinned:
                 self.ledger.fs_bind(resource, cur_kid)     # self-healed: remember it
-            return status, out, payload
+            return status, out, payload, signal
         return last
+
+    def _observe(self, status: int, out: dict, payload: bytes, kid: str,
+                 model: str | None, ctx: RequestContext) -> ProviderSignal | None:
+        """Fold one provider answer into the shared truth (SPEC §12)."""
+        if not model or status not in (429, 502, 503):
+            return None
+        signal = parse_provider_signal(status, out, payload, self.cfg)
+        if signal.blocks_pair:
+            self.truth.apply(signal, key_id=kid, model=model, context=ctx)
+        return signal
 
     def _send_upstream(self, method, url, headers, body, stream, length,
                        kid) -> tuple[int, dict, bytes]:
@@ -419,26 +535,12 @@ class GeminiProxy:
         tiers = len(self.cfg.chain) + len(self.cfg.overflow_tiers)
         return min(self.WALK_RETRIES, max(1, len(self.cfg.api_keys) * tiers))
 
-    def _quota_cooldown(self, kid: str, model: str | None, payload: bytes) -> None:
-        """A 429 from the provider is the router's own signal: reuse its taxonomy and
-        its cooldown table instead of inventing a second one."""
-        if not model:
-            return
-        err = GeminiClient._classify(httpx.Response(429, content=payload,
-                                                    headers={"content-type":
-                                                             "application/json"}))
-        if isinstance(err, GeminiHTTPError) and (err.quota_day or err.quota_minute):
-            from .ledger import pt_midnight_ts
-            until = pt_midnight_ts(self.cfg.quota_day_tz, days_ahead=1)
-            if err.retry_after is not None:
-                until = min(until, time.time() + err.retry_after + 5)
-            self.ledger.set_cooldown(kid, model, until,
-                                     "rpd_429" if err.quota_day else "rpm_429")
-
     # ------------------------------------------------------------------ plumbing
     def _upstream_headers(self, h: BaseHTTPRequestHandler) -> dict:
         return {k: v for k, v in h.headers.items()
-                if k.lower() not in HOP_BY_HOP and k.lower() not in CLIENT_AUTH_HEADERS}
+                if k.lower() not in HOP_BY_HOP
+                and k.lower() not in CLIENT_AUTH_HEADERS
+                and k.lower() not in CLIENT_CONTEXT_HEADERS}
 
     def _upstream_url(self, path: str, query: str) -> str:
         """Route the request to the configured upstream, keeping the provider's split

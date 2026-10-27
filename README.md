@@ -108,5 +108,77 @@ cache hits return it without deltas. Text events are not retained in `result.eve
 Truncated, blocked and interrupted responses are never cached. Existing calls stay
 non-streaming. Both paths share keys, model selection, auth fallback and the ledger.
 
+## Provider truth, request identity and annotations (v0.11.0)
+
+The counters in the ledger are a **prediction**; Google is the authority. Before v0.11
+a live 429 only benched a pair for ~65 seconds, and the pass-through re-selected pairs
+from scratch on every hop of a walk. On 2026-10-21 three client requests therefore
+produced **48 identical 429s in ten seconds**: three walks × 16 hops, cycling the same
+exhausted `key × model` pairs, with only three refusals reaching the client.
+
+Each API key belongs to a **separate Google account** (per-key×model isolation is
+correct — there is no shared project bucket to model). The incident was an
+amplification bug plus a short provider-side capacity blip, not a shared quota.
+
+What v0.11 changes:
+
+- **One `feedback` module** parses every 429/503 (real `Retry-After` header, HTTP-date,
+  `retryDelay`/`quotaId`/`quotaValue` in the body) and writes a `pair_state` row.
+  A confirmed `PerDay` verdict blocks the pair until the next **Pacific-time reset** —
+  no more `min(midnight, now + 65)`. An unexplained 429 benches it for the advertised
+  delay; three such hits inside five minutes are promoted to a day block.
+- **The walk never repeats a pair.** `visited` is threaded through `pick_pair`; when
+  every candidate is benched, the proxy answers locally with `429 + Retry-After`
+  (circuit breaker) instead of replaying the same refusals upstream.
+- **The proxy waits** for minute-scale gates (`proxy.walk_wait`) instead of firing at a
+  cooling pair. `2xx` clears any earlier provider block — truth is symmetric.
+- `503` is **not** RPD spend any more; counting overloads as daily usage used to make a
+  capacity storm look like an exhausted day. `cooldowns` is still written (mirrored) so
+  older library builds sharing the database agree on blocked pairs.
+
+### Identity and free-form comments
+
+Every audit row and every log line carries the router **version**, the **initiator**
+(free-form string supplied by the caller) and an arbitrary **comment** that has no
+behavioural effect whatsoever — it is stored and logged, never used for routing and
+never sent to Google.
+
+```bash
+# HTTP clients (headers are ASCII; percent-encode non-ASCII text)
+curl -s -X POST http://127.0.0.1:8787/v1beta/models/gemini-3.8-flash:generateContent \
+  -H "x-goog-api-key: $GEMINI_ROUTER_PROXY_TOKEN" \
+  -H "X-Router-Initiator: tldr-digest" \
+  -H "X-Router-Comment: starting new version testing" \
+  -H "X-Router-Request-Id: digest-20261028" -H 'Content-Type: application/json' \
+  -d '{"contents":[{"parts":[{"text":"hi"}]}]}'
+
+# Python library
+RouterRequest(prompt="...", initiator="tldr-digest",
+              comment="начинаем тестирование новой версии")
+
+# Standalone annotation: no provider call, no quota effect
+gemini-router note "начинаем тестирование новой версии" --initiator ops-audit
+gemini-router notes -n 20
+curl -s -X POST http://127.0.0.1:8787/v1/note \
+  -H "x-goog-api-key: $GEMINI_ROUTER_PROXY_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"comment":"начинаем тестирование новой версии","initiator":"ops-audit"}'
+
+# Inspect: version / initiator / comment / signal are in the audit rows
+gemini-router calls -n 50 --wide
+gemini-router calls --initiator tldr-digest --json
+curl -s http://127.0.0.1:8787/healthz          # includes "version"
+```
+
+Structured logs are one-line logfmt (`event=request v=0.11.0 rid=... initiator=...
+comment=... key=... model=... status=...`). Startup emits `event=startup`,
+provider verdicts emit `event=provider_feedback`, annotations emit `event=note`.
+
+New config keys (all optional, see `config.example.yaml`): `feedback.throttle_min_s`,
+`throttle_max_s`, `buffer_s`, `reset_buffer_s`, `overload_cooldown_s`, `promote_hits`,
+`promote_window_s`, `circuit_breaker`; `proxy.default_initiator`, `walk_wait`,
+`pool_circuit_breaker`. Schema v3 is purely additive — older readers keep working.
+
+Full design: [SPEC §12](docs/SPEC.md#12-provider-truth-and-request-identity-v011).
+
 Conventions: English in files, Conventional Commits, SemVer tags `v*` (gemini-mcp pins
 a tag), CI = ruff + pytest with mocked HTTP (see `AGENTS.md`).

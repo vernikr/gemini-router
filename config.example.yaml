@@ -1,0 +1,27 @@
+# Example config for gemini-router 0.11.0. Secrets come from the environment only.
+# See docs/SPEC.md §12 for the semantics of the feedback block.
+router:
+  chain: [gemini-3.8-flash, gemini-3.6-flash, gemini-3-flash-preview]
+  overflow_tiers: [gemini-3.5-flash-lite, gemma-auto]
+  overflow_default: lite            # off | lite | lite+gemma
+  quota_day_tz: America/Los_Angeles
+
+  # Each key is a SEPARATE Google account; per-key×model budgets are intentional.
+  limits_per_key_model: {rpd: 20, rpm: 5, tpm: 250000}
+  overflow_limits:      {rpd: 500, rpm: 15, tpm: 250000}
+
+  feedback:
+    throttle_min_s: 60              # floor for an unexplained 429
+    throttle_max_s: 900             # ceiling for a provider Retry-After
+    buffer_s: 5                    # safety margin over Retry-After
+    reset_buffer_s: 30             # avoid a race at PT midnight
+    overload_cooldown_s: 60        # 503 = capacity, not budget
+    promote_hits: 3                # unexplained 429s before a day block
+    promote_window_s: 300
+    circuit_breaker: true
+
+  proxy:
+    model_policy: strict
+    default_initiator: filesearch   # when the client sent no X-Router-Initiator
+    walk_wait: true                 # wait out minute gates instead of firing
+    pool_circuit_breaker: true      # local 429 when every pair is benched
