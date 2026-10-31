@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
 import shutil
 import wave
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from conftest import BASE, make_config
-from gemini_router import GeminiClient, Router, RouterError, routing
+from gemini_router import GeminiClient, Router, RouterError, routing, tts as tts_module
 from gemini_router.tts import WavAssembler, split_text
 
 
@@ -127,7 +129,7 @@ async def test_router_file_creates_one_mp3_and_preflights_quota(
 
     monkeypatch.setattr(routing.shutil, "which", lambda _: "/usr/bin/ffmpeg")
 
-    async def fake_encode(wav_path, mp3_path, *, bitrate_kbps=128):
+    async def fake_encode(wav_path, mp3_path, *, bitrate_kbps=128, on_progress=None):
         shutil.copyfile(wav_path, mp3_path)
 
     monkeypatch.setattr(routing, "encode_mp3", fake_encode)
@@ -164,3 +166,64 @@ async def test_router_rejects_oversized_single_segment(mock_api, tmp_path):
             await router.synthesize("long input")
     finally:
         await router.aclose()
+
+
+async def test_file_progress_advances_inside_a_slow_chunk(mock_api, tmp_path, monkeypatch):
+    cfg = make_config(tmp_path, api_keys=["tts-key"])
+    mock_api.post(f"{BASE}/models/gemini-3.8-flash-tts:countTokens").mock(
+        return_value=httpx.Response(200, json={"totalTokens": 4}))
+    monkeypatch.setattr(routing, "_TTS_PROGRESS_INTERVAL_S", 0.01)
+    monkeypatch.setattr(routing.shutil, "which", lambda _: "/usr/bin/ffmpeg")
+
+    async def fake_encode(wav_path, mp3_path, *, bitrate_kbps=128, on_progress=None):
+        shutil.copyfile(wav_path, mp3_path)
+
+    source = tmp_path / "slow.txt"
+    source.write_text("A deliberately slow chunk.", encoding="utf-8")
+    target = tmp_path / "slow.mp3"
+    router = Router(cfg)
+    events = []
+
+    async def slow_synthesize(*args, **kwargs):
+        await asyncio.sleep(0.06)
+        return SimpleNamespace(audio=wav_data(), tokens_in=4, key_id="tts-key")
+
+    monkeypatch.setattr(router, "synthesize", slow_synthesize)
+    monkeypatch.setattr(routing, "encode_mp3", fake_encode)
+    try:
+        await router.synthesize_file(source, output_path=target, on_event=events.append)
+        heartbeats = [
+            event for event in events
+            if event.stage == "file_progress"
+            and event.detail.get("phase") == "synthesis"
+            and event.detail.get("active_chunk_pct") is not None
+        ]
+        assert heartbeats
+        assert 0 < heartbeats[0].pct < 95
+        assert heartbeats[0].detail["active_chunk_pct"] > 0
+        assert heartbeats[0].detail["eta_s"] > 0
+    finally:
+        await router.aclose()
+
+
+async def test_encode_mp3_reports_ffmpeg_progress(tmp_path, monkeypatch):
+    wav_path = tmp_path / "source.wav"
+    wav_path.write_bytes(wav_data(b"\\x00\\x00" * 24_000))
+    executable = tmp_path / "ffmpeg"
+    executable.write_text(
+        "#!/bin/sh\\n"
+        'for argument do output="$argument"; done\\n'
+        'printf "encoded" > "$output"\\n'
+        'printf "out_time_us=1000000\\\\nprogress=continue\\\\n"\\n'
+        'printf "out_time_us=2000000\\\\nprogress=end\\\\n"\\n',
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    monkeypatch.setattr(tts_module.shutil, "which", lambda _: str(executable))
+    target = tmp_path / "source.mp3"
+    progress = []
+
+    await tts_module.encode_mp3(wav_path, target, on_progress=progress.append)
+
+    assert target.read_bytes() == b"encoded"
+    assert progress == [0.5, 1.0]
