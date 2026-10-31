@@ -677,41 +677,49 @@ class Router:
                 chunk_size = chunk_sizes[i - 1]
                 later_sizes = chunk_sizes[i:]
                 later_work = sum(later_sizes)
-                waiting_started: float | None = None
-                waiting_duration = 0.0
+                chunk_state = {"waiting_started": None, "waiting_duration": 0.0}
 
-                async def publish_chunk_progress() -> None:
+                async def publish_chunk_progress(
+                    state=chunk_state,
+                    started_at=chunk_started,
+                    current_size=chunk_size,
+                    throughput=estimated_tokens_per_second,
+                    future_sizes=later_sizes,
+                    index=chunk_index,
+                    done_work=completed_work,
+                    work_total=total_work,
+                    chunks_total=len(chunks),
+                ) -> None:
                     nonlocal last_progress
                     while True:
                         await asyncio.sleep(_TTS_PROGRESS_INTERVAL_S)
-                        if waiting_started is not None:
+                        if state["waiting_started"] is not None:
                             continue
                         elapsed = max(
                             0.05,
-                            time.monotonic() - chunk_started - waiting_duration,
+                            time.monotonic() - started_at - state["waiting_duration"],
                         )
-                        expected_s = max(8.0, chunk_size / estimated_tokens_per_second)
+                        expected_s = max(8.0, current_size / throughput)
                         fraction = min(0.9, 0.75 * elapsed / expected_s)
                         active_rate = max(
                             0.1,
-                            min(estimated_tokens_per_second, chunk_size * fraction / elapsed),
+                            min(throughput, current_size * fraction / elapsed),
                         )
-                        remaining_current = chunk_size * (1.0 - fraction)
+                        remaining_current = current_size * (1.0 - fraction)
                         future_eta = sum(
-                            max(8.0, size / estimated_tokens_per_second)
-                            for size in later_sizes
+                            max(8.0, size / throughput) for size in future_sizes
                         )
                         eta_s = max(1, round(remaining_current / active_rate + future_eta))
                         pct = min(
                             94.9,
-                            95.0 * (completed_work + chunk_size * fraction) / total_work,
+                            95.0 * (done_work + current_size * fraction) / work_total,
                         )
                         last_progress = max(last_progress, pct)
                         report_progress(
-                            last_progress, f"TTS · {chunk_index}/{len(chunks)}",
-                            phase="synthesis", completed_chunks=chunk_index - 1,
-                            total_chunks=len(chunks), active_chunk_pct=round(fraction * 100, 1),
-                            eta_s=eta_s,
+                            last_progress, f"TTS · {index}/{chunks_total}",
+                            phase="synthesis", completed_chunks=index - 1,
+                            total_chunks=chunks_total,
+                            active_chunk_pct=round(fraction * 100, 1), eta_s=eta_s,
                         )
 
                 ticker = (
@@ -719,14 +727,15 @@ class Router:
                 )
 
                 def chunk_event(event: RouterEvent, current_chunk: int = i,
-                                total_chunks: int = len(chunks)) -> None:
-                    nonlocal waiting_started, waiting_duration
+                                total_chunks: int = len(chunks), state=chunk_state) -> None:
                     if event.stage == "waiting":
-                        if waiting_started is None:
-                            waiting_started = time.monotonic()
-                    elif waiting_started is not None:
-                        waiting_duration += time.monotonic() - waiting_started
-                        waiting_started = None
+                        if state["waiting_started"] is None:
+                            state["waiting_started"] = time.monotonic()
+                    elif state["waiting_started"] is not None:
+                        state["waiting_duration"] += (
+                            time.monotonic() - state["waiting_started"]
+                        )
+                        state["waiting_started"] = None
                     if on_event:
                         event.detail.setdefault("chunk", current_chunk)
                         event.detail.setdefault("chunks", total_chunks)
@@ -748,7 +757,8 @@ class Router:
                             pass
 
                 chunk_elapsed = max(
-                    0.1, time.monotonic() - chunk_started - waiting_duration
+                    0.1,
+                    time.monotonic() - chunk_started - chunk_state["waiting_duration"],
                 )
                 measured_rate = chunk_size / chunk_elapsed
                 estimated_tokens_per_second = max(
