@@ -9,12 +9,14 @@ import sys
 from pathlib import Path
 
 from rich.console import Console
+from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn
 from rich.table import Table
 
 from . import __version__
 from .config import Config
 from .context import audit_line
 from .errors import RouterError
+from .events import RouterEvent
 from .ledger import Ledger, iso, pt_midnight_ts
 from .routing import Router, pick_gemma
 
@@ -346,22 +348,71 @@ def cmd_doctor(args, cfg: Config | None = None) -> int:
     return 0
 
 
+def _format_eta(seconds: float) -> str:
+    total = max(0, int(float(seconds) + 0.5))
+    if total >= 3600:
+        return f"{total // 3600}h {(total % 3600) // 60:02d}m"
+    if total >= 60:
+        return f"{total // 60}:{total % 60:02d}"
+    return f"{total}s"
+
+
 def cmd_tts(args, cfg: Config | None = None) -> int:
     """Read TXT/Markdown, synthesize in quota-sized chunks, and write one MP3."""
     cfg = cfg if cfg is not None else _load_cfg(args)
+    progress = Progress(
+        TextColumn("{task.description}", markup=False),
+        BarColumn(bar_width=24),
+        TaskProgressColumn(),
+        console=console,
+        transient=False,
+        refresh_per_second=8,
+        disable=bool(args.json) or not console.is_terminal,
+    )
+    with progress:
+        task = progress.add_task("Preparing audio", total=100)
+        completed = 0.0
 
-    async def _run():
-        r = _router(cfg)
-        try:
-            return await r.synthesize_file(args.file, output_path=args.output,
-                                           voice=args.voice, style=args.style,
-                                           bitrate_kbps=args.bitrate, wait=args.wait,
-                                           source="cli", initiator="gemini-router-cli",
-                                           request_id=args.request_id)
-        finally:
-            await r.aclose()
+        def on_event(event: RouterEvent) -> None:
+            nonlocal completed
+            if event.pct is not None:
+                completed = max(completed, min(100.0, float(event.pct)))
+            eta_s = None
+            if event.stage == "file_progress":
+                description = str(event.detail.get("label") or "Preparing audio")
+                eta_s = event.detail.get("eta_s")
+            elif event.stage == "waiting":
+                description = "Waiting"
+                eta_s = event.wait_s
+            elif event.stage == "dispatch":
+                chunk, chunks = event.detail.get("chunk"), event.detail.get("chunks")
+                description = f"TTS · {chunk}/{chunks}" if chunk and chunks else "TTS"
+            elif event.stage == "retry":
+                chunk, chunks = event.detail.get("chunk"), event.detail.get("chunks")
+                description = f"Retry · {chunk}/{chunks}" if chunk and chunks else "Retry"
+            elif event.stage == "switch":
+                chunk, chunks = event.detail.get("chunk"), event.detail.get("chunks")
+                description = f"Switch · {chunk}/{chunks}" if chunk and chunks else "Switch"
+            else:
+                return
+            if eta_s is not None:
+                description += f" · ~{_format_eta(eta_s)}"
+            progress.update(task, completed=completed, description=description)
+            progress.refresh()
 
-    result = asyncio.run(_run())
+        async def _run():
+            r = _router(cfg)
+            try:
+                return await r.synthesize_file(
+                    args.file, output_path=args.output, voice=args.voice, style=args.style,
+                    bitrate_kbps=args.bitrate, wait=args.wait, source="cli",
+                    initiator="gemini-router-cli", request_id=args.request_id,
+                    on_event=None if args.json else on_event,
+                )
+            finally:
+                await r.aclose()
+
+        result = asyncio.run(_run())
     payload = {"path": str(result.path), "model": result.model,
                "chunks": result.chunks, "tokens_in": result.tokens_in,
                "key_ids": result.key_ids, "latency_s": round(result.latency_s, 2)}

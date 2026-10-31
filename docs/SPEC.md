@@ -129,6 +129,14 @@ the input TPM gate. Output WAV chunks are appended to disk and asynchronously en
 MP3 using system `ffmpeg` (128 kbps mono by default). It supports one voice per file;
 voice and style are optional. No audio is returned as a text completion or streamed.
 
+File progress events (stage="file_progress") carry an overall monotonic percentage, a phase
+(preflight, synthesis, encoding, or complete), completed_chunks, and total_chunks.
+During synthesis, active_chunk_pct and eta_s are estimates: completed chunks are weighted
+by preflight input tokens, while the active chunk advances gradually and is capped below
+completion until the provider request returns. The ETA is recalculated from observed chunk
+throughput. During encoding, encoding_pct follows ffmpeg output-time progress and eta_s is
+estimated from elapsed encoding time. Consumers should present eta_s as approximate.
+
 Errors: `QuotaExhaustedError` carries the machine-readable payload
 (per-model rpd_left/rpm_wait_s/tpm_wait_s/cooldown_until, reset_eta_pt, hint) — frontends
 surface it as-is. `RouterError` base for everything else (network, http 4xx, parse).

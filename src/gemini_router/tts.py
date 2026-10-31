@@ -10,6 +10,7 @@ import io
 import re
 import shutil
 import wave
+from collections.abc import Callable
 from pathlib import Path
 
 from .config import estimate_tokens
@@ -133,8 +134,9 @@ class WavAssembler:
 
 
 async def encode_mp3(wav_path: str | Path, mp3_path: str | Path, *,
-                     bitrate_kbps: int = 128) -> None:
-    """Encode WAV to MP3 in a child process so CPU work does not block asyncio."""
+                     bitrate_kbps: int = 128,
+                     on_progress: Callable[[float], None] | None = None) -> None:
+    """Encode WAV to MP3 and forward ffmpeg's real output-time progress (0–1)."""
     if not 32 <= bitrate_kbps <= 320:
         raise ValueError("MP3 bitrate must be between 32 and 320 kbps")
     ffmpeg = shutil.which("ffmpeg")
@@ -142,12 +144,48 @@ async def encode_mp3(wav_path: str | Path, mp3_path: str | Path, *,
         raise RouterError("MP3 encoding requires ffmpeg on PATH")
     target = Path(mp3_path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(wav_path), "rb") as source:
+        duration_us = max(
+            1, int(source.getnframes() / source.getframerate() * 1_000_000)
+        )
     proc = await asyncio.create_subprocess_exec(
         ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
         "-i", str(wav_path), "-vn", "-codec:a", "libmp3lame", "-b:a",
-        f"{bitrate_kbps}k", "-ac", "1", str(target),
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-    _, stderr = await proc.communicate()
-    if proc.returncode:
-        target.unlink(missing_ok=True)
-        raise RouterError(f"ffmpeg MP3 encoding failed: {stderr.decode(errors='replace')[-500:]}")
+        f"{bitrate_kbps}k", "-ac", "1", "-progress", "pipe:1", "-nostats",
+        str(target), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    stderr_task = asyncio.create_task(proc.stderr.read()) if proc.stderr else None
+    last_fraction = 0.0
+    try:
+        if proc.stdout is not None:
+            while line := await proc.stdout.readline():
+                key, separator, value = line.decode(errors="replace").strip().partition("=")
+                if not separator:
+                    continue
+                if key == "out_time_us":
+                    try:
+                        fraction = min(1.0, max(0.0, int(value) / duration_us))
+                    except ValueError:
+                        continue
+                    if fraction > last_fraction:
+                        last_fraction = fraction
+                        if on_progress:
+                            on_progress(fraction)
+                elif key == "progress" and value == "end":
+                    if last_fraction < 1.0:
+                        last_fraction = 1.0
+                        if on_progress:
+                            on_progress(1.0)
+        returncode = await proc.wait()
+        stderr = await stderr_task if stderr_task else b""
+        if returncode:
+            target.unlink(missing_ok=True)
+            raise RouterError(
+                f"ffmpeg MP3 encoding failed: {stderr.decode(errors='replace')[-500:]}"
+            )
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        if stderr_task and not stderr_task.done():
+            stderr_task.cancel()
+            await asyncio.gather(stderr_task, return_exceptions=True)

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.14.2 — live TTS progress and ETA
+
+### Added
+- TTS events include monotonic pseudo-progress inside the active chunk, weighted by preflight token counts, with an ETA adapted from completed chunk throughput.
+- MP3 encoding reports ffmpeg output-time progress and a remaining-time estimate.
+- Router and gateway CLIs render a compact one-line indicator; JSON output remains machine-readable.
+
+
 ## 0.14.1 — REST TTS response parsing
 
 ### Fixed

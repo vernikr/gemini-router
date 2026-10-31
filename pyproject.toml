@@ -1,6 +1,6 @@
 [project]
 name = "gemini-router"
-version = "0.14.1"
+version = "0.14.2"
 description = "Quota-aware Gemini router with persistent usage ledger, native API proxy, TTS and auto-updating CLI"
 readme = "README.md"
 requires-python = ">=3.12"
