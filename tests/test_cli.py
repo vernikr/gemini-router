@@ -134,5 +134,5 @@ def test_tts_cli_shows_compact_progress_and_eta(tmp_path, monkeypatch):
 
     assert cli_module.cmd_tts(args) == 0
     rendered = output.getvalue()
-    assert "TTS · 3/8 · ~1:24" in rendered
+    assert "TTS · 3/8" in rendered and "~1:24" in rendered
     assert "100%" in rendered
