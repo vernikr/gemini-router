@@ -399,6 +399,7 @@ def cmd_tts(args, cfg: Config | None = None) -> int:
             if eta_s is not None:
                 description += f" · ~{_format_eta(eta_s)}"
             progress.update(task, completed=completed, description=description)
+            progress.refresh()
 
         async def _run():
             r = _router(cfg)
