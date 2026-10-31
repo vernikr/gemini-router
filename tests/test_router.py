@@ -294,9 +294,8 @@ def test_quota_exhausted_message_has_no_dangling_separator():
     assert str(QuotaExhaustedError([], "eta")) == "quota exhausted"
 
 
-async def test_routing_asks_for_the_model_list_once(tmp_path, respx_mock):
-    """Every key on one account tier gets the same model list, so probing N keys buys
-    nothing. 3.4: this was one round trip per key on a path that runs per request."""
+async def test_routing_checks_model_availability_per_project(tmp_path, respx_mock):
+    """Keys may belong to different Google projects, so each project is probed once."""
     calls = {"n": 0}
 
     def _count(request):
@@ -305,16 +304,16 @@ async def test_routing_asks_for_the_model_list_once(tmp_path, respx_mock):
                                                    for m in MODELS]})
 
     respx_mock.get(f"{BASE}/models").mock(side_effect=_count)
-    cfg = make_config(tmp_path, api_keys=["k1", "k2", "k3", "k4"], models_refresh_h=0)
+    cfg = make_config(tmp_path, api_keys=["k1", "k2", "k3", "k4"], models_refresh_h=12)
     r = Router(cfg)
     try:
         avail = await r.availability()
-        assert calls["n"] == 1                        # one probe, not four
+        assert calls["n"] == 4                        # each project is independent
         assert set(avail) == {key_id(k) for k in cfg.api_keys}
-        assert all(v is not None for v in avail.values())   # every key still answered
+        assert all(v is not None for v in avail.values())
 
-        per = await r.availability_per_key()          # the setup/doctor question
-        assert calls["n"] == 5                        # one per key, as asked
+        per = await r.availability_per_key()
+        assert calls["n"] == 4                        # same per-project cache
         assert set(per) == set(avail)
     finally:
         await r.aclose()

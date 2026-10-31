@@ -374,6 +374,36 @@ function calls(base, token, context, options = {}) {
   });
 }
 
+function ttsFile(base, token, context, uploadId, options = {}) {
+  const o = options || {};
+  const ctx = toContext(context);
+  return requestJSON(base, token, ctx, "/v1/tts/file", {
+    method: "POST", fetch: o.fetch, signal: o.signal,
+    body: {
+      upload_id: uploadId,
+      voice: o.voice,
+      style: o.style,
+      wait_for_minute_limits: o.waitForMinuteLimits,
+      request_id: o.requestId || ctx.requestId,
+      wait_seconds: o.waitSeconds === undefined ? 25 : o.waitSeconds,
+    },
+  });
+}
+
+function ttsStatus(base, token, context, requestId, options = {}) {
+  const path = `/v1/tts/${encodeURIComponent(requestId)}`;
+  return requestJSON(base, token, context, path, {
+    fetch: options.fetch, signal: options.signal,
+  });
+}
+
+function ttsDownload(base, token, context, requestId, options = {}) {
+  const path = `/v1/tts/${encodeURIComponent(requestId)}/download`;
+  return routerFetch(base, token, context, path, {
+    fetch: options.fetch, signal: options.signal,
+  });
+}
+
 async function health(base, options = {}) {
   const o = options || {};
   const url = makeURL(base, "/healthz");
@@ -398,6 +428,9 @@ module.exports = {
   note,
   notes,
   calls,
+  ttsFile,
+  ttsStatus,
+  ttsDownload,
   health,
   makeTraceparent,
   parseTraceparent,

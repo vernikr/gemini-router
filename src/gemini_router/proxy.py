@@ -42,7 +42,7 @@ from urllib.parse import parse_qsl, urlparse
 
 import httpx
 
-from .config import Config, key_id
+from .config import TTS_MODEL, Config, estimate_tokens, key_id
 from .context import (
     CLIENT_CONTEXT_HEADERS,
     RequestContext,
@@ -58,6 +58,7 @@ from .filesearch import (
     UploadTickets,
     allowed_path,
     interactions_model,
+    interactions_text,
     is_create,
     is_upload_chunk,
     is_upload_start,
@@ -79,6 +80,20 @@ CLIENT_AUTH_HEADERS = {"x-goog-api-key", "authorization", "cookie"}
 # a free-form comment or trace header must never change a provider request.
 CHUNK = 1 << 20          # 1 MiB: streamed, so a 2 GB upload never lands in RAM twice
 RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
+
+
+def _usage_counts(payload: bytes) -> tuple[int | None, int | None]:
+    try:
+        data = json.loads(payload)
+    except (ValueError, TypeError):
+        return None, None
+    usage = data.get("usage") or data.get("usageMetadata") or {}
+    tin = (usage.get("input_tokens") or usage.get("promptTokenCount") or
+           usage.get("inputTokens"))
+    tout = (usage.get("output_tokens") or usage.get("candidatesTokenCount") or
+            usage.get("outputTokens"))
+    return (int(tin) if tin is not None else None,
+            int(tout) if tout is not None else None)
 
 
 def google_error(status: int, message: str, *, code: int | None = None,
@@ -436,13 +451,25 @@ class GeminiProxy:
         if model_in_body and not model:
             model = interactions_model(body)
         requested_model = model
+        tts_tokens = estimate_tokens(interactions_text(body)) if model == TTS_MODEL else 0
+        # Keep a small allowance for speech metadata and the selected voice in the
+        # serialized request; usage metadata corrects the estimate after the response.
+        if model == TTS_MODEL and body:
+            try:
+                request_data = json.loads(body)
+                tts_tokens += estimate_tokens(json.dumps(
+                    {"generation_config": request_data.get("generation_config")},
+                    ensure_ascii=False))
+            except (ValueError, TypeError):
+                pass
         selection: Selection | None = None
-        if model and cfg.proxy.model_policy != "passthrough":
+        if model and (model == TTS_MODEL or cfg.proxy.model_policy != "passthrough"):
             # Key and model come from the shared selection walk (SPEC §11.6): resource
             # affinity pins the key and only the model walks; an unbound model call
             # (plain generateContent/countTokens) walks both — the pool rotates by
             # remaining budget instead of riding the File Search pin.
-            selection = self.routing.choose(model, kid if resource else None)
+            selection = self.routing.choose(model, kid if resource else None,
+                                            est_tokens=tts_tokens)
             new_kid, chosen = selection.key_id, selection.model
             if chosen and chosen != model:
                 if model_in_body:
@@ -475,7 +502,7 @@ class GeminiProxy:
             hop += 1
             row_id = self.ledger.plan(
                 key_id=key_id(key), model=model or FILE_ROW_MODEL,
-                kind="single" if spending else "filesearch", est_tokens=0,
+                kind="single" if spending else "filesearch", est_tokens=tts_tokens,
                 request_id=ctx.request_id, source=ctx.initiator or "filesearch",
                 initiator=ctx.initiator or "filesearch", comment=ctx.comment or None,
                 version=self.version, job=ctx.job, trace_id=ctx.trace_id,
@@ -487,9 +514,12 @@ class GeminiProxy:
                 method, url, headers, body, stream, length, path, resource, pinned,
                 kid, key, model=model, ctx=ctx)
             if row_id is not None:
+                input_tokens, output_tokens = (
+                    _usage_counts(pl) if model == TTS_MODEL else (None, None))
                 self.ledger.resolve(
                     row_id, "ok" if st < 400 else self._status_name(st),
-                    http_status=st, latency_ms=int((time.time() - started) * 1000),
+                    http_status=st, tokens_in=input_tokens, tokens_out=output_tokens,
+                    latency_ms=int((time.time() - started) * 1000),
                     quota_error=signal.detail if signal and signal.blocks_pair else None,
                     retry_after_s=signal.retry_after_s if signal else None,
                     quota_id=signal.quota_id if signal else None,
@@ -521,7 +551,8 @@ class GeminiProxy:
             for _ in range(self._walk_bound()):
                 if status not in (429, 503):
                     break
-                sel = self.routing.choose(model, kid if resource else None, exclude=visited)
+                sel = self.routing.choose(model, kid if resource else None, exclude=visited,
+                                          est_tokens=tts_tokens)
                 if sel.state == "throttled" and cfg.proxy.pool_circuit_breaker:
                     status, out_headers, payload, _ = self._local_throttle(sel, ctx)
                     break

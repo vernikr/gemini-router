@@ -9,7 +9,7 @@ from gemini_router import Config, keyauth
 BASE = "https://generativelanguage.googleapis.com/v1beta"
 MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash",
           "gemini-3-flash-preview", "gemini-3.5-flash-lite", "gemini-2.5-flash",
-          "gemma-3-27b-it", "gemma-4-12b-it"]
+          "gemma-3-27b-it", "gemma-4-12b-it", "gemini-3.8-flash-tts"]
 
 
 def make_config(tmp_path, **over) -> Config:

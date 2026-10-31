@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.13.0 — single-speaker Gemini 3.8 Flash TTS
+
+### Added
+- `Router.synthesize()` for one audio segment and `Router.synthesize_file()` for UTF-8
+  TXT/Markdown → paragraph/sentence-aware chunks → one MP3 file.
+- Dedicated TTS request path through the Gemini Interactions API; voice and style are
+  optional; chunks are appended as WAV on disk and encoded to MP3 by asynchronous ffmpeg.
+- Per-project TTS quota defaults (3 RPM, 10,000 input TPM, 10 RPD) in the shared SQLite
+  ledger, preflight token measurement, quota-aware project rotation/waiting, provider
+  feedback, and per-project `listModels` validation.
+- CLI `gemini-router tts`; TTS quota rows in `gemini-router quota`.
+
+### Docs
+- README and SPEC describe the input-only TPM limit, 8,192-token request ceiling,
+  supported input formats, MP3/ffmpeg requirement and API examples.
+
 ## 0.12.0 — job/trace correlation, npm client
 
 ### Added

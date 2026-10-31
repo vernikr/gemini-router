@@ -1,7 +1,7 @@
 {
   "name": "gemini-router",
-  "version": "0.12.0",
-  "description": "Zero-dependency client helpers for gemini-router job/trace correlation, annotations and the native Gemini pass-through proxy",
+  "version": "0.13.0",
+  "description": "Zero-dependency client helpers for gemini-router job/trace correlation, annotations, TTS and the native Gemini pass-through proxy",
   "license": "MIT",
   "author": "vernikr",
   "type": "module",

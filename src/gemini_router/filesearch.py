@@ -29,7 +29,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse
 import httpx
 
 from . import keyauth
-from .config import Config, key_id
+from .config import TTS_MODEL, Config, key_id
 from .ledger import Ledger
 from .routing import gates_for, pick_pair
 
@@ -162,6 +162,22 @@ def interactions_model(body: bytes | None) -> str | None:
     data = _body_json(body)
     model = str((data or {}).get("model") or "")
     return model or None
+
+
+def interactions_text(body: bytes | None) -> str:
+    """Extract only the text portions of a single-speaker TTS interaction for the
+    pre-flight TPM estimate. Other Interactions calls naturally return an empty string.
+    """
+    data = _body_json(body or b"") or {}
+    pieces: list[str] = []
+    for turn in data.get("input") or []:
+        content = turn.get("content") or [] if isinstance(turn, dict) else []
+        if isinstance(content, str):
+            pieces.append(content)
+        elif isinstance(content, list):
+            pieces.extend(str(item.get("text") or "") for item in content
+                          if isinstance(item, dict) and item.get("type") == "text")
+    return "\n".join(part for part in pieces if part)
 
 
 def set_interactions_model(body: bytes, model: str) -> bytes:
@@ -364,7 +380,8 @@ class FileSearchRouting:
         return None
 
     def choose(self, requested: str | None, kid_pin: str | None = None,
-               exclude: set[tuple[str, str]] | None = None) -> Selection:
+               exclude: set[tuple[str, str]] | None = None,
+               est_tokens: int = 0) -> Selection:
         """Selection for a model-path request, per `proxy.model_policy` (SPEC §11.6).
 
         The walk itself is `routing.pick_pair` — the single selection procedure every
@@ -380,6 +397,26 @@ class FileSearchRouting:
           keep re-selecting the same exhausted pair.
         """
         policy = self.cfg.proxy.model_policy
+        if requested == TTS_MODEL:
+            # TTS is a separate, fixed-model operation: never rewrite it to a text model,
+            # even when the proxy's text policy is `strict` or `passthrough`.
+            pinned_key = self._resolve(kid_pin) if kid_pin else None
+            if kid_pin and pinned_key is None:
+                return Selection(kid_pin, TTS_MODEL)
+            pool = [pinned_key] if pinned_key else list(self.cfg.api_keys)
+            avail = {key_id(k): self.available_models(k) for k in pool}
+            choice = pick_pair(self.cfg, self.ledger, overflow="off",
+                               chain_override=[TTS_MODEL], keys=pool, avail=avail,
+                               est_tokens=est_tokens, exclude=exclude,
+                               now=self._now() if self._now else None)
+            if choice.key is not None:
+                return Selection(key_id(choice.key), TTS_MODEL,
+                                 "wait" if choice.reason == "wait" else "ok",
+                                 choice.retry_after_s,
+                                 choice.gates["wait_s"] if choice.gates else 0.0)
+            fallback_kid = kid_pin or self.pin()
+            return Selection(fallback_kid, TTS_MODEL, choice.reason,
+                             choice.retry_after_s or 60.0)
         if policy == "passthrough" or not requested:
             return Selection(kid_pin or self.pin(), requested)
         keys: list[str] | None = None

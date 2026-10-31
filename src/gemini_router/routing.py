@@ -7,14 +7,17 @@ import hashlib
 import json
 import random
 import re
+import shutil
+import tempfile
 import time
+import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import httpx
 
-from .config import Config, estimate_tokens, key_id
+from .config import TTS_MODEL, Config, estimate_tokens, key_id
 from .context import RequestContext, router_version
 from .errors import (
     FileNotReady,
@@ -24,9 +27,10 @@ from .errors import (
 )
 from .events import RouterEvent
 from .feedback import QuotaTruth
-from .gemini import GeminiClient, UploadedFile, file_parts
+from .gemini import GeminiClient, TTSResult, UploadedFile, file_parts
 from .ledger import Ledger, iso, pt_midnight_ts
 from .tariffs import media_class
+from .tts import MAX_INPUT_TOKENS, WavAssembler, encode_mp3, split_text
 
 Emitter = Callable[[RouterEvent], None]
 
@@ -78,6 +82,17 @@ class RouterResult:
     trace_id: str | None = None
     step: str = ""
     files_used: list[UploadedFile] = field(default_factory=list)  # actual key's uploads
+
+
+@dataclass(slots=True)
+class TTSFileResult:
+    path: Path
+    model: str
+    chunks: int
+    tokens_in: int
+    key_ids: list[str] = field(default_factory=list)
+    latency_s: float = 0.0
+    mime_type: str = "audio/mpeg"
 
 
 def gates_from(cfg: Config, model: str, kid: str, spent: tuple[int, int],
@@ -298,19 +313,15 @@ class Router:
 
     # ------------------------------------------------------------------ info
     async def availability(self) -> dict[str, set[str] | None]:
-        """key_id → live model set (None = listModels failed → trust config, b04).
+        """key_id → that project's live model set (None = probe failed; trust config).
 
-        One call, not one per key: the model list is a property of the account tier, and
-        every key on one plan gets the same answer, so asking N times buys nothing and
-        costs N round trips on a path that runs per request. The result is still keyed
-        per key so callers keep their shape, and a key whose own liveness matters
-        (setup, doctor) can pass `per_key=True`.
+        API keys may belong to different Google projects and tiers, so each key is
+        checked independently. Results are cached for `models_refresh_h`.
         """
-        return await self._availability(per_key=False)
+        return await self._availability(per_key=True)
 
     async def availability_per_key(self) -> dict[str, set[str] | None]:
-        """The same probe against every key separately — for checking that each key
-        works at all, which is a different question from what models exist."""
+        """Explicit alias for callers that want to emphasize per-project probing."""
         return await self._availability(per_key=True)
 
     async def _availability(self, *, per_key: bool) -> dict[str, set[str] | None]:
@@ -364,7 +375,8 @@ class Router:
         """Per key×model budget rows for chain + literal overflow tiers (BR3)."""
         now = now or self._now()
         models = list(dict.fromkeys(
-            self.cfg.chain + [m for m in self.cfg.overflow_tiers if m != "gemma-auto"]))
+            self.cfg.chain + [m for m in self.cfg.overflow_tiers if m != "gemma-auto"]
+            + [TTS_MODEL]))
         snap = self._snapshot(now)
         rows = [self._gates_from_snap(snap, m, k, now)
                 for m in models for k in self.cfg.api_keys]
@@ -416,6 +428,250 @@ class Router:
                                trace_id=trace_id, step=step)
         self.ledger.resolve(row, "ok", tokens_in=n, tokens_out=0)
         return n
+
+    async def synthesize(self, text: str, *, voice: str | None = None,
+                         style: str | None = None, wait: bool | None = None,
+                         source: str = "cli", initiator: str | None = None,
+                         request_id: str | None = None, job: str | None = None,
+                         trace_id: str | None = None, step: str = "tts",
+                         on_event: Emitter | None = None,
+                         _input_tokens: int | None = None) -> TTSResult:
+        """Synthesize one bounded text segment with the shared model/key ledger.
+
+        TTS has its own fixed model and quota table, but reuses the router's key order,
+        gates, provider feedback, wait policy, retries and SQLite audit.
+        """
+        if not text or not text.strip():
+            raise ValueError("TTS text must not be empty")
+        model = TTS_MODEL
+        today = iso(self._now())[:10]
+        default_job = f"{initiator or source}@{today}"
+        ctx = RequestContext(initiator=initiator or source, source=source,
+                             request_id=request_id or uuid.uuid4().hex[:12],
+                             job=job or default_job,
+                             trace_id=trace_id or job or default_job, step=step)
+
+        def emit(stage: str, **kwargs) -> None:
+            if on_event:
+                on_event(RouterEvent(stage=stage, model=model, **kwargs))
+
+        # countTokens is the provider's input-token count and is recorded as a
+        # non-spending ledger event. TPM gates count input only; audio tokens are output.
+        if _input_tokens is not None:
+            est = _input_tokens
+        else:
+            try:
+                est = await self.count_tokens(text, model=model, job=ctx.job,
+                                              trace_id=ctx.trace_id, step=f"{step}:count",
+                                              initiator=ctx.initiator, request_id=ctx.request_id)
+            except (GeminiHTTPError, RouterError, httpx.HTTPError):
+                est = estimate_tokens(text)
+        if est > MAX_INPUT_TOKENS:
+            raise RouterError(f"TTS segment is {est} input tokens; the model limit is "
+                              f"{MAX_INPUT_TOKENS}. Use synthesize_file() to split it.")
+
+        available = await self._safe_avail()
+        keys = self._keys_sorted(model)
+        if available:
+            keys = [k for k in keys if available.get(key_id(k)) is None
+                    or model in (available.get(key_id(k)) or set())]
+        if not keys:
+            raise RouterError(f"{model} is unavailable for every configured project")
+        wait_enabled = self.cfg.wait.enabled_default if wait is None else wait
+        deadline = self._now() + self.cfg.wait.max_s + self.cfg.retry.provider_timeout_s
+        visited: set[str] = set()
+        dead_keys: set[str] = set()
+        failures: list[str] = []
+        while True:
+            candidates = [k for k in keys if key_id(k) not in visited
+                          and key_id(k) not in dead_keys]
+            if not candidates:
+                # A gate/provider cooldown is the only reason to revisit. Permanently
+                # rejected credentials are excluded for the rest of this logical call.
+                candidates = [k for k in keys if key_id(k) not in dead_keys]
+                visited.clear()
+            if not candidates:
+                raise RouterError("every configured Gemini API key was rejected")
+            gates = [(k, self._gates(model, k, est)) for k in candidates]
+            usable = [(k, g) for k, g in gates if g["rpd_left"] > 0 and g["wait_s"] <= 0]
+            if usable:
+                key, gate = usable[0]
+            else:
+                minute = [(k, g) for k, g in gates if g["rpd_left"] > 0 and g["wait_s"] > 0]
+                if not minute:
+                    payload = self.model_budgets([model])
+                    eta = iso(pt_midnight_ts(self.cfg.quota_day_tz, days_ahead=1))
+                    raise QuotaExhaustedError(
+                        payload, eta, hint="TTS daily request quota exhausted across the key pool",
+                        waited=False, failures=failures)
+                key, gate = min(minute, key=lambda item: item[1]["wait_s"])
+                if not wait_enabled or gate["wait_s"] > self.cfg.wait.max_s:
+                    payload = self.model_budgets([model])
+                    eta = iso(pt_midnight_ts(self.cfg.quota_day_tz, days_ahead=1))
+                    raise QuotaExhaustedError(payload, eta,
+                                              hint=f"TTS minute quota; retry in about "
+                                                   f"{gate['wait_s']:.0f}s",
+                                              waited=False, failures=failures)
+                emit("waiting", key_id=key_id(key), wait_s=gate["wait_s"],
+                     detail={"reason": gate["reason"]})
+                await self._sleep(min(gate["wait_s"], max(0.05, deadline - self._now())))
+                if self._now() >= deadline:
+                    raise RouterError("TTS quota wait exceeded the request deadline")
+                continue
+
+            kid = key_id(key)
+            visited.add(kid)
+            gap = max(self.cfg.retry.request_delay_s,
+                      self.cfg.window_s / max(1, self.cfg.limits_for(model).rpm))
+            last = self.ledger.last_call_ts(kid, model)
+            if last is not None and (self._now() - last) < gap:
+                delay = gap - (self._now() - last)
+                emit("pacing", key_id=kid, wait_s=delay,
+                     detail={"reason": "tts_rpm_smoothing"})
+                await self._sleep(delay)
+
+            row_id = self.ledger.plan(key_id=kid, model=model, kind="single", est_tokens=est,
+                                      request_id=ctx.request_id, source=source,
+                                      initiator=ctx.initiator, version=ctx.version,
+                                      job=ctx.job, trace_id=ctx.trace_id, step=step)
+            emit("dispatch", key_id=kid, detail={"row_id": row_id, "est_tokens": est})
+            t0 = self._now()
+            try:
+                result = await self.client.synthesize(key, model, text,
+                                                     voice=voice, style=style)
+            except GeminiHTTPError as exc:
+                elapsed = int((self._now() - t0) * 1000)
+                if exc.status in (429, 503):
+                    signal = exc.signal or self.truth_fallback(exc)
+                    self.ledger.resolve(row_id, "quota" if exc.status == 429 else "http5xx",
+                                        http_status=exc.status, latency_ms=elapsed,
+                                        quota_error=str(exc), retry_after_s=signal.retry_after_s,
+                                        quota_id=signal.quota_id, signal_kind=signal.kind,
+                                        provider_reason=signal.reason)
+                    self.truth.apply(signal, key_id=kid, model=model, context=ctx)
+                    failures.append(f"{kid}: HTTP {exc.status}: {exc}")
+                    emit("switch", key_id=kid, detail={"reason": signal.reason or exc.status})
+                    if signal.kind == "minute" and wait_enabled:
+                        visited.discard(kid)
+                    continue
+                self._resolve_err(row_id, exc, elapsed)
+                failures.append(f"{kid}: {exc}")
+                if exc.key_rejected:
+                    dead_keys.add(kid)
+                if exc.switch_model or exc.retryable or exc.key_rejected:
+                    emit("switch", key_id=kid, detail={"reason": f"http_{exc.status}"})
+                    continue
+                raise
+            except httpx.HTTPError as exc:
+                self.ledger.resolve(row_id, "network", latency_ms=int((self._now() - t0) * 1000),
+                                    quota_error=type(exc).__name__)
+                failures.append(f"{kid}: network {type(exc).__name__}")
+                emit("switch", key_id=kid, detail={"reason": "network"})
+                continue
+            except BaseException as exc:
+                self.ledger.resolve(row_id, "blocked", latency_ms=int((self._now() - t0) * 1000),
+                                    quota_error=type(exc).__name__)
+                raise
+
+            measured = result.tokens_in if result.tokens_in is not None else est
+            elapsed = int((self._now() - t0) * 1000)
+            self.ledger.resolve(row_id, "ok", http_status=200, tokens_in=measured,
+                                tokens_out=result.tokens_out, latency_ms=elapsed,
+                                response_bytes=len(result.audio))
+            self.ledger.clear_pair_state(kid, model)
+            result.key_id = kid
+            emit("ok", key_id=kid, detail={"tokens_in": measured,
+                 "tokens_out": result.tokens_out, "latency_s": round(elapsed / 1000, 1)})
+            return result
+
+    async def synthesize_file(self, path: str | Path, *, output_path: str | Path | None = None,
+                              voice: str | None = None, style: str | None = None,
+                              bitrate_kbps: int = 128, wait: bool | None = None,
+                              source: str = "cli", initiator: str | None = None,
+                              request_id: str | None = None, job: str | None = None,
+                              trace_id: str | None = None,
+                              on_event: Emitter | None = None) -> TTSFileResult:
+        """Read UTF-8 TXT/Markdown, split at paragraphs then sentences, synthesize in
+        order, concatenate WAV pieces on disk, and encode one MP3 asynchronously."""
+        source_path = Path(path)
+        if source_path.suffix.lower() not in {".txt", ".md"}:
+            raise ValueError("TTS file input supports only .txt and .md")
+        try:
+            text = await asyncio.to_thread(source_path.read_text, encoding="utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ValueError("TTS input must be UTF-8 text") from exc
+        if not shutil.which("ffmpeg"):
+            raise RouterError("MP3 encoding requires ffmpeg on PATH (no TTS quota spent)")
+        if not 32 <= bitrate_kbps <= 320:
+            raise ValueError("MP3 bitrate must be between 32 and 320 kbps")
+        chunks = split_text(text)
+        measured_chunks: list[tuple[str, int]] = []
+        pending = list(chunks)
+        while pending:
+            chunk = pending.pop(0)
+            try:
+                count = await self.count_tokens(chunk, model=TTS_MODEL,
+                                                job=job, trace_id=trace_id,
+                                                step="tts:preflight", initiator=initiator,
+                                                request_id=request_id)
+            except (GeminiHTTPError, RouterError, httpx.HTTPError):
+                count = estimate_tokens(chunk)
+            if count <= MAX_INPUT_TOKENS:
+                measured_chunks.append((chunk, count))
+                continue
+            smaller = split_text(chunk, max_tokens=max(1, int(MAX_INPUT_TOKENS * 0.8)))
+            if len(smaller) <= 1:
+                raise RouterError("could not split an oversized TTS sentence below the "
+                                  f"{MAX_INPUT_TOKENS}-token request limit")
+            pending = smaller + pending
+        chunks = [chunk for chunk, _ in measured_chunks]
+        avail = await self._safe_avail()
+        eligible = [k for k in self.cfg.api_keys
+                    if avail.get(key_id(k)) is None
+                    or TTS_MODEL in (avail.get(key_id(k)) or set())]
+        remaining_requests = sum(self._gates(TTS_MODEL, k, 0)["rpd_left"] for k in eligible)
+        if remaining_requests < len(chunks):
+            payload = self.model_budgets([TTS_MODEL])
+            eta = iso(pt_midnight_ts(self.cfg.quota_day_tz, days_ahead=1))
+            raise QuotaExhaustedError(
+                payload, eta,
+                hint=f"file needs {len(chunks)} TTS requests; only "
+                     f"{remaining_requests} daily requests remain across usable projects",
+                waited=False)
+        target = Path(output_path) if output_path else Path(tempfile.gettempdir()) / (
+            f"gemini-tts-{uuid.uuid4().hex}.mp3")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            raise FileExistsError(f"TTS output already exists: {target}")
+        wav_path = target.with_name(f".{target.name}.wav.tmp")
+        assembler = WavAssembler(wav_path)
+        used_keys: list[str] = []
+        total_tokens = 0
+        started = self._now()
+        try:
+            for i, (chunk, token_count) in enumerate(measured_chunks, 1):
+                res = await self.synthesize(
+                    chunk, voice=voice, style=style, wait=wait, source=source,
+                    initiator=initiator, request_id=f"{request_id or uuid.uuid4().hex[:12]}-{i}",
+                    job=job, trace_id=trace_id, step=f"tts:{i}/{len(chunks)}",
+                    on_event=on_event, _input_tokens=token_count)
+                await asyncio.to_thread(assembler.append, res.audio)
+                total_tokens += res.tokens_in or estimate_tokens(chunk)
+                if res.key_id and res.key_id not in used_keys:
+                    used_keys.append(res.key_id)
+            assembler.close()
+            await encode_mp3(wav_path, target, bitrate_kbps=bitrate_kbps)
+            target.chmod(0o600)
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+        finally:
+            if assembler._writer is not None:
+                assembler._writer.close()
+            wav_path.unlink(missing_ok=True)
+        return TTSFileResult(path=target, model=TTS_MODEL, chunks=len(chunks),
+                             tokens_in=total_tokens, key_ids=used_keys,
+                             latency_s=self._now() - started)
 
     # ------------------------------------------------------------------ main
     async def complete(self, req: RouterRequest, on_event: Emitter | None = None,

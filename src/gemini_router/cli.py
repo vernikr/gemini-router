@@ -346,6 +346,33 @@ def cmd_doctor(args, cfg: Config | None = None) -> int:
     return 0
 
 
+def cmd_tts(args, cfg: Config | None = None) -> int:
+    """Read TXT/Markdown, synthesize in quota-sized chunks, and write one MP3."""
+    cfg = cfg if cfg is not None else _load_cfg(args)
+
+    async def _run():
+        r = _router(cfg)
+        try:
+            return await r.synthesize_file(args.file, output_path=args.output,
+                                           voice=args.voice, style=args.style,
+                                           bitrate_kbps=args.bitrate, wait=args.wait,
+                                           source="cli", initiator="gemini-router-cli",
+                                           request_id=args.request_id)
+        finally:
+            await r.aclose()
+
+    result = asyncio.run(_run())
+    payload = {"path": str(result.path), "model": result.model,
+               "chunks": result.chunks, "tokens_in": result.tokens_in,
+               "key_ids": result.key_ids, "latency_s": round(result.latency_s, 2)}
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        console.print(f"[green]Wrote {result.path}[/green] · {result.chunks} chunk(s) · "
+                      f"{result.tokens_in} input tokens · {result.latency_s:.1f}s")
+    return 0
+
+
 def cmd_proxy(args) -> int:
     """Run the native-Gemini pass-through (`GOOGLE_GEMINI_BASE_URL` for Gen AI SDKs).
 
@@ -385,7 +412,8 @@ def _proxy_cfg(args) -> dict:
 _COMMANDS = {"quota": cmd_quota, "models": cmd_models, "calls": cmd_calls,
              "prune": cmd_prune, "doctor": cmd_doctor, "proxy": cmd_proxy,
              "note": cmd_note, "notes": cmd_notes, "jobs": cmd_jobs,
-             "job": cmd_job, "job-start": cmd_job_action, "job-finish": cmd_job_action}
+             "job": cmd_job, "job-start": cmd_job_action, "job-finish": cmd_job_action,
+             "tts": cmd_tts}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -441,6 +469,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dry", action="store_true")
     p = sub.add_parser("doctor", help="config/state/connectivity check")
     p.add_argument("--offline", action="store_true")
+    p = sub.add_parser("tts", help="synthesize a TXT/Markdown file into one MP3")
+    p.add_argument("file", type=Path)
+    p.add_argument("-o", "--output", type=Path)
+    p.add_argument("--voice")
+    p.add_argument("--style")
+    p.add_argument("--bitrate", type=int, default=128, help="MP3 bitrate in kbps")
+    p.add_argument("--wait", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--request-id")
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("proxy", help="native Gemini API pass-through (File Search MCP)")
     p.add_argument("--bind", help="listen address (default from config: 127.0.0.1)")
     p.add_argument("--port", type=int, help="listen port (default from config: 8787)")

@@ -140,6 +140,31 @@ export declare function calls(
   base: string, token: string | undefined, context: RouterContext | ContextOptions,
   options?: number | EndpointOptions,
 ): Promise<any>;
+export interface TTSOptions {
+  voice?: string;
+  style?: string;
+  waitForMinuteLimits?: boolean;
+  requestId?: string;
+  waitSeconds?: number;
+  signal?: AbortSignal;
+  fetch?: typeof fetch;
+}
+
+/** Submit an already-uploaded TXT/Markdown file to the Gemini TTS endpoint. */
+export declare function ttsFile(
+  base: string, token: string | undefined, context: RouterContext | ContextOptions,
+  uploadId: string, options?: TTSOptions,
+): Promise<any>;
+export declare function ttsStatus(
+  base: string, token: string | undefined, context: RouterContext | ContextOptions,
+  requestId: string, options?: Pick<TTSOptions, "signal" | "fetch">,
+): Promise<any>;
+/** Returns the raw audio/mpeg Response; call `response.blob()` or `arrayBuffer()`. */
+export declare function ttsDownload(
+  base: string, token: string | undefined, context: RouterContext | ContextOptions,
+  requestId: string, options?: Pick<TTSOptions, "signal" | "fetch">,
+): Promise<Response>;
+
 export declare function health(base: string, options?: { signal?: AbortSignal; fetch?: typeof fetch }): Promise<any>;
 
 export interface ParsedTraceparent {
@@ -173,6 +198,9 @@ declare const lib: {
   note: typeof note;
   notes: typeof notes;
   calls: typeof calls;
+  ttsFile: typeof ttsFile;
+  ttsStatus: typeof ttsStatus;
+  ttsDownload: typeof ttsDownload;
   health: typeof health;
   makeTraceparent: typeof makeTraceparent;
   parseTraceparent: typeof parseTraceparent;

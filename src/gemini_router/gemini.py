@@ -10,6 +10,7 @@ in memory — the gateway runs on a 1 GB box."""
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import mimetypes
 import re
@@ -77,6 +78,15 @@ class GenResult:
     tokens_out: int | None
     finish_reason: str | None
     tokens_thought: int | None = None        # 3.x thinking tokens (count toward limits)
+
+
+@dataclass(slots=True)
+class TTSResult:
+    audio: bytes
+    mime_type: str = "audio/wav"
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    key_id: str | None = None
 
 
 def is_gemini3(model: str) -> bool:
@@ -282,6 +292,52 @@ class GeminiClient:
                          tokens_out=usage.get("candidatesTokenCount"),
                          finish_reason=c.get("finishReason"),
                          tokens_thought=usage.get("thoughtsTokenCount"))
+
+    async def synthesize(self, key: str, model: str, text: str, *,
+                         voice: str | None = None, style: str | None = None) -> TTSResult:
+        """Create one single-speaker WAV through the Gemini Interactions API.
+
+        TTS is a distinct operation from generateContent: the response is binary audio,
+        not text. Optional speech controls are omitted entirely when unset.
+        """
+        content: dict = {"type": "text", "text": text}
+        if style:
+            content["annotations"] = [{"type": "speech_metadata", "style": style}]
+        payload: dict = {
+            "model": model,
+            "input": [{"type": "user_input", "content": [content]}],
+            "response_format": {"type": "audio"},
+        }
+        if voice:
+            payload["generation_config"] = {"speech_config": [{"voice": voice}]}
+        r = await self._authed("POST", f"{self.cfg.base_url}/interactions",
+                               key=key, json=payload)
+        if r.status_code >= 400:
+            raise self._error(r)
+        data = r.json()
+        audio = (data.get("output_audio") or {}).get("data")
+        if not audio:
+            # Be tolerant of the list-shaped output used by SDK response wrappers.
+            for item in data.get("output") or []:
+                if item.get("type") == "audio":
+                    audio = item.get("data")
+                    break
+        if not audio:
+            raise RouterError("TTS response contained no audio data")
+        try:
+            raw = base64.b64decode(audio, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise RouterError("TTS response contained invalid base64 audio") from exc
+        usage = data.get("usage") or data.get("usageMetadata") or {}
+        tokens_in = (usage.get("input_tokens") or usage.get("promptTokenCount") or
+                     usage.get("inputTokens"))
+        tokens_out = (usage.get("output_tokens") or usage.get("candidatesTokenCount") or
+                      usage.get("outputTokens"))
+        return TTSResult(audio=raw,
+                         mime_type=(data.get("output_audio") or {}).get("mime_type") or
+                                   "audio/wav",
+                         tokens_in=int(tokens_in) if tokens_in is not None else None,
+                         tokens_out=int(tokens_out) if tokens_out is not None else None)
 
     async def _generate_stream(self, key: str, model: str, payload: dict,
                                on_text: Callable[[str], None]) -> GenResult:

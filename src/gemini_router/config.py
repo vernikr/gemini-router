@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field, field_validator
 # an alias means paying for a model nobody can select.
 DEFAULT_CHAIN = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3-flash-preview"]
 DEFAULT_OVERFLOW = ["gemini-3.5-flash-lite", "gemma-auto"]
+TTS_MODEL = "gemini-3.8-flash-tts"
 
 
 class Limits(BaseModel):
@@ -101,6 +102,9 @@ class Config(BaseModel):
     overflow_default: str = "off"
     limits_per_key_model: Limits = Field(default_factory=Limits)
     overflow_limits: Limits = Field(default_factory=lambda: Limits(rpd=500, rpm=15, tpm=250_000))
+    # Google AI Studio free-tier limits for Gemini 3.8 Flash TTS. TPM is input-only;
+    # audio output tokens are accounted separately by Google for billing.
+    tts_limits: Limits = Field(default_factory=lambda: Limits(rpd=10, rpm=3, tpm=10_000))
     limits_overrides: dict[str, dict[str, int]] = Field(default_factory=dict)
     quota_day_tz: str = "America/Los_Angeles"
     retry: RetryCfg = Field(default_factory=RetryCfg)
@@ -154,7 +158,10 @@ class Config(BaseModel):
         return cls.model_validate(data)
 
     def limits_for(self, model: str) -> Limits:
-        base = (self.limits_per_key_model if model in self.chain else self.overflow_limits)
+        if model == TTS_MODEL:
+            base = self.tts_limits
+        else:
+            base = (self.limits_per_key_model if model in self.chain else self.overflow_limits)
         merged = base.model_dump() | self.limits_overrides.get(model, {})
         return Limits(**merged)
 

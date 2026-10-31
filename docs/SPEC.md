@@ -60,6 +60,14 @@ res.text, res.model, res.key_id, res.tokens_in, res.tokens_out
 res.latency_s, res.cached, res.overflow_tier, res.events, res.quota_after
 res.request_id, res.row_id, res.finish_reason, res.tokens_thought
 await router.count_tokens(text, model=None) -> int
+
+# One text segment; audio is returned as `TTSResult.audio` (provider WAV).
+audio = await router.synthesize(text, voice=None, style=None, wait=None)
+
+# UTF-8 TXT/Markdown file → quota-aware chunks → one MP3 path.
+file = await router.synthesize_file(path, output_path=None, voice=None, style=None,
+                                    bitrate_kbps=128, wait=None)
+file.path, file.chunks, file.tokens_in, file.key_ids
 await router.quota_table() -> list[QuotaRow]   # key_id, model, rpd_left, rpm_wait_s,
                                                # tpm_wait_s, cooldown_until, recommended
 router.complete_sync(...)                      # blocking facade for synchronous callers
@@ -107,6 +115,20 @@ single-key pinning and never sends a foreign URI. The request carries `file_data
 parts ahead of text; the cache hashes local `sha256`, not a key-specific URI. A failed
 multi-file re-upload discards that candidate's partial bundle.
 
+### TTS (Gemini 3.8 Flash)
+
+`Router.synthesize()` sends one text segment to the Interactions API and returns WAV
+bytes. `Router.synthesize_file()` accepts UTF-8 `.txt` / `.md`, greedily packs the largest
+paragraph-first chunks under the model's 8,192 input-token request limit, falls back to
+sentence boundaries, and only splits within a sentence as a last resort. It checks the
+full request count against the daily budget before generating, uses `countTokens` for
+preflight when available, and records provider-measured usage into the same ledger. Per
+project defaults are `tts_limits: {rpd: 10, rpm: 3, tpm: 10000}`; Google defines TPM as
+input tokens, while generated audio tokens are an output/billing measure and do not enter
+the input TPM gate. Output WAV chunks are appended to disk and asynchronously encoded to
+MP3 using system `ffmpeg` (128 kbps mono by default). It supports one voice per file;
+voice and style are optional. No audio is returned as a text completion or streamed.
+
 Errors: `QuotaExhaustedError` carries the machine-readable payload
 (per-model rpd_left/rpm_wait_s/tpm_wait_s/cooldown_until, reset_eta_pt, hint) — frontends
 surface it as-is. `RouterError` base for everything else (network, http 4xx, parse).
@@ -150,7 +172,8 @@ Env: `GEMINI_API_KEYS`/`GEMINI_API_KEY_1..10`, `GEMINI_ROUTER_STATE`,
 `GEMINI_ROUTER_CONFIG` (yaml). YAML keys: `chain`, `overflow_tiers`,
 `overflow_default` (off|lite|lite+gemma — the overflow policy every entry point starts
 from; a library request may override it per call, the pass-through proxy walks it as is),
-`limits_per_key_model {rpd,rpm,tpm}`, `overflow_limits {rpd,rpm,tpm}`, `limits_overrides`,
+`limits_per_key_model {rpd,rpm,tpm}`, `overflow_limits {rpd,rpm,tpm}`, `tts_limits {rpd,rpm,tpm}`
+(default 10/3/10000 for `gemini-3.8-flash-tts`), `limits_overrides`,
 `quota_day_tz`, `retry {max,backoff_base_s,jitter_max_s,provider_timeout_s,request_delay_s}`,
 `wait {enabled_default,max_s,poll_s}` (FR-C13 semantics), `window_s`, `planned_ttl_s`,
 `models_refresh_h`, `cache_ttl_h`, `state_path`, `base_url`, `temperature` (pre-3.x models

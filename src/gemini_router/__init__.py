@@ -8,6 +8,7 @@ Public API (docs/SPEC.md §2):
     forecast_media_tokens, check_drift, media_class, TariffNotMeasured
 """
 from .config import (
+                     TTS_MODEL,
                      Config,
                      FeedbackCfg,
                      Limits,
@@ -34,13 +35,22 @@ from .errors import (
 )
 from .events import RouterEvent
 from .feedback import ProviderSignal, QuotaTruth, body_facts, parse_provider_signal
-from .gemini import GeminiClient, GenResult, UploadedFile, extract_json, file_parts, is_gemini3
+from .gemini import (
+                     GeminiClient,
+                     GenResult,
+                     TTSResult,
+                     UploadedFile,
+                     extract_json,
+                     file_parts,
+                     is_gemini3,
+)
 from .ledger import Ledger, iso, pt_midnight_ts
 from .proxy import GeminiProxy
 from .routing import (
                      Router,
                      RouterRequest,
                      RouterResult,
+                     TTSFileResult,
                      cache_hash,
                      gates_for,
                      pick_gemma,
@@ -64,7 +74,7 @@ __all__ = [
     "RouterError", "GeminiHTTPError", "QuotaExhaustedError",
     "FileUploadFailed", "FileNotReady", "UploadedFile", "file_parts",
     "Config", "Limits", "RetryCfg", "WaitCfg", "ProxyCfg", "FeedbackCfg", "Ledger",
-    "GeminiClient", "GenResult", "GeminiProxy",
+    "GeminiClient", "GenResult", "TTSResult", "TTSFileResult", "GeminiProxy", "TTS_MODEL",
     "RequestContext", "ProviderSignal", "QuotaTruth", "parse_provider_signal",
     "body_facts", "router_version", "audit_line", "CLIENT_CONTEXT_HEADERS",
     "parse_traceparent", "make_traceparent",

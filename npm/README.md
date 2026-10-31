@@ -64,6 +64,30 @@ gemini-router job digest-2026-10-28 --json   # CLI from the Python package
 curl -s 'http://127.0.0.1:8787/v1/job?id=digest-2026-10-28&n=200'
 ```
 
+## TTS file flow
+
+The file must first be uploaded to the gemini-mcp inbox (for example with its
+`file_upload_ticket` flow). Then submit it through the REST daemon on port 8790:
+
+```js
+import { createContext, ttsFile, ttsStatus, ttsDownload } from "gemini-router";
+
+const gateway = "http://127.0.0.1:8790";
+const ctx = createContext({ initiator: "reader", step: "tts" });
+const job = await ttsFile(gateway, process.env.GEMINI_MCP_TOKEN, ctx, "upload-id", {
+  voice: "Kore",                  // optional
+  style: "clear, calm narration", // optional
+  waitSeconds: 25,
+});
+// If job.status === "running", poll ttsStatus with job.request_id.
+const response = await ttsDownload(gateway, process.env.GEMINI_MCP_TOKEN,
+  ctx, job.request_id);
+if (response.ok) await Bun.write("narration.mp3", response);
+```
+
+The gateway returns a download URL and retains generated MP3s for 24 hours. Use
+`response.blob()`, `response.arrayBuffer()`, or a streaming file writer to save the audio.
+
 ## API
 
 | export | purpose |
@@ -77,6 +101,9 @@ curl -s 'http://127.0.0.1:8787/v1/job?id=digest-2026-10-28&n=200'
 | `jobs`, `jobGet` | `GET /v1/jobs`, `GET /v1/job` — counters and the full timeline |
 | `note`, `notes` | `POST /v1/note`, `GET /v1/notes` — annotations with no provider call |
 | `calls` | `GET /v1/calls` with `job`, `trace`, `step`, `model`, `status`, `source`, `requestId`, `n` filters |
+| `ttsFile` | `POST /v1/tts/file` for an already-uploaded TXT/Markdown file |
+| `ttsStatus` | `GET /v1/tts/{request_id}` |
+| `ttsDownload` | `GET /v1/tts/{request_id}/download`; returns raw MP3 `Response` |
 | `health` | `GET /healthz` (no token) |
 | `makeTraceparent`, `parseTraceparent` | W3C Trace Context helpers |
 | `CLIENT_CONTEXT_HEADERS` | the header names the proxy consumes locally |

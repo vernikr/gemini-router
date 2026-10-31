@@ -718,3 +718,28 @@ def test_interaction_retrieval_reaches_the_owning_key(proxy, respx_mock):
         r = c.get("/v1beta/interactions/intx_9")
     assert r.status_code == 200
     assert route.calls[0].request.headers["x-goog-api-key"] == K2
+
+
+def test_native_interactions_proxy_keeps_tts_model_and_logs_usage(proxy, respx_mock):
+    from conftest import MODELS
+
+    respx_mock.get(f"{API}/models").mock(return_value=httpx.Response(
+        200, json={"models": [{"name": f"models/{model}"} for model in MODELS]}))
+    route = respx_mock.post(f"{API}/interactions").mock(return_value=httpx.Response(
+        200, json={"id": "tts_1", "model": "gemini-3.8-flash-tts",
+                   "output_audio": {"data": "AA==", "mime_type": "audio/wav"},
+                   "usage": {"input_tokens": 17, "output_tokens": 250}}))
+    payload = {"model": "gemini-3.8-flash-tts",
+               "input": [{"type": "user_input", "content": [
+                   {"type": "text", "text": "Hello there."}]}],
+               "response_format": {"type": "audio"}}
+    with client(proxy) as c:
+        response = c.post("/v1beta/interactions", json=payload)
+    assert response.status_code == 200
+    assert json.loads(route.calls.last.request.content)["model"] == "gemini-3.8-flash-tts"
+    assert response.headers["x-router-model"] == "gemini-3.8-flash-tts"
+    rows = proxy.ledger.calls_tail(10, model="gemini-3.8-flash-tts")
+    row = next(r for r in rows if r["kind"] == "single")
+    assert row["tokens_in"] == 17
+    assert row["tokens_out"] == 250
+    assert row["key_id"] in {kid(K1), kid(K2)}

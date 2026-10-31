@@ -20,6 +20,9 @@ import {
   note,
   notes,
   parseTraceparent,
+  ttsDownload,
+  ttsFile,
+  ttsStatus,
   routerFetch,
 } from "../index.js";
 
@@ -182,6 +185,24 @@ test("routerFetch JSON-encodes objects and returns the raw response", async () =
   assert.equal(req.headers["content-type"], "application/json");
   assert.equal(req.body.contents[0].parts[0].text, "hi");
   assert.equal(req.headers["x-router-job"], "digest-2026-10-28");
+});
+
+test("TTS helpers submit uploaded text, poll status and return raw audio response", async () => {
+  const ctx = createContext({ job: "tts-job", initiator: "reader" });
+  const submitted = await ttsFile(base, "TOKEN", ctx, "upload-1", {
+    voice: "Kore", style: "calm", waitForMinuteLimits: true,
+    requestId: "tts-1", waitSeconds: 12,
+  });
+  assert.equal(submitted.path, "/v1/tts/file");
+  const request = seen.find((r) => r.path === "/v1/tts/file");
+  assert.deepEqual(request.body, {
+    upload_id: "upload-1", voice: "Kore", style: "calm",
+    wait_for_minute_limits: true, request_id: "tts-1", wait_seconds: 12,
+  });
+  assert.equal((await ttsStatus(base, "TOKEN", ctx, "tts-1")).path, "/v1/tts/tts-1");
+  const response = await ttsDownload(base, "TOKEN", ctx, "tts-1");
+  assert.equal(response.status, 200);
+  assert.ok(seen.some((r) => r.path === "/v1/tts/tts-1/download"));
 });
 
 test("CommonJS entry exports the same implementation", () => {

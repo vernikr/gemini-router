@@ -1,13 +1,17 @@
 # gemini-router
 
-Quota-aware **Gemini Flash router** with one persistent SQLite WAL ledger. A key pool,
-cascading model chain, per-`key×model` RPD/RPM/TPM budgets, provider-truth feedback and
-structured job/trace audit are shared by the Python library, the CLI, the native Gemini
-API pass-through proxy and any HTTP client.
+Quota-aware **Gemini Flash and Gemini TTS router** with one persistent SQLite WAL ledger.
+A key pool, cascading text-model chain, model-specific RPD/RPM/input-TPM budgets,
+provider-truth feedback and structured job/trace audit are shared by the Python library,
+the CLI, the native Gemini API pass-through proxy and HTTP consumers.
 
-- Per **key×model** budgets: RPD (Pacific-time day + rolling 24 h), RPM, TPM (sliding
-  60 s). Pre-flight enforced, accounted from `usageMetadata`. Each key belongs to a
-  separate Google account; budgets are tracked per key and model.
+- Per **project-key×model** budgets: RPD (Pacific-time day + rolling 24 h), RPM, and
+  input TPM (sliding 60 s). Pre-flight enforced, accounted from `usageMetadata`; output
+  audio tokens are recorded separately and never counted against input TPM.
+- Single-speaker TTS for `gemini-3.8-flash-tts`: TXT/Markdown files are packed into the
+  largest paragraph-first, sentence-second chunks that fit the model input limit, routed
+  through the same ledger and key pool, combined as WAV, then encoded to MP3 asynchronously.
+  Default free-tier limits: 3 RPM, 10,000 input TPM, 10 RPD per project; configurable.
 - Cascading chain with runtime `listModels` validation; opt-in overflow tiers
   (`flash-lite → gemma-auto`) behind `overflow_default`, applied identically by the
   library and the proxy.
@@ -103,6 +107,40 @@ provider attempt (discard the previous provisional text), then `text` events wit
 `detail["text"]` deltas. `RouterResult.text` is authoritative; cache hits return it
 without deltas. Text events are not retained in `result.events`. Truncated, blocked and
 interrupted responses are never cached.
+
+### Text-to-speech
+
+```python
+from gemini_router import Router
+
+router = Router.from_env()
+try:
+    result = await router.synthesize_file(
+        "script.md", output_path="narration.mp3",
+        voice="Kore",                 # optional; provider default if omitted
+        style="clear, calm narration", # optional
+        bitrate_kbps=128, wait=True,
+    )
+    print(result.path, result.chunks, result.tokens_in)
+finally:
+    await router.aclose()
+```
+
+Only `.txt` and `.md` UTF-8 files are accepted. Chunks are greedily packed by paragraph,
+then sentence (word boundary only for a single oversized sentence). A chunk is never
+resized to consume a partial minute window: it waits for a full slot or uses another
+project. The per-request model input ceiling is 8,192 tokens; the default project limits
+are 3 RPM, 10,000 **input** TPM and 10 RPD. The router measures text input before dispatch
+and reconciles with provider usage metadata afterwards. Audio output tokens are a separate
+billing measure, not input TPM. WAV chunks are appended to a temporary file and encoded
+by the system `ffmpeg` executable in a child process; `ffmpeg` must be installed.
+
+CLI equivalent:
+
+```bash
+gemini-router tts script.md --output narration.mp3 --voice Kore \\
+  --style "clear, calm narration" --bitrate 128
+```
 
 ## Job / trace correlation
 

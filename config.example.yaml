@@ -1,4 +1,4 @@
-# Example config for gemini-router 0.12.0. Secrets come from the environment only.
+# Example config for gemini-router 0.13.0. Secrets come from the environment only.
 # The feedback block controls provider-truth benches (docs/SPEC.md §12); job/trace
 # correlation needs no config — clients send X-Router-* headers (§13).
 router:
@@ -10,6 +10,8 @@ router:
   # Each key is a SEPARATE Google account; per-key×model budgets are intentional.
   limits_per_key_model: {rpd: 20, rpm: 5, tpm: 250000}
   overflow_limits:      {rpd: 500, rpm: 15, tpm: 250000}
+  # Gemini 3.8 Flash TTS: input TPM only (audio output is not part of this gate).
+  tts_limits:           {rpd: 10, rpm: 3, tpm: 10000}
 
   feedback:
     throttle_min_s: 60              # floor for an unexplained 429
