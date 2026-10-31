@@ -208,14 +208,14 @@ async def test_file_progress_advances_inside_a_slow_chunk(mock_api, tmp_path, mo
 
 async def test_encode_mp3_reports_ffmpeg_progress(tmp_path, monkeypatch):
     wav_path = tmp_path / "source.wav"
-    wav_path.write_bytes(wav_data(b"\\x00\\x00" * 24_000))
+    wav_path.write_bytes(wav_data(b"\x00\x00" * 24_000))
     executable = tmp_path / "ffmpeg"
     executable.write_text(
-        "#!/bin/sh\\n"
-        'for argument do output="$argument"; done\\n'
-        'printf "encoded" > "$output"\\n'
-        'printf "out_time_us=1000000\\\\nprogress=continue\\\\n"\\n'
-        'printf "out_time_us=2000000\\\\nprogress=end\\\\n"\\n',
+        "#!/bin/sh\n"
+        'for argument do output="$argument"; done\n'
+        'printf "encoded" > "$output"\n'
+        'printf "out_time_us=1000000\\nprogress=continue\\n"\n'
+        'printf "out_time_us=2000000\\nprogress=end\\n"\n',
         encoding="utf-8",
     )
     executable.chmod(0o755)
