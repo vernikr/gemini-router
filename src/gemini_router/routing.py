@@ -666,7 +666,6 @@ class Router:
         used_keys: list[str] = []
         total_tokens = 0
         started = self._now()
-        loop = asyncio.get_running_loop()
         try:
             for i, (chunk, token_count) in enumerate(measured_chunks, 1):
                 chunk_started = time.monotonic()
