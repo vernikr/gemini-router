@@ -209,7 +209,7 @@ async def test_file_progress_advances_inside_a_slow_chunk(mock_api, tmp_path, mo
 
 async def test_encode_mp3_reports_ffmpeg_progress(tmp_path, monkeypatch):
     wav_path = tmp_path / "source.wav"
-    wav_path.write_bytes(wav_data(b"\x00\x00" * 24_000))
+    wav_path.write_bytes(wav_data(b"\x00\x00" * 48_000))
     executable = tmp_path / "ffmpeg"
     executable.write_text(
         "#!/bin/sh\n"
