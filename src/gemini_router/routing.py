@@ -33,6 +33,8 @@ from .tariffs import media_class
 from .tts import MAX_INPUT_TOKENS, WavAssembler, encode_mp3, split_text
 
 Emitter = Callable[[RouterEvent], None]
+_TTS_PROGRESS_INTERVAL_S = 1.0
+_TTS_FALLBACK_TOKENS_PER_SECOND = 32.0
 
 
 @dataclass(slots=True)
@@ -644,8 +646,16 @@ class Router:
                 hint=f"file needs {len(chunks)} TTS requests; only "
                      f"{remaining_requests} daily requests remain across usable projects",
                 waited=False)
-        report_progress(0, f"Synthesizing audio · 0/{len(chunks)} chunks",
-                        phase="synthesis", completed_chunks=0, total_chunks=len(chunks))
+        chunk_sizes = [max(1, count) for _, count in measured_chunks]
+        total_work = sum(chunk_sizes)
+        estimated_tokens_per_second = _TTS_FALLBACK_TOKENS_PER_SECOND
+        completed_work = 0
+        last_progress = 0.0
+        report_progress(
+            0, f"TTS · 0/{len(chunks)}", phase="synthesis",
+            completed_chunks=0, total_chunks=len(chunks),
+            eta_s=max(1, round(total_work / estimated_tokens_per_second)),
+        )
         target = Path(output_path) if output_path else Path(tempfile.gettempdir()) / (
             f"gemini-tts-{uuid.uuid4().hex}.mp3")
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -656,32 +666,116 @@ class Router:
         used_keys: list[str] = []
         total_tokens = 0
         started = self._now()
+        loop = asyncio.get_running_loop()
         try:
             for i, (chunk, token_count) in enumerate(measured_chunks, 1):
-                def chunk_event(event: RouterEvent, chunk_index: int = i,
+                chunk_started = time.monotonic()
+                chunk_index = i
+                chunk_size = chunk_sizes[i - 1]
+                later_work = sum(chunk_sizes[i:])
+
+                async def publish_chunk_progress() -> None:
+                    nonlocal last_progress
+                    while True:
+                        await asyncio.sleep(_TTS_PROGRESS_INTERVAL_S)
+                        elapsed = max(0.05, time.monotonic() - chunk_started)
+                        expected_s = max(3.0, chunk_size / estimated_tokens_per_second)
+                        fraction = min(0.9, 0.75 * elapsed / expected_s)
+                        active_rate = max(
+                            1.0,
+                            min(estimated_tokens_per_second, chunk_size * fraction / elapsed),
+                        )
+                        remaining_work = chunk_size * (1.0 - fraction) + later_work
+                        eta_s = max(1, round(remaining_work / active_rate))
+                        pct = min(
+                            94.9,
+                            95.0 * (completed_work + chunk_size * fraction) / total_work,
+                        )
+                        last_progress = max(last_progress, pct)
+                        report_progress(
+                            last_progress, f"TTS · {chunk_index}/{len(chunks)}",
+                            phase="synthesis", completed_chunks=chunk_index - 1,
+                            total_chunks=len(chunks), active_chunk_pct=round(fraction * 100, 1),
+                            eta_s=eta_s,
+                        )
+
+                ticker = (
+                    asyncio.create_task(publish_chunk_progress()) if on_event else None
+                )
+
+                def chunk_event(event: RouterEvent, current_chunk: int = i,
                                 total_chunks: int = len(chunks)) -> None:
                     if on_event:
-                        event.detail.setdefault("chunk", chunk_index)
+                        event.detail.setdefault("chunk", current_chunk)
                         event.detail.setdefault("chunks", total_chunks)
                         on_event(event)
 
-                res = await self.synthesize(
-                    chunk, voice=voice, style=style, wait=wait, source=source,
-                    initiator=initiator, request_id=f"{request_id or uuid.uuid4().hex[:12]}-{i}",
-                    job=job, trace_id=trace_id, step=f"tts:{i}/{len(chunks)}",
-                    on_event=chunk_event if on_event else None, _input_tokens=token_count)
+                try:
+                    res = await self.synthesize(
+                        chunk, voice=voice, style=style, wait=wait, source=source,
+                        initiator=initiator,
+                        request_id=f"{request_id or uuid.uuid4().hex[:12]}-{i}",
+                        job=job, trace_id=trace_id, step=f"tts:{i}/{len(chunks)}",
+                        on_event=chunk_event if on_event else None, _input_tokens=token_count)
+                finally:
+                    if ticker is not None:
+                        ticker.cancel()
+                        try:
+                            await ticker
+                        except asyncio.CancelledError:
+                            pass
+
+                chunk_elapsed = max(0.1, time.monotonic() - chunk_started)
+                measured_rate = chunk_size / chunk_elapsed
+                estimated_tokens_per_second = max(
+                    2.0,
+                    min(
+                        120.0,
+                        0.35 * estimated_tokens_per_second + 0.65 * measured_rate,
+                    ),
+                )
                 await asyncio.to_thread(assembler.append, res.audio)
                 total_tokens += res.tokens_in or estimate_tokens(chunk)
                 if res.key_id and res.key_id not in used_keys:
                     used_keys.append(res.key_id)
-                report_progress(95 * i / len(chunks),
-                                f"Synthesizing audio · {i}/{len(chunks)} chunks",
-                                phase="synthesis", completed_chunks=i,
-                                total_chunks=len(chunks))
+                completed_work += chunk_size
+                completed_pct = 95.0 * completed_work / total_work
+                last_progress = max(last_progress, completed_pct)
+                future_eta = (
+                    max(1, round(later_work / estimated_tokens_per_second))
+                    if later_work else None
+                )
+                report_progress(
+                    last_progress, f"TTS · {i}/{len(chunks)}",
+                    phase="synthesis", completed_chunks=i, total_chunks=len(chunks),
+                    eta_s=future_eta,
+                )
             assembler.close()
             report_progress(95, "Encoding MP3", phase="encoding",
                             completed_chunks=len(chunks), total_chunks=len(chunks))
-            await encode_mp3(wav_path, target, bitrate_kbps=bitrate_kbps)
+
+            encode_started = time.monotonic()
+
+            def encode_progress(fraction: float) -> None:
+                nonlocal last_progress
+                fraction = max(0.0, min(1.0, float(fraction)))
+                pct = 95.0 + 4.0 * fraction
+                last_progress = max(last_progress, pct)
+                elapsed = max(0.05, time.monotonic() - encode_started)
+                eta_s = (
+                    max(1, round(elapsed * (1.0 - fraction) / fraction))
+                    if 0.03 <= fraction < 1.0 else (0 if fraction >= 1.0 else None)
+                )
+                report_progress(
+                    last_progress, "Encoding MP3", phase="encoding",
+                    completed_chunks=len(chunks), total_chunks=len(chunks),
+                    encoding_pct=round(fraction * 100, 1), eta_s=eta_s,
+                )
+
+            await encode_mp3(
+                wav_path, target, bitrate_kbps=bitrate_kbps,
+                on_progress=encode_progress if on_event else None,
+            )
             target.chmod(0o600)
             report_progress(100, "Audio complete", phase="complete",
                             completed_chunks=len(chunks), total_chunks=len(chunks))
