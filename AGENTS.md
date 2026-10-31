@@ -20,7 +20,7 @@ with functional changes). Repo-specific rules:
 
 ## Commands
 - `uv sync` · `uv run pytest` · `uv run ruff check src tests`
-- To add or move a sub-issue, put `<!-- issue-parent: #PARENT_NUMBER -->` on its own line in the child Issue body; use `<!-- issue-parent: none -->` to detach it (requires the shared Issue hierarchy workflow in this repository).
+- For native GitHub sub-issues, ensure `.github/workflows/issue-parent-sync.yml` exists with `issues: [opened, edited]`, `permissions: issues: write`, and a job calling `vernikr/mother/.github/workflows/issue-parent-sync.yml@v1` (create the caller workflow if missing); then put `<!-- issue-parent: #N -->` on its own line in the child Issue body, or use `<!-- issue-parent: none -->` to detach.
 - `uv run gemini-router quota|models|calls|jobs|job|note|notes|prune|doctor`
 
 ## Testing & secrets
