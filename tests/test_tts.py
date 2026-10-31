@@ -12,7 +12,8 @@ import httpx
 import pytest
 
 from conftest import BASE, make_config
-from gemini_router import GeminiClient, Router, RouterError, routing, tts as tts_module
+from gemini_router import GeminiClient, Router, RouterError, routing
+from gemini_router import tts as tts_module
 from gemini_router.tts import WavAssembler, split_text
 
 
