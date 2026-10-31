@@ -1,7 +1,7 @@
 /** Zero-dependency helpers for the gemini-router pass-through proxy. */
 
 export interface ContextOptions {
-  /** One target activity, e.g. "digest-2026-10-28". Defaults to `<initiator>@<UTC date>`. */
+  /** One target activity, e.g. "job-42". Defaults to `<initiator>@<UTC date>`. */
   job?: string;
   /** One execution of the job. Defaults to a random 32-hex W3C trace id. */
   trace?: string;
@@ -9,7 +9,7 @@ export interface ContextOptions {
   traceId?: string;
   /** Client stage inside the execution, e.g. "prefilter". */
   step?: string;
-  /** Who started the work, e.g. "tldr-digest". */
+  /** Who started the work, e.g. "example-client". */
   initiator?: string;
   /** Free text stored in the audit trail; never used for routing. */
   comment?: string;

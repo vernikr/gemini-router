@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
-"""Fail on anything that looks like a real vendor credential, before it can be published.
+"""Reject credential-shaped literals before package contents are published.
 
-Library form (the CLI entry point is scripts/check_secrets.py); importing this from the
-package keeps the rule testable like any other rule in the codebase.
-
-Why this exists: on 2026-10-11 two real Gemini keys were committed into a test fixture of
-the sibling public repo (gemini-mcp) and shipped inside an sdist on PyPI. Google's scanner
-reported the first one as leaked within the hour — the correct behaviour, and ours must not
-depend on a vendor noticing. This repo is public and ships `tests/` in its sdist too, so it
-carries the same rule. Rule: any literal shaped like a key (`AIza…`, `AQ.…`, `sk-…`, `ghp_…`,
-`AKIA…`) must carry the marker word DUMMY. That keeps fixtures realistic in length and
-impossible to confuse with the real thing.
+The source distribution includes tests, so fixtures must carry the explicit DUMMY marker.
+The same check runs in local verification and release workflows.
 
 Usage: python scripts/check_secrets.py [paths…]   (default: every git-tracked text file)
 """

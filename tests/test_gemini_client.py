@@ -121,8 +121,7 @@ async def test_thought_parts_filtered(mock_api, tmp_path):
 
 
 async def test_thinking_starvation_surfaces(mock_api, tmp_path):
-    """VPS smoke 2026-10-08: maxOutputTokens counts thinking tokens — a 16-token cap
-    left zero visible text. Must surface as empty text + MAX_TOKENS, not silently vanish."""
+    """When the output budget is consumed by thinking, surface MAX_TOKENS with no text."""
     cfg = make_config(tmp_path)
     payload = {"candidates": [{"content": {"parts": [
                    {"thought": True, "text": "all budget went to thinking"}]},

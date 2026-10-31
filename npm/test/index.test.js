@@ -41,7 +41,7 @@ before(async () => {
         query: Object.fromEntries(url.searchParams), headers: req.headers,
         body: raw ? JSON.parse(raw) : null });
       res.setHeader("content-type", "application/json");
-      res.setHeader("x-router-job", "digest-2026-10-28");
+      res.setHeader("x-router-job", "job-42");
       res.setHeader("x-router-trace", "abc");
       if (url.pathname === "/v1/job" && req.method === "GET" &&
           url.searchParams.get("id") === "missing") {
@@ -62,9 +62,9 @@ after(async () => {
 });
 
 test("createContext: defaults, W3C trace id and header shape", () => {
-  const ctx = createContext({ initiator: "tldr-digest" });
+  const ctx = createContext({ initiator: "example-client" });
   assert.ok(ctx instanceof RouterContext);
-  assert.match(ctx.job, /^tldr-digest@\d{4}-\d{2}-\d{2}$/);
+  assert.match(ctx.job, /^example-client@\d{4}-\d{2}-\d{2}$/);
   assert.match(ctx.trace, /^[0-9a-f]{32}$/);
   assert.equal(ctx.traceId, ctx.trace);
   assert.match(ctx.spanId, /^[0-9a-f]{16}$/);
@@ -72,22 +72,22 @@ test("createContext: defaults, W3C trace id and header shape", () => {
   const h = ctx.headers();
   assert.equal(h["X-Router-Job"], ctx.job);
   assert.equal(h["X-Router-Trace"], ctx.trace);
-  assert.equal(h["X-Router-Initiator"], "tldr-digest");
+  assert.equal(h["X-Router-Initiator"], "example-client");
   assert.deepEqual(parseTraceparent(h.traceparent).traceId, ctx.trace);
   assert.ok(CLIENT_CONTEXT_HEADERS.includes("x-router-job"));
 });
 
 test("createContext: traceparent seeds trace and parent span", () => {
   const tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-  const ctx = createContext({ job: "digest-2026-10-28", initiator: "worker", traceparent: tp });
+  const ctx = createContext({ job: "job-42", initiator: "worker", traceparent: tp });
   assert.equal(ctx.trace, "4bf92f3577b34da6a3ce929d0e0e4736");
   assert.equal(ctx.parentSpan, "00f067aa0ba902b7");
   assert.equal(ctx.headers()["X-Router-Parent-Span"], "00f067aa0ba902b7");
-  assert.equal(ctx.toJSON().job, "digest-2026-10-28");
+  assert.equal(ctx.toJSON().job, "job-42");
 });
 
 test("headers: non-ASCII text is encoded, extra options win", () => {
-  const ctx = createContext({ job: "digest-2026-10-28", initiator: "tldr-digest",
+  const ctx = createContext({ job: "job-42", initiator: "example-client",
     step: "analysis", comment: "утренняя сборка" });
   const h = headers("TOKEN", ctx, { "content-type": "application/json", "X-Router-Step": "dedup" });
   assert.equal(h["x-goog-api-key"], "TOKEN");
@@ -97,7 +97,7 @@ test("headers: non-ASCII text is encoded, extra options win", () => {
 });
 
 test("context derivation: step, retry trace, child span", () => {
-  const ctx = createContext({ job: "digest-2026-10-28", initiator: "tldr-digest",
+  const ctx = createContext({ job: "job-42", initiator: "example-client",
     step: "prefilter", trace: "7f3a9c2e" });
   assert.equal(ctx.headers().traceparent, undefined);   // not a 32-hex W3C id
   const analysis = ctx.withStep("analysis");
@@ -124,15 +124,15 @@ test("makeTraceparent always produces valid W3C fields", () => {
 });
 
 test("makeURL builds bare-origin URLs with a query", () => {
-  const u = makeURL("http://127.0.0.1:8787/", "/v1/job", { id: "digest-2026-10-28", n: 10, skip: "" });
+  const u = makeURL("http://127.0.0.1:8787/", "/v1/job", { id: "job-42", n: 10, skip: "" });
   assert.equal(u.pathname, "/v1/job");
-  assert.equal(u.searchParams.get("id"), "digest-2026-10-28");
+  assert.equal(u.searchParams.get("id"), "job-42");
   assert.equal(u.searchParams.get("n"), "10");
   assert.equal(u.searchParams.has("skip"), false);
 });
 
 test("job lifecycle helpers send the right method, body and headers", async () => {
-  const ctx = createContext({ job: "digest-2026-10-28", initiator: "tldr-digest",
+  const ctx = createContext({ job: "job-42", initiator: "example-client",
     step: "prefilter" });
   assert.equal((await jobStart(base, "TOKEN", ctx, { comment: "start" })).ok, true);
   assert.equal((await jobFinish(base, "TOKEN", ctx, { status: "failed" })).ok, true);
@@ -140,21 +140,21 @@ test("job lifecycle helpers send the right method, body and headers", async () =
     r.body.action === "start");
   const finish = seen.find((r) => r.path === "/v1/job" && r.method === "POST" &&
     r.body.action === "finish");
-  assert.equal(start.body.job, "digest-2026-10-28");
+  assert.equal(start.body.job, "job-42");
   assert.equal(start.body.comment, "start");
   assert.equal(finish.body.status, "failed");
-  assert.equal(start.headers["x-router-job"], "digest-2026-10-28");
+  assert.equal(start.headers["x-router-job"], "job-42");
   assert.equal(start.headers["x-goog-api-key"], "TOKEN");
 });
 
 test("read helpers build filters and surface HTTP errors", async () => {
-  const ctx = createContext({ job: "digest-2026-10-28", initiator: "tldr-digest" });
+  const ctx = createContext({ job: "job-42", initiator: "example-client" });
   assert.equal((await jobs(base, "TOKEN", ctx, 5)).ok, true);
   assert.equal((await jobGet(base, "TOKEN", ctx, { n: 100 })).ok, true);
   assert.equal((await note(base, "TOKEN", ctx, "prefilter done")).ok, true);
   assert.equal((await notes(base, "TOKEN", ctx, { n: 7 })).ok, true);
   assert.equal((await calls(base, "TOKEN", ctx,
-    { job: "digest-2026-10-28", step: "prefilter", requestId: "rid-1", n: 3 })).ok, true);
+    { job: "job-42", step: "prefilter", requestId: "rid-1", n: 3 })).ok, true);
   assert.equal((await health(base)).version, "0.12.0");
 
   const jobsReq = seen.find((r) => r.path === "/v1/jobs");
@@ -164,7 +164,7 @@ test("read helpers build filters and surface HTTP errors", async () => {
   assert.equal(callsReq.query.request_id, "rid-1");
   const noteReq = seen.find((r) => r.path === "/v1/note");
   assert.equal(noteReq.body.comment, "prefilter done");
-  assert.equal(noteReq.body.job, "digest-2026-10-28");
+  assert.equal(noteReq.body.job, "job-42");
 
   await assert.rejects(
     () => jobGet(base, "TOKEN", ctx, { job: "missing" }),
@@ -174,17 +174,17 @@ test("read helpers build filters and surface HTTP errors", async () => {
 });
 
 test("routerFetch JSON-encodes objects and returns the raw response", async () => {
-  const ctx = createContext({ job: "digest-2026-10-28", initiator: "tldr-digest" });
+  const ctx = createContext({ job: "job-42", initiator: "example-client" });
   const res = await routerFetch(base, "TOKEN", ctx,
     "/v1beta/models/gemini-3.8-flash:generateContent",
     { method: "POST", body: { contents: [{ parts: [{ text: "hi" }] }] } });
-  assert.equal(res.headers.get("x-router-job"), "digest-2026-10-28");
+  assert.equal(res.headers.get("x-router-job"), "job-42");
   assert.equal(res.headers.get("x-router-trace"), "abc");
   assert.equal((await res.json()).ok, true);
   const req = seen.find((r) => r.path.includes(":generateContent"));
   assert.equal(req.headers["content-type"], "application/json");
   assert.equal(req.body.contents[0].parts[0].text, "hi");
-  assert.equal(req.headers["x-router-job"], "digest-2026-10-28");
+  assert.equal(req.headers["x-router-job"], "job-42");
 });
 
 test("TTS helpers submit uploaded text, poll status and return raw audio response", async () => {

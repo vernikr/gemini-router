@@ -423,8 +423,8 @@ class GeminiClient:
         if keyauth.leaked(status, resp.text):
             return KeyLeakedError(
                 f"HTTP {status}: {body} — the provider has this key on its leaked list; "
-                f"delete it in the console (or AI Studio) and add a fresh one: "
-                f"`gemini-mcp keys add <new key>`", status=status)
+                f"delete it in the console (or AI Studio) and add a fresh key to the configured "
+                f"key source (for gateway installs: `gemini keys add <new key>`)", status=status)
         key_rejected = status in KEY_REJECT_STATUS
         retryable = status in RETRYABLE_STATUS or (status == 429 and quota_minute)
         switch = (status in MODEL_SWITCH_STATUS or (status == 429 and quota_day)
@@ -436,10 +436,8 @@ class GeminiClient:
                                signal=signal if signal.blocks_pair else None)
 
 
-# What the provider accepts under a media part. Measured 2026-10-11 on gemini-3.6-flash:
-# an image costs 256/529/1089 tokens at low/medium/high, a PDF page 280/560/1120, and the
-# default differs per media type (images high, PDFs medium) — so pinning a level is what
-# makes cost predictable. One word in, the provider's constant out.
+# Media-resolution values accepted by the provider. Forecast rates are defined in
+# `tariffs.py`; actual accounting uses provider usage metadata and countTokens.
 RESOLUTION_LEVELS = {"low": "MEDIA_RESOLUTION_LOW",
                      "medium": "MEDIA_RESOLUTION_MEDIUM",
                      "high": "MEDIA_RESOLUTION_HIGH"}
@@ -483,8 +481,7 @@ async def _chunks(path: Path, size: int = CHUNK):
 
 
 def extract_json(text: str):
-    """Tolerant JSON extractor (ported from tldr-digest src/llm.py; when several
-    candidates match, the one starting earliest in the text wins)."""
+    """Extract the earliest valid JSON value from a provider response."""
     if text is None:
         raise RouterError("empty model response")
     text = text.strip()

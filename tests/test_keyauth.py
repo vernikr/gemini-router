@@ -93,8 +93,7 @@ async def test_bearer_transport_is_also_a_candidate(mock_api, tmp_path):
 
 
 async def test_leaked_key_is_not_rotated_and_names_itself(mock_api, tmp_path):
-    """The 403 that cost us hours on 2026-10-11: one provider call, no transport roulette,
-    and an error that tells the operator what to do."""
+    """A leaked-key response is reported clearly and does not trigger transport retries."""
     key = "AIzaSyDUMMYleaked_key_for_tests_00000"
     cfg = make_config(tmp_path, api_keys=[key])
     calls: list[str] = []

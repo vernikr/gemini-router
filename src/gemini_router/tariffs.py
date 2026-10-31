@@ -1,27 +1,22 @@
-"""Media token tariffs and drift detection (SPEC §2, wave 1 of the cross-repo wave plan).
+"""Media token tariffs and drift detection (SPEC §2).
 
-The table below is the single source of truth for media prices; docs point here and never
-restate the numbers. A forecast is a planning number for BEFORE any provider round-trip —
-countTokens is free and stays the measured fact packing and accounting run on.
+Forecasts are planning estimates before provider dispatch. `countTokens` supplies the
+measured request value used for preflight and accounting; drift checks compare the
+forecast with provider usage metadata.
 """
 from __future__ import annotations
 
-# Tokens per media part by media_resolution level.
-# image: per image, flat across 300x300..4096x4096 px and 2 KB..7 MB
-#   [measured 2026-10-11, gemini-3.6-flash, countTokens + usageMetadata agree,
-#    vernikr/gemini-mcp docs/worklog/archive/2026.10.11-binary-file-support/report.md §0.18.2]
-# pdf: per page, text PDF [measured 2026-10-11, same key and sources]
+# Tokens per image or PDF page at each media-resolution level.
+# The values are measured estimates; request accounting uses provider usage metadata.
 MEDIA_TARIFFS: dict[str, dict[str, int]] = {
     "image": {"low": 256, "medium": 529, "high": 1089},
     "pdf": {"low": 280, "medium": 560, "high": 1120},
 }
 
-# The level the provider charges when the request sends none (""):
-# the "default" column measured the same day (image = high, pdf = medium).
+# Levels used when a request omits media_resolution.
 DEFAULT_LEVEL: dict[str, str] = {"image": "high", "pdf": "medium"}
 
-# Provider-published, not yet measured — forecast refuses until a call verifies them.
-# [docs, ai.google.dev, fetched 2026-10-11]
+# Published reference rates; forecasts remain disabled until verified by a live count.
 PUBLISHED_ONLY: dict[str, str] = {"audio": "25 tokens/s", "video": "70 tokens/frame at 1 fps"}
 
 LEVELS = ("low", "medium", "high")
@@ -41,8 +36,7 @@ def media_class(mime: str | None) -> str:
 
 def forecast_media_tokens(mime: str | None, *, pages: int = 1,
                           level: str | None = None) -> int:
-    """Predicted token cost before any provider call. `level` in low/medium/high, or
-    None/"" for the provider default (DEFAULT_LEVEL). `pages` matters for pdf only."""
+    """Predict token cost before dispatch; ``pages`` applies to PDFs only."""
     cls = media_class(mime)
     table = MEDIA_TARIFFS.get(cls)
     if table is None:
@@ -50,17 +44,20 @@ def forecast_media_tokens(mime: str | None, *, pages: int = 1,
         raise TariffNotMeasured(
             f"no measured tariff for {cls!r}{note} — measure with countTokens; "
             f"forecasts cover {'/'.join(MEDIA_TARIFFS)} only")
-    lvl = level or DEFAULT_LEVEL[cls]
-    if lvl not in LEVELS:
+    chosen = level or DEFAULT_LEVEL[cls]
+    if chosen not in LEVELS:
         raise ValueError(f"media_resolution must be one of {'/'.join(LEVELS)} or '' "
-                         f"— got {lvl!r}")
-    per = table[lvl]
+                         f"— got {chosen!r}")
+    per = table[chosen]
     return per * pages if cls == "pdf" else per
 
 
 def check_drift(predicted: int, measured: int) -> dict | None:
-    """{'predicted','measured','pct'} when the miss exceeds max(5 %, 50 tokens): a signal
-    to re-measure the table, never an error — the request ran on the measured number."""
+    """Return a drift record when the miss exceeds max(5 %, 50 tokens).
+
+    Drift is an observability signal, not an error: the request is accounted using the
+    provider's measured usage.
+    """
     if abs(measured - predicted) <= max(predicted * 0.05, 50):
         return None
     return {"predicted": predicted, "measured": measured,

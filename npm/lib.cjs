@@ -167,10 +167,10 @@ class RouterContext {
 /**
  * One target activity. Every call, hop, note and job event carries this identity.
  * @param {object} [options]
- * @param {string} [options.job] e.g. "digest-2026-10-28"; defaults to initiator@UTC-date
+ * @param {string} [options.job] e.g. "job-42"; defaults to initiator@UTC-date
  * @param {string} [options.trace] one execution of the job; defaults to a 32-hex id
  * @param {string} [options.step] stage label, e.g. "prefilter"
- * @param {string} [options.initiator] e.g. "tldr-digest"
+ * @param {string} [options.initiator] e.g. "example-client"
  * @param {string} [options.comment] free text, stored but never used for routing
  */
 function createContext(options = {}) {

@@ -1,4 +1,4 @@
-"""Streaming transport, provisional output, shared accounting and legacy parity."""
+"""Streaming transport, provisional output, shared accounting and sync/async parity."""
 import asyncio
 import json
 

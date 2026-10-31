@@ -1,10 +1,4 @@
-"""The 2026-10-21 incident, pinned as tests.
-
-Three client requests, every key×model pair answering an unexplained 429. Before
-provider truth was authoritative the proxy re-walked the same exhausted pairs inside
-each request: 48 upstream refusals in ten seconds, 3 of them client-visible. Now the
-first request discovers the truth once, and the next two are answered locally.
-"""
+"""Repeated provider quota refusals are learned once and answered locally thereafter."""
 from __future__ import annotations
 
 import httpx
@@ -16,7 +10,7 @@ MODELS = CHAIN + [LITE]
 
 
 def _unexplained_429():
-    # No quotaId, no Retry-After: exactly what the free tier sent during the blip.
+    # No quotaId or Retry-After; classify quota state from the provider response body.
     return httpx.Response(429, json={"error": {"code": 429, "message":
                                                "You exceeded your current quota"}})
 

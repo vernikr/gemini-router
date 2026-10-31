@@ -23,7 +23,7 @@ from gemini_router import (
 )
 from gemini_router.cli import main
 
-JOB = "digest-2026-10-28"
+JOB = "job-42"
 TRACE = "run-7f3a9c2e"
 NOW = 1792594800.0
 MINUTE_BODY = b'''{"error":{"code":429,"message":"quota exceeded",
@@ -32,7 +32,7 @@ MINUTE_BODY = b'''{"error":{"code":429,"message":"quota exceeded",
 
 def ctx_headers(**over) -> dict:
     h = {"X-Router-Job": JOB, "X-Router-Trace": TRACE, "X-Router-Step": "prefilter",
-         "X-Router-Initiator": "tldr-digest", "X-Router-Request-Id": "req-1",
+         "X-Router-Initiator": "example-client", "X-Router-Request-Id": "req-1",
          "X-Router-Comment": quote("утренняя сборка"),
          "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}
     h.update(over)
@@ -43,12 +43,12 @@ def ctx_headers(**over) -> dict:
 def test_context_headers_carry_the_whole_identity():
     ctx = RequestContext.from_headers(ctx_headers(), default_initiator="mcp")
     assert ctx.job == JOB and ctx.trace_id == TRACE and ctx.step == "prefilter"
-    assert ctx.initiator == "tldr-digest" and ctx.request_id == "req-1"
+    assert ctx.initiator == "example-client" and ctx.request_id == "req-1"
     assert ctx.comment == "утренняя сборка"
     assert ctx.parent_span == "00f067aa0ba902b7"
     fields = ctx.log_fields()
     assert fields["job"] == JOB and fields["trace"] == TRACE and fields["step"] == "prefilter"
-    assert fields["initiator"] == "tldr-digest" and fields["comment"] == "утренняя сборка"
+    assert fields["initiator"] == "example-client" and fields["comment"] == "утренняя сборка"
     assert "x-router-parent-span" in CLIENT_CONTEXT_HEADERS
     assert "traceparent" in CLIENT_CONTEXT_HEADERS
     for name in ("X-Router-Job", "X-Router-Trace", "X-Router-Step", "traceparent"):
@@ -56,8 +56,8 @@ def test_context_headers_carry_the_whole_identity():
 
 
 def test_default_job_groups_the_initiators_utc_day():
-    ctx = RequestContext.from_headers({}, default_initiator="tldr-digest")
-    assert re.fullmatch(r"tldr-digest@\d{4}-\d{2}-\d{2}", ctx.job)
+    ctx = RequestContext.from_headers({}, default_initiator="example-client")
+    assert re.fullmatch(r"example-client@\d{4}-\d{2}-\d{2}", ctx.job)
     assert ctx.trace_id == ctx.job
     assert ctx.step == ""
 
@@ -113,10 +113,10 @@ def test_schema_v4_migrates_an_older_database(tmp_path):
 
 def test_job_aggregates_calls_notes_and_lifecycle(tmp_path):
     led = Ledger(tmp_path / "state.db")
-    led.job_start(JOB, initiator="tldr-digest", version="0.12.0", comment="start",
+    led.job_start(JOB, initiator="example-client", version="0.12.0", comment="start",
                   trace_id=TRACE, step="init")
     ok = led.plan(key_id="k1", model="gemini-3.8-flash", kind="single", est_tokens=10,
-                  request_id="req-1", source="test", initiator="tldr-digest",
+                  request_id="req-1", source="test", initiator="example-client",
                   version="0.12.0", job=JOB, trace_id=TRACE, step="prefilter", hop=0,
                   requested_model="gemini-2.5-flash", request_bytes=120,
                   method="POST", path="/v1beta/models/gemini-3.8-flash:generateContent")
@@ -125,9 +125,9 @@ def test_job_aggregates_calls_notes_and_lifecycle(tmp_path):
                        request_id="req-2", source="test", job=JOB, trace_id=TRACE,
                        step="analysis", hop=1)
     led.resolve(refused, "quota", http_status=429, quota_id="GenerateRequestsPerDay")
-    led.add_note("prefilter done", initiator="tldr-digest", version="0.12.0",
+    led.add_note("prefilter done", initiator="example-client", version="0.12.0",
                  job=JOB, trace_id=TRACE, step="prefilter")
-    led.job_finish(JOB, status="done", initiator="tldr-digest", version="0.12.0",
+    led.job_finish(JOB, status="done", initiator="example-client", version="0.12.0",
                    comment="ok", step="finish")
 
     summary = led.job_summary(JOB)
@@ -155,7 +155,7 @@ def test_job_aggregates_calls_notes_and_lifecycle(tmp_path):
 def test_provider_feedback_log_and_pair_state_carry_the_job(tmp_path, caplog):
     cfg = make_config(tmp_path)
     led = Ledger(cfg.state_path)
-    ctx = RequestContext(initiator="tldr-digest", version="0.12.0",
+    ctx = RequestContext(initiator="example-client", version="0.12.0",
                          job=JOB, trace_id=TRACE, step="prefilter")
     signal = parse_provider_signal(429, {"Retry-After": "60"}, MINUTE_BODY, cfg, now=NOW)
     with caplog.at_level(logging.INFO, logger="gemini_router.feedback"):
@@ -216,7 +216,7 @@ def test_proxy_job_end_to_end(tmp_path, respx_mock, caplog):
         assert row["requested_model"] == "gemini-3.8-flash"
         assert row["method"] == "POST" and row["path"].endswith(":generateContent")
         assert row["request_bytes"] > 0 and row["response_bytes"] > 0
-        assert row["initiator"] == "tldr-digest" and row["comment"] == "утренняя сборка"
+        assert row["initiator"] == "example-client" and row["comment"] == "утренняя сборка"
         # Router-only headers never reach Google; the upstream key is a pool key.
         upstream = route.calls.last.request.headers
         for name in CLIENT_CONTEXT_HEADERS:
@@ -251,7 +251,7 @@ def cli_env(tmp_path, monkeypatch):
 
 @pytest.mark.usefixtures("cli_env")
 def test_cli_job_lifecycle_and_audit(capsys):
-    assert main(["job-start", JOB, "--initiator", "tldr-digest", "--trace", TRACE,
+    assert main(["job-start", JOB, "--initiator", "example-client", "--trace", TRACE,
                  "--step", "init", "--comment", "start"]) == 0
     assert "event=job" in capsys.readouterr().out
     assert main(["note", "prefilter done", "--job", JOB, "--trace", TRACE,

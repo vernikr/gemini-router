@@ -2,7 +2,7 @@ name: tariff-drift
 # Wave 1 layer 3: the scheduled proof that MEDIA_TARIFFS still matches the provider.
 # Uploads three generated fixtures and calls countTokens on each — both free, no RPD —
 # then fails on any mismatch. A red run is itself a signal (GitHub notifies); the mail
-# path is the durable one (Gmail SMTP from Actions, the pattern tldr-digest proved).
+# path is the durable one (Gmail SMTP from Actions, the pattern example-client proved).
 # Needs repo secrets: GEMINI_API_KEY; for mail GMAIL_ADDRESS / GMAIL_APP_PASSWORD / MAIL_TO.
 on:
   schedule:

@@ -1,5 +1,4 @@
-"""Error taxonomy. Ported status sets from tldr-digest src/llm.py, extended with
-free-tier quota semantics (day vs minute 429) per gemini-mcp docs/02 FR-C4/C8/C13."""
+"""Provider error classification and quota-aware retry semantics."""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -35,9 +34,8 @@ class GeminiHTTPError(RouterError):
 class KeyLeakedError(GeminiHTTPError):
     """The provider refused the key because it was reported as leaked. No transport helps
     and no retry helps: delete the key in the console and add a fresh one. The router
-    treats it as a key rejection, so failover moves on to the next key — and when every
-    key answers this way, the operator reads the cause instead of a file-upload failure,
-    which is exactly how a pool-wide outage stayed invisible on 2026-10-11."""
+    treats it as a key rejection, so failover moves on to the next key. If every key is
+    refused, the operator sees the provider's actual cause instead of a generic failure."""
 
     def __init__(self, message: str, **kw):
         kw.setdefault("key_rejected", True)

@@ -18,7 +18,7 @@ from gemini_router.gemini import GenResult, UploadedFile
     ("ok", None, "readable", "match"),
     ("blocked", None, "readable", "drift"),
     ("blocked", 400, "", "match"),
-    ("blocked", 500, "", "match"),   # historical lite/PDF behavior
+    ("blocked", 500, "", "match"),   # configured capability verdict
     ("ok", 400, "", "drift"),
     ("ok", 500, "", "inconclusive"),  # may be provider instability
     ("ok", 503, "", "inconclusive"),

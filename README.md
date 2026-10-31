@@ -26,7 +26,7 @@ the CLI, the native Gemini API pass-through proxy and HTTP consumers.
   `pair_state`. A confirmed `PerDay` verdict lasts until the next Pacific-time reset;
   repeated unexplained 429s escalate to a day block; `2xx` clears a block; `503` is
   overload, not RPD spend. Each walk remembers the pairs it visited.
-- **Job/trace audit**: one target activity (`digest-2026-10-28`, `mcp-session-…`) spans
+- **Job/trace audit**: one target activity (`job-42`, `mcp-session-…`) spans
   requests, hops, provider signals, waits, cooldowns and annotations. Schema v4 stores
   `jobs` and job/trace/step/hop fields on `calls`, `notes` and `pair_state`; CLI and HTTP
   endpoints read them back.
@@ -51,7 +51,7 @@ gemini-router --version
 
 ## How to call from another project
 
-### 1. HTTP REST API via `gemini-mcp` daemon (`127.0.0.1:8790`)
+### 1. HTTP REST API via the Gemini gateway daemon (`127.0.0.1:8790`)
 
 Language-agnostic. Ensure the SSH tunnel is active
 (`packaging/com.vernikr.gemini-tunnel.plist` forwards `:8790` and `:8787` from the VPS):
@@ -62,7 +62,7 @@ curl -s http://127.0.0.1:8790/v1/quota -H "Authorization: Bearer $GEMINI_MCP_TOK
 curl -s -X POST http://127.0.0.1:8790/v1/complete \
   -H "Authorization: Bearer $GEMINI_MCP_TOKEN" -H 'Content-Type: application/json' \
   -d '{"prompt":"Summarize these messages...","system":"You are a concise analyst.",
-       "route":"auto","thinking_level":"medium","overflow":"lite"}'
+       "route":"optimal","thinking_level":"medium","overflow":"lite"}'
 # {"report": "...", "result": "<text>", "meta": {"model": "...", ...}}
 ```
 
@@ -83,7 +83,7 @@ no path prefix) and `GEMINI_API_KEY=$GEMINI_ROUTER_PROXY_TOKEN` (sent as
 ```python
 from gemini_router import Config, Router, RouterRequest
 
-cfg = Config.load(state_path="~/.config/gemini-mcp/state.db")
+cfg = Config.load(state_path="~/.config/gemini/state.db")
 router = Router(cfg)
 try:
     res = await router.complete(
@@ -91,8 +91,8 @@ try:
             prompt="...", system="...",
             thinking_level="medium",   # "low" | "medium" | "high" | None
             overflow="lite",           # "off" | "lite" | "lite+gemma"
-            initiator="tldr-digest",
-            job="digest-2026-10-28", trace_id="run-7f3a", step="analysis",
+            initiator="example-client",
+            job="job-42", trace_id="run-7f3a", step="analysis",
             comment="утренняя сборка",
         ),
         on_event=lambda ev: print(ev.message(), flush=True),
@@ -135,6 +135,12 @@ and reconciles with provider usage metadata afterwards. Audio output tokens are 
 billing measure, not input TPM. WAV chunks are appended to a temporary file and encoded
 by the system `ffmpeg` executable in a child process; `ffmpeg` must be installed.
 
+The CLI checks PyPI before interactive subcommands, except `--help`, `--version`, and the
+long-running `proxy` service. Use `--no-update` for one command or set
+`GEMINI_ROUTER_AUTO_UPDATE=0` to keep the installed version. For TTS, the TTY progress bar
+advances on completed chunks and encoding; quota waits and retries update the label without
+guessed percentages.
+
 CLI equivalent:
 
 ```bash
@@ -154,11 +160,11 @@ attempts inside one request's selection walk.
 ### HTTP headers (consumed locally, never forwarded upstream)
 
 ```
-X-Router-Initiator: tldr-digest            # who started the work (alias X-Router-Source)
-X-Router-Job: digest-2026-10-28            # target activity (alias X-Router-Job-Id)
+X-Router-Initiator: example-client            # who started the work (alias X-Router-Source)
+X-Router-Job: job-42            # target activity (alias X-Router-Job-Id)
 X-Router-Trace: 7f3a9c2e                   # one run (alias X-Router-Trace-Id)
 X-Router-Step: prefilter                   # stage (alias X-Router-Stage)
-X-Router-Request-Id: digest-20261028-001   # one logical request (alias X-Router-Span)
+X-Router-Request-Id: request-001   # one logical request (alias X-Router-Span)
 X-Router-Comment: утренняя сборка          # free text (alias X-Router-Note)
 X-Router-Parent-Span: <16 hex>             # link a child request to its parent
 traceparent: 00-<32 hex>-<16 hex>-01       # W3C Trace Context, also accepted
@@ -174,18 +180,18 @@ trace. Forwarded responses carry `x-router-version`, `x-router-job`, `x-router-t
 ```bash
 curl -s -X POST http://127.0.0.1:8787/v1/job \
   -H "x-goog-api-key: $GEMINI_ROUTER_PROXY_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"action":"start","job":"digest-2026-10-28","initiator":"tldr-digest",
+  -d '{"action":"start","job":"job-42","initiator":"example-client",
        "trace":"7f3a9c2e","comment":"сборка дайджеста за сегодня"}'
 
 # ... all generateContent calls use X-Router-Job / X-Router-Trace / X-Router-Step ...
 
 curl -s -X POST http://127.0.0.1:8787/v1/job \
   -H "x-goog-api-key: $GEMINI_ROUTER_PROXY_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"action":"finish","job":"digest-2026-10-28","status":"done","comment":"ok"}'
+  -d '{"action":"finish","job":"job-42","status":"done","comment":"ok"}'
 
 curl -s 'http://127.0.0.1:8787/v1/jobs?n=20'                 # job list with counters
-curl -s 'http://127.0.0.1:8787/v1/job?id=digest-2026-10-28&n=200'  # summary + events + calls
-curl -s 'http://127.0.0.1:8787/v1/notes?job=digest-2026-10-28&n=50'
+curl -s 'http://127.0.0.1:8787/v1/job?id=job-42&n=200'  # summary + events + calls
+curl -s 'http://127.0.0.1:8787/v1/notes?job=job-42&n=50'
 ```
 
 `POST /v1/note` accepts `job`, `trace`, `step`, `initiator` and `comment` and writes an
@@ -195,13 +201,13 @@ annotation with no provider call and no quota effect. `GET /v1/calls` filters by
 ### CLI
 
 ```bash
-gemini-router job-start digest-2026-10-28 --initiator tldr-digest --trace 7f3a9c2e
-gemini-router note "prefilter done" --job digest-2026-10-28 --trace 7f3a9c2e
+gemini-router job-start job-42 --initiator example-client --trace 7f3a9c2e
+gemini-router note "prefilter done" --job job-42 --trace 7f3a9c2e
 gemini-router jobs -n 20                        # status, calls, ok, refusals, 429, models
-gemini-router job digest-2026-10-28 --json     # full timeline of one activity
-gemini-router job-finish digest-2026-10-28 --status done
-gemini-router calls --job digest-2026-10-28 --step prefilter --wide
-gemini-router notes --job digest-2026-10-28
+gemini-router job job-42 --json     # full timeline of one activity
+gemini-router job-finish job-42 --status done
+gemini-router calls --job job-42 --step prefilter --wide
+gemini-router notes --job job-42
 ```
 
 ### npm helper
@@ -211,7 +217,7 @@ import { createContext, headers, note, jobStart, jobFinish, jobGet } from "gemin
 
 const base = "http://127.0.0.1:8787";
 const token = process.env.GEMINI_ROUTER_PROXY_TOKEN;
-const ctx = createContext({ job: "digest-2026-10-28", initiator: "tldr-digest",
+const ctx = createContext({ job: "job-42", initiator: "example-client",
                             step: "prefilter" });   // generates a trace id
 await jobStart(base, token, ctx, { comment: "сборка дайджеста за сегодня" });
 const res = await fetch(`${base}/v1beta/models/gemini-3.8-flash:generateContent`, {
@@ -259,5 +265,5 @@ Config (all optional, see [`config.example.yaml`](config.example.yaml)):
 Full design: [SPEC §12](docs/SPEC.md#12-provider-truth-and-request-identity) and
 [SPEC §13](docs/SPEC.md#13-job--trace-correlation).
 
-Conventions: English in files, Conventional Commits, SemVer tags `v*` (`gemini-mcp` pins
-a tag), CI = ruff + pytest with mocked HTTP (see [`AGENTS.md`](AGENTS.md)).
+Conventions: English in files, Conventional Commits, SemVer tags `v*`, compatible Python/npm
+package versions, and CI with mocked HTTP tests (see [`AGENTS.md`](AGENTS.md)).

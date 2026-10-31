@@ -5,7 +5,7 @@
 #          systemctl daemon-reload && systemctl enable --now gemini-router-proxy
 #
 # It reuses the gateway's EnvironmentFile, so it sees the SAME key pool and the SAME
-# state.db — quota truth stays shared with gemini-mcp, stdio sessions and the CLI.
+# state.db — quota truth stays shared with the gateway, stdio sessions and the CLI.
 # Loopback only: never publish this port.
 [Unit]
 Description=gemini-router — native Gemini API pass-through for File Search (127.0.0.1:8787)

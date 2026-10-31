@@ -15,7 +15,7 @@ from gemini_router import (
 from gemini_router.config import key_id
 from gemini_router.routing import gates_for
 
-# 2026-10-21 15:00 UTC = 08:00 PDT: the next PT reset is ~16 h away.
+# Fixed timestamp gives deterministic Pacific-time daily-window boundaries.
 NOW = 1792594800.0
 DAY_BODY = b'''{"error":{"code":429,"message":"You exceeded your current quota",
  "status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure",
@@ -90,7 +90,7 @@ def test_provider_state_overrides_fresh_counters(tmp_path):
     assert after["rpd_left"] == 0
     assert after["provider_blocked"] == "day"
     assert led.provider_state(kid, c.chain[0], NOW)["kind"] == "day"
-    # Old readers (gemini-mcp) only know `cooldowns`; the verdict is mirrored there.
+    # Daily provider blocks are mirrored to `cooldowns` for compatible readers.
     assert led.cooldown(kid, c.chain[0], NOW) is not None
     led.close()
 
@@ -164,16 +164,15 @@ def test_v2_database_migrates_additively(tmp_path):
     led.close()
 
 
-def test_legacy_rpd_429_cooldown_is_read_as_provider_truth(tmp_path):
-    """gemini-mcp still ships v0.1.1 and writes only `cooldowns`. Its daily verdict
-    must still be a hard block for the new proxy — a mixed fleet shares one truth."""
+def test_rpd_429_cooldown_is_read_as_provider_truth(tmp_path):
+    """A persisted daily-quota cooldown maps to a hard block in provider state."""
     c = cfg(tmp_path)
     led = Ledger(c.state_path)
-    kid = key_id("legacy-key")
+    kid = key_id("quota-key")
     led.set_cooldown(kid, c.chain[0], NOW + 3600, "rpd_429")
     state = led.provider_state(kid, c.chain[0], NOW)
     assert state and state["kind"] == "day"
-    g = gates_for(c, led, c.chain[0], "legacy-key", 0, NOW)
+    g = gates_for(c, led, c.chain[0], "quota-key", 0, NOW)
     assert g["rpd_left"] == 0 and g["provider_blocked"] == "day"
     snap = led.gate_snapshot(day_start=NOW - 3600, roll_start=NOW - 86400,
                              win_start=NOW - 60, planned_min=NOW - 300, now=NOW)

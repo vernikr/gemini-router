@@ -3,7 +3,7 @@
 Uploads three generated fixtures and calls countTokens on each — both free, no RPD —
 then diffs the live prices against MEDIA_TARIFFS. A miss fails the run (GitHub notifies
 on red runs) and, when the Gmail secrets exist, mails the numbers (the same path
-tldr-digest uses). The model id is this script's own canary pin, deliberately NOT the
+example-client uses). The model id is this script's own canary pin, deliberately NOT the
 library's chain (volatile model ids are why this check exists).
 """
 from __future__ import annotations

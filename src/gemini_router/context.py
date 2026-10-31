@@ -3,10 +3,9 @@
 Every record produced by the router carries the same identity:
 
 * **version** — the build that produced it;
-* **initiator** — a free-form string supplied by whoever started the work
-  (``tldr-digest``, ``gemini-mcp``, ``ops-audit`` ...); ``source`` remains the entry
-  point (``filesearch`` / ``cli`` / ``mcp``);
-* **job** — the ID of one *target activity*, e.g. ``digest-2026-10-28``. All requests,
+* **initiator** — a free-form string supplied by the caller; ``source`` remains the
+  entry point (``filesearch`` / ``cli`` / ``mcp``);
+* **job** — the ID of one *target activity*, e.g. ``job-42``. All requests,
   hops, provider signals, cooldown decisions and notes belonging to that activity share
   it. When a client sends no job, ``<initiator>@<UTC date>`` groups the day;
 * **trace** — one execution of the job. It comes from ``X-Router-Trace``, from a W3C

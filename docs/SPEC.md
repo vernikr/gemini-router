@@ -1,7 +1,7 @@
 # gemini-router · SPEC
 
-The router's own contract. Companion docs live in `vernikr/gemini-mcp/docs/02` + `docs/03`
-(system-wide requirements, architecture, plan).
+The router's API and behavior contract. The Gemini gateway's requirements and architecture
+are documented in `vernikr/gemini/docs/02-requirements.md` and `docs/03-architecture.md`.
 
 ## 1. What it is
 
@@ -14,7 +14,7 @@ Quota-aware Gemini Flash router shared by Python, CLI and HTTP consumers:
 - key pool (`GEMINI_API_KEYS` / `GEMINI_API_KEY_1..10`); selection prefers the pair with
   the largest remaining budget;
 - persistent multi-process ledger (SQLite WAL) — shared by connected consumers on
-  the same machine (`gemini-mcp`, `tldr-digest`, CLI, HTTP clients);
+  the same machine (the Gemini gateway, Python applications, CLI, HTTP clients);
 - 429/5xx/4xx taxonomy (`RETRYABLE_STATUS`, `MODEL_SWITCH_STATUS`, `Retry-After`,
   backoff+jitter, provider deadline);
 - opt-in overflow tiers (`gemini-3.5-flash-lite`, best `gemma-*`) — never automatic;
@@ -110,8 +110,8 @@ walk the same model/key tiers as a text request. Pass the same `overflow` policy
 `upload_file` so it can start even when only a Lite/Gemma key has quota; counting
 file tokens stays free. Gateway single, group and split-PDF
 paths all supply these sources. The result's `files_used` records the *serving* uploads.
-If the caller does not supply local paths, the router safely retains historical
-single-key pinning and never sends a foreign URI. The request carries `file_data`
+If the caller does not supply local paths, the router uses single-key pinning and never
+sends a foreign URI. The request carries `file_data`
 parts ahead of text; the cache hashes local `sha256`, not a key-specific URI. A failed
 multi-file re-upload discards that candidate's partial bundle.
 
@@ -192,7 +192,7 @@ uv add gemini-router      # PyPI
 ```
 
 Service-style consumption (no Python): REST `POST /v1/complete`, `GET /v1/quota` on the
-gemini-mcp daemon (localhost:8790, bearer) — same ledger, same rules.
+Gemini gateway daemon (localhost:8790, bearer) — same ledger, same rules.
 
 ## 6. Scope and boundaries
 
@@ -205,11 +205,11 @@ ledger without duplicating routing rules.
 
 ## 7. Versioning & CI
 
-SemVer; tags `v*`; `gemini-mcp` pins a tag. CI: ruff + pytest (respx mocks, no network) on
-push/PR. Conventional Commits. Release artifacts: `gemini-router` on PyPI (library +
-CLI) and `gemini-router` on npm (zero-dependency HTTP helper in `npm/`). Both publish from
-the tagged commit; the tag, `pyproject.toml` and `npm/package.json` carry the same
-version.
+SemVer; tags `v*`; CI runs Ruff, pytest and the npm helper tests with mocked provider
+responses. Conventional Commits. Release artifacts are `gemini-router` on PyPI (library
+and CLI) and `gemini-router` on npm (zero-dependency HTTP helper in `npm/`). The release
+workflow publishes both from the tagged commit and checks that the tag, `pyproject.toml`,
+and `npm/package.json` use the same version.
 
 ## 8. File input (Files API)
 
@@ -283,7 +283,7 @@ at analysis time and are the frontend's pre-flight concern, not this library's.
   The chain is the account's real options, newest first.
 - CLI exit codes: `0` ok · `2` config/usage error · `doctor` names its failure so a
   script can act without parsing prose: `3` no API keys, `4` state file unusable,
-  `5` no configured chain model reachable on any key. `gemini-mcp` passes these through
+  `5` no configured chain model reachable on any key. The Gemini gateway passes these through
   and adds `6` for an unwritable log directory.
 
 ## 10. Keys and transports (`keyauth`)
@@ -541,7 +541,7 @@ path; `event=provider_feedback` the parsed signal; `event=note` an annotation;
 
 ### 13.1 Model
 
-A **job** identifies one target activity (`digest-2026-10-28`, `mcp-session-…`). A
+A **job** identifies one target activity (`job-42`, `mcp-session-…`). A
 **trace** identifies one execution of that job; retries use a new trace and stay in the
 job. `step` names a stage inside the execution, `request_id`/`span_id` identify one
 logical request, and `hop` counts upstream attempts inside its selection walk. All
@@ -554,11 +554,11 @@ that sends no trace uses the job as its trace.
 Request headers, consumed locally and never forwarded upstream:
 
 ```
-X-Router-Initiator: tldr-digest          (aliases: X-Router-Source)
-X-Router-Job: digest-2026-10-28          (aliases: X-Router-Job-Id)
+X-Router-Initiator: example-client          (aliases: X-Router-Source)
+X-Router-Job: job-42          (aliases: X-Router-Job-Id)
 X-Router-Trace: 7f3a9c2e                 (aliases: X-Router-Trace-Id)
 X-Router-Step: prefilter                 (aliases: X-Router-Stage)
-X-Router-Request-Id: digest-20261028-001 (aliases: X-Router-Span)
+X-Router-Request-Id: request-001 (aliases: X-Router-Span)
 X-Router-Comment: free text              (aliases: X-Router-Note)
 X-Router-Parent-Span: <16 hex>           (link a child request to its parent)
 traceparent: 00-<32 hex>-<16 hex>-01     (W3C Trace Context)
@@ -604,12 +604,12 @@ All require the proxy token. `/healthz` is open and reports the version.
 ### 13.5 CLI and npm
 
 ```bash
-gemini-router job-start digest-2026-10-28 --initiator tldr-digest --trace 7f3a9c2e
+gemini-router job-start job-42 --initiator example-client --trace 7f3a9c2e
 gemini-router jobs -n 20
-gemini-router job digest-2026-10-28 --json
-gemini-router job-finish digest-2026-10-28 --status done
-gemini-router calls --job digest-2026-10-28 --step prefilter --wide
-gemini-router notes --job digest-2026-10-28
+gemini-router job job-42 --json
+gemini-router job-finish job-42 --status done
+gemini-router calls --job job-42 --step prefilter --wide
+gemini-router notes --job job-42
 ```
 
 The npm package `gemini-router` exports `createContext`, `headers`, `note`, `jobStart`,

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.14.0 — CLI updates and deterministic TTS progress
+
+### Added
+- The `gemini-router` CLI checks PyPI at launch and runs the newest published release
+  when available. `--no-update` and `GEMINI_ROUTER_AUTO_UPDATE=0` keep the installed
+  version; offline checks fall back to the installed CLI. The long-running `proxy`
+  service remains deployment-managed.
+- TTS CLI progress now shows an animated Rich spinner and an overall percentage. The bar
+  advances on completed audio chunks and MP3 encoding, while quota waits and retries update
+  the status line without estimating progress from elapsed time.
+
+### Changed
+- Provider events include per-file TTS progress and chunk context for terminal frontends.
+- Evergreen documentation and source comments describe the current interfaces and behavior.
+
 ## 0.13.0 — single-speaker Gemini 3.8 Flash TTS
 
 ### Added

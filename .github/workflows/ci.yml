@@ -16,3 +16,8 @@ jobs:
       - run: python3 scripts/check_secrets.py   # fixtures carry DUMMY, never a live key
       - run: uv run ruff check .
       - run: uv run pytest -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm test
+        working-directory: npm

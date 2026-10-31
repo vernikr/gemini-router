@@ -117,10 +117,16 @@ async def test_router_file_creates_one_mp3_and_preflights_quota(
     source.write_text("Hello there.", encoding="utf-8")
     target = tmp_path / "result.mp3"
     router = Router(cfg)
+    events = []
     try:
-        result = await router.synthesize_file(source, output_path=target)
+        result = await router.synthesize_file(source, output_path=target,
+                                              on_event=events.append)
         assert result.path == target and result.chunks == 1
         assert result.tokens_in == 4 and target.exists()
+        progress = [event.pct for event in events if event.stage == "file_progress"]
+        assert progress == [0, 0, 95, 95, 100]
+        dispatch = next(event for event in events if event.stage == "dispatch")
+        assert dispatch.message().startswith("1/1 · dispatch")
         assert not target.with_name(f".{target.name}.wav.tmp").exists()
     finally:
         await router.aclose()

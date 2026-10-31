@@ -243,7 +243,7 @@ async def test_delete_file_is_best_effort(mock_api, tmp_path):
 
 # ------------------------------------------------------------------ schema migration
 def test_an_existing_v1_database_migrates_in_place(tmp_path):
-    """The production database is shared (daemon, stdio sessions, tldr-digest) and older
+    """The production database is shared (daemon, stdio sessions, example-client) and older
     code opens it too: adding a column must be additive and must keep every row."""
     import sqlite3
 

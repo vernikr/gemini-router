@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Local :8790 -> VPS :8790 for gemini-mcp, plus :8787 -> VPS :8787 for the native
+<!-- Local :8790 -> VPS :8790 for the Gemini gateway, plus :8787 -> VPS :8787 for the native
      Gemini pass-through (gemini-router proxy). ONE ssh process, both forwards: a
      second launchd agent would open a second connection and double the keepalive
      traffic for no gain.

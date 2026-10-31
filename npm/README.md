@@ -21,8 +21,8 @@ import {
 const base = "http://127.0.0.1:8787";
 const token = process.env.GEMINI_ROUTER_PROXY_TOKEN;
 const ctx = createContext({
-  job: "digest-2026-10-28",
-  initiator: "tldr-digest",
+  job: "job-42",
+  initiator: "example-client",
   step: "prefilter",
   comment: "сборка дайджеста за сегодня",   // non-ASCII is percent-encoded for headers
 });
@@ -60,14 +60,14 @@ Every request, upstream hop, provider verdict, cooldown and annotation carries `
 `ctx.withStep("dedup")` changes only the stage. Read one activity back with:
 
 ```bash
-gemini-router job digest-2026-10-28 --json   # CLI from the Python package
-curl -s 'http://127.0.0.1:8787/v1/job?id=digest-2026-10-28&n=200'
+gemini-router job job-42 --json   # CLI from the Python package
+curl -s 'http://127.0.0.1:8787/v1/job?id=job-42&n=200'
 ```
 
 ## TTS file flow
 
-The file must first be uploaded to the gemini-mcp inbox (for example with its
-`file_upload_ticket` flow). Then submit it through the REST daemon on port 8790:
+The file must first be uploaded to the Gemini gateway inbox using its
+`file_upload_ticket` flow. Then submit it through the REST daemon on port 8790:
 
 ```js
 import { createContext, ttsFile, ttsStatus, ttsDownload } from "gemini-router";

@@ -50,7 +50,7 @@ class RouterRequest:
     initiator: str | None = None
     # Arbitrary operator text. Logged and stored, never used in a routing decision.
     comment: str = ""
-    # Target activity (e.g. "digest-2026-10-28"), one execution of it, and the
+    # Target activity (e.g. "job-42"), one execution of it, and the
     # client's stage inside that execution. All rows of the job share `job`.
     job: str | None = None
     trace_id: str | None = None
@@ -593,6 +593,12 @@ class Router:
                               on_event: Emitter | None = None) -> TTSFileResult:
         """Read UTF-8 TXT/Markdown, split at paragraphs then sentences, synthesize in
         order, concatenate WAV pieces on disk, and encode one MP3 asynchronously."""
+        def report_progress(pct: float, label: str, **detail) -> None:
+            if on_event:
+                on_event(RouterEvent(stage="file_progress", pct=pct,
+                                     detail={"label": label, **detail}))
+
+        report_progress(0, "Preparing audio · checking input", phase="preflight")
         source_path = Path(path)
         if source_path.suffix.lower() not in {".txt", ".md"}:
             raise ValueError("TTS file input supports only .txt and .md")
@@ -638,6 +644,8 @@ class Router:
                 hint=f"file needs {len(chunks)} TTS requests; only "
                      f"{remaining_requests} daily requests remain across usable projects",
                 waited=False)
+        report_progress(0, f"Synthesizing audio · 0/{len(chunks)} chunks",
+                        phase="synthesis", completed_chunks=0, total_chunks=len(chunks))
         target = Path(output_path) if output_path else Path(tempfile.gettempdir()) / (
             f"gemini-tts-{uuid.uuid4().hex}.mp3")
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -650,18 +658,33 @@ class Router:
         started = self._now()
         try:
             for i, (chunk, token_count) in enumerate(measured_chunks, 1):
+                def chunk_event(event: RouterEvent, chunk_index: int = i,
+                                total_chunks: int = len(chunks)) -> None:
+                    if on_event:
+                        event.detail.setdefault("chunk", chunk_index)
+                        event.detail.setdefault("chunks", total_chunks)
+                        on_event(event)
+
                 res = await self.synthesize(
                     chunk, voice=voice, style=style, wait=wait, source=source,
                     initiator=initiator, request_id=f"{request_id or uuid.uuid4().hex[:12]}-{i}",
                     job=job, trace_id=trace_id, step=f"tts:{i}/{len(chunks)}",
-                    on_event=on_event, _input_tokens=token_count)
+                    on_event=chunk_event if on_event else None, _input_tokens=token_count)
                 await asyncio.to_thread(assembler.append, res.audio)
                 total_tokens += res.tokens_in or estimate_tokens(chunk)
                 if res.key_id and res.key_id not in used_keys:
                     used_keys.append(res.key_id)
+                report_progress(95 * i / len(chunks),
+                                f"Synthesizing audio · {i}/{len(chunks)} chunks",
+                                phase="synthesis", completed_chunks=i,
+                                total_chunks=len(chunks))
             assembler.close()
+            report_progress(95, "Encoding MP3", phase="encoding",
+                            completed_chunks=len(chunks), total_chunks=len(chunks))
             await encode_mp3(wav_path, target, bitrate_kbps=bitrate_kbps)
             target.chmod(0o600)
+            report_progress(100, "Audio complete", phase="complete",
+                            completed_chunks=len(chunks), total_chunks=len(chunks))
         except BaseException:
             target.unlink(missing_ok=True)
             raise
@@ -831,9 +854,9 @@ class Router:
         if dead_keys and len(dead_keys) == len({key_id(k) for k in self.cfg.api_keys}):
             raise RouterError(
                 "every configured API key was rejected by the provider (HTTP 401, or a "
-                "leaked-key block) — delete the dead keys in the console and add fresh "
-                "ones: `gemini-mcp keys` shows the pool, `gemini-mcp keys add <key>` "
-                "validates and installs one without touching the unit file by hand")
+                "leaked-key block) — delete the rejected keys in the console and update "
+                "the configured key source. In a gateway install, `gemini keys` lists the "
+                "pool and `gemini keys add <key>` validates a replacement.")
         # A file job that exhausted its file-capable candidates is not a key problem, so
         # this is read before the pin clause; a quota block must not ask for a re-upload
         # under a key that was never the issue.
@@ -1055,7 +1078,7 @@ class Router:
         ctx = context or RequestContext(source=req.source, version=router_version())
         kid = key_id(key)
         g = self._gates(model, key, est)
-        if g["rpd_left"] <= 0:                                   # day gate — never waited (D9)
+        if g["rpd_left"] <= 0:                                   # daily limits cannot be waited out
             emit("switch", model=model, key_id=kid, detail={"reason": "rpd"})
             return None, "quota"
 

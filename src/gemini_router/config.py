@@ -1,5 +1,5 @@
-"""Config: pydantic model + YAML/env loading (SPEC §4). Defaults mirror
-gemini-mcp docs/03 §8. Secrets come only from env; never from YAML."""
+"""Configuration model and YAML/environment loading (SPEC §4).
+Secrets come only from the environment, never from YAML."""
 from __future__ import annotations
 
 import hashlib

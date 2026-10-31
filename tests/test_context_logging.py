@@ -12,11 +12,11 @@ from gemini_router import RequestContext, audit_line, router_version
 
 def test_context_from_headers_and_defaults():
     ctx = RequestContext.from_headers({
-        "X-Router-Initiator": "tldr-digest",
+        "X-Router-Initiator": "example-client",
         "X-Router-Comment": "starting new version testing",
         "X-Router-Request-Id": "req-42",
     }, default_initiator="filesearch")
-    assert ctx.initiator == "tldr-digest"
+    assert ctx.initiator == "example-client"
     assert ctx.comment == "starting new version testing"
     assert ctx.request_id == "req-42"
     assert ctx.version == router_version()
@@ -44,15 +44,15 @@ def test_proxy_rows_carry_version_initiator_and_comment(tmp_path, respx_mock):
         with client(proxy) as c:
             r = c.post("/v1beta/models/gemini-3.8-flash:generateContent",
                        json={"contents": [{"parts": [{"text": "q"}]}]},
-                       headers={"X-Router-Initiator": "tldr-digest",
+                       headers={"X-Router-Initiator": "example-client",
                                 "X-Router-Comment": "starting new version testing",
-                                "X-Router-Request-Id": "digest-20261028"})
+                                "X-Router-Request-Id": "request-42"})
         assert r.status_code == 200
         row = proxy.ledger.calls_tail(1)[0]
         assert row["version"] == router_version()
-        assert row["initiator"] == "tldr-digest" and row["source"] == "tldr-digest"
+        assert row["initiator"] == "example-client" and row["source"] == "example-client"
         assert row["comment"] == "starting new version testing"
-        assert row["request_id"] == "digest-20261028"
+        assert row["request_id"] == "request-42"
         # Context headers are consumed locally: they must never reach Google.
         upstream = route.calls.last.request.headers
         for h in ("x-router-initiator", "x-router-comment", "x-router-request-id"):

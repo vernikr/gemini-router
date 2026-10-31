@@ -1,7 +1,7 @@
 [project]
 name = "gemini-router"
-version = "0.13.0"
-description = "Quota-aware Gemini Flash router with persistent quota ledger, TTS file synthesis, CLI and native Gemini pass-through proxy"
+version = "0.14.0"
+description = "Quota-aware Gemini router with persistent usage ledger, native API proxy, TTS and auto-updating CLI"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
@@ -28,7 +28,7 @@ Repository = "https://github.com/vernikr/gemini-router"
 Changelog = "https://github.com/vernikr/gemini-router/blob/main/CHANGELOG.md"
 
 [project.scripts]
-gemini-router = "gemini_router.cli:main"
+gemini-router = "gemini_router.launcher:main"
 
 [build-system]
 requires = ["hatchling"]
