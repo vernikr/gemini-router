@@ -12,12 +12,11 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn
 from rich.table import Table
 
-from .events import RouterEvent
-
 from . import __version__
 from .config import Config
 from .context import audit_line
 from .errors import RouterError
+from .events import RouterEvent
 from .ledger import Ledger, iso, pt_midnight_ts
 from .routing import Router, pick_gemma
 
