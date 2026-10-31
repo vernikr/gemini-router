@@ -1,0 +1,12 @@
+name: Issue hierarchy
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  issues: write
+
+jobs:
+  sync-parent:
+    uses: vernikr/mother/.github/workflows/issue-parent-sync.yml@v1
