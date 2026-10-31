@@ -9,7 +9,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
 from rich.console import Console
 
 from gemini_router import cli as cli_module
