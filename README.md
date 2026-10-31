@@ -38,7 +38,7 @@ the CLI, the native Gemini API pass-through proxy and HTTP consumers.
   coupling. The npm package `gemini-router` is a zero-dependency client helper for the
   HTTP surface.
 
-Contract: [`docs/SPEC.md`](docs/SPEC.md) · changes: [`CHANGELOG.md`](CHANGELOG.md).
+Contract: [`docs/SPEC.md`](docs/SPEC.md) · changes: [`CHANGELOG.md`](CHANGELOG.md) · [release deployment](docs/deployment.md).
 
 ## Install
 
