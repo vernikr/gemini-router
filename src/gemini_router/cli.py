@@ -12,7 +12,6 @@ from rich.console import Console
 from rich.table import Table
 
 from . import __version__
-from .cli_progress import tts_progress
 from .config import Config
 from .context import audit_line
 from .errors import RouterError
@@ -351,19 +350,18 @@ def cmd_tts(args, cfg: Config | None = None) -> int:
     """Read TXT/Markdown, synthesize in quota-sized chunks, and write one MP3."""
     cfg = cfg if cfg is not None else _load_cfg(args)
 
-    async def _run(on_event):
+    async def _run():
         r = _router(cfg)
         try:
             return await r.synthesize_file(args.file, output_path=args.output,
                                            voice=args.voice, style=args.style,
                                            bitrate_kbps=args.bitrate, wait=args.wait,
                                            source="cli", initiator="gemini-router-cli",
-                                           request_id=args.request_id, on_event=on_event)
+                                           request_id=args.request_id)
         finally:
             await r.aclose()
 
-    with tts_progress(console, enabled=not args.json) as on_event:
-        result = asyncio.run(_run(on_event))
+    result = asyncio.run(_run())
     payload = {"path": str(result.path), "model": result.model,
                "chunks": result.chunks, "tokens_in": result.tokens_in,
                "key_ids": result.key_ids, "latency_s": round(result.latency_s, 2)}

@@ -7,9 +7,9 @@
   when available. `--no-update` and `GEMINI_ROUTER_AUTO_UPDATE=0` keep the installed
   version; offline checks fall back to the installed CLI. The long-running `proxy`
   service remains deployment-managed.
-- TTS CLI progress now shows an animated Rich spinner and an overall percentage. The bar
-  advances on completed audio chunks and MP3 encoding, while quota waits and retries update
-  the status line without estimating progress from elapsed time.
+- TTS file progress events now include deterministic overall percentage, phase, completed
+  chunks, and total chunks. The Gemini gateway CLI renders these events as a terminal
+  progress bar; waits and retries do not invent time-based progress.
 
 ### Changed
 - Provider events include per-file TTS progress and chunk context for terminal frontends.

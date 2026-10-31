@@ -137,9 +137,10 @@ by the system `ffmpeg` executable in a child process; `ffmpeg` must be installed
 
 The CLI checks PyPI before interactive subcommands, except `--help`, `--version`, and the
 long-running `proxy` service. Use `--no-update` for one command or set
-`GEMINI_ROUTER_AUTO_UPDATE=0` to keep the installed version. For TTS, the TTY progress bar
-advances on completed chunks and encoding; quota waits and retries update the label without
-guessed percentages.
+`GEMINI_ROUTER_AUTO_UPDATE=0` to keep the installed version. TTS emits `file_progress` events
+with overall percentage, phase, completed chunks, and total chunks; the Gemini gateway
+renders these as a terminal progress bar. Quota waits and retries remain event-driven and
+do not invent time-based percentages.
 
 CLI equivalent:
 
