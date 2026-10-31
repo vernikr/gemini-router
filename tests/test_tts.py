@@ -72,6 +72,24 @@ async def test_client_tts_uses_interactions_and_optional_controls(respx_mock, tm
     assert result.tokens_in == 7 and result.tokens_out == 12
 
 
+async def test_client_tts_reads_audio_from_raw_rest_steps(respx_mock, tmp_path):
+    cfg = make_config(tmp_path)
+    audio = base64.b64encode(wav_data()).decode()
+    respx_mock.post(f"{BASE}/interactions").mock(return_value=httpx.Response(200, json={
+        "steps": [{
+            "type": "model_output",
+            "content": [{"type": "audio", "data": audio, "mime_type": "audio/wav"}],
+        }],
+        "usage": {"input_tokens": 7, "output_tokens": 12},
+    }))
+    client = GeminiClient(cfg)
+    result = await client.synthesize("k1", "gemini-3.8-flash-tts", "Hello")
+    await client.aclose()
+    assert result.audio == base64.b64decode(audio)
+    assert result.mime_type == "audio/wav"
+    assert result.tokens_in == 7 and result.tokens_out == 12
+
+
 async def test_router_synthesize_uses_tts_quota_and_records_audio(mock_api, tmp_path):
     cfg = make_config(tmp_path, api_keys=["tts-key"],
                        tts_limits={"rpd": 10, "rpm": 3, "tpm": 10_000})

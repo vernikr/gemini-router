@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.14.1 — REST TTS response parsing
+
+### Fixed
+- Read audio from `steps[].content[]` in the raw Interactions API REST response as well as SDK-shaped responses.
+
 ## 0.14.0 — CLI updates and deterministic TTS progress
 
 ### Added

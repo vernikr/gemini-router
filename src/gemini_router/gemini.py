@@ -315,12 +315,28 @@ class GeminiClient:
         if r.status_code >= 400:
             raise self._error(r)
         data = r.json()
-        audio = (data.get("output_audio") or {}).get("data")
+        output_audio = data.get("output_audio") or {}
+        audio = output_audio.get("data")
+        mime_type = output_audio.get("mime_type")
+        if not audio:
+            # The raw REST response exposes model output in steps[].content[]. The SDK's
+            # output_audio convenience property is not present in that JSON shape.
+            for step in data.get("steps") or []:
+                if step.get("type") != "model_output":
+                    continue
+                for content in step.get("content") or []:
+                    if content.get("type") == "audio" and content.get("data"):
+                        audio = content["data"]
+                        mime_type = content.get("mime_type") or mime_type
+                        break
+                if audio:
+                    break
         if not audio:
             # Be tolerant of the list-shaped output used by SDK response wrappers.
             for item in data.get("output") or []:
                 if item.get("type") == "audio":
                     audio = item.get("data")
+                    mime_type = item.get("mime_type") or mime_type
                     break
         if not audio:
             raise RouterError("TTS response contained no audio data")
@@ -334,8 +350,7 @@ class GeminiClient:
         tokens_out = (usage.get("output_tokens") or usage.get("candidatesTokenCount") or
                       usage.get("outputTokens"))
         return TTSResult(audio=raw,
-                         mime_type=(data.get("output_audio") or {}).get("mime_type") or
-                                   "audio/wav",
+                         mime_type=mime_type or "audio/wav",
                          tokens_in=int(tokens_in) if tokens_in is not None else None,
                          tokens_out=int(tokens_out) if tokens_out is not None else None)
 
