@@ -670,6 +670,7 @@ class Router:
         used_keys: list[str] = []
         total_tokens = 0
         started = self._now()
+        chunk_count = len(chunks)
         try:
             for i, (chunk, token_count) in enumerate(measured_chunks, 1):
                 chunk_started = time.monotonic()
@@ -688,7 +689,7 @@ class Router:
                     index=chunk_index,
                     done_work=completed_work,
                     work_total=total_work,
-                    chunks_total=len(chunks),
+                    chunks_total=chunk_count,
                 ) -> None:
                     nonlocal last_progress
                     while True:
