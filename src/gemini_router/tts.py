@@ -171,9 +171,10 @@ async def encode_mp3(wav_path: str | Path, mp3_path: str | Path, *,
                         if on_progress:
                             on_progress(fraction)
                 elif key == "progress" and value == "end":
-                    last_fraction = 1.0
-                    if on_progress:
-                        on_progress(1.0)
+                    if last_fraction < 1.0:
+                        last_fraction = 1.0
+                        if on_progress:
+                            on_progress(1.0)
         returncode = await proc.wait()
         stderr = await stderr_task if stderr_task else b""
         if returncode:
