@@ -16,8 +16,9 @@ use Conventional Commits and SemVer tags, and update documentation with behavior
 - The CLI checks PyPI for updates before user-facing commands. `--no-update` or
   `GEMINI_ROUTER_AUTO_UPDATE=0` disables the check. The long-running `proxy` service uses
   its deployment-managed version and does not self-update.
-- TTS progress is event-driven: percentages advance on completed chunks and encoding,
-  not on elapsed-time estimates.
+- TTS progress is monotonic: completed chunks are measured, the active chunk uses capped
+  time-based pseudo-progress, ETA adapts from observed throughput, and ffmpeg reports
+  actual MP3 encoding progress.
 
 ## Commands
 - `uv sync` · `uv run pytest` · `uv run ruff check src tests`
