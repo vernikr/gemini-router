@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import json
 import os
+from io import StringIO
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from rich.console import Console
+
+from gemini_router import cli as cli_module
 from gemini_router.cli import main
+from gemini_router.events import RouterEvent
 from gemini_router.ledger import Ledger
 
 
@@ -91,3 +98,42 @@ def test_doctor_exit_codes_name_the_failure(tmp_path, monkeypatch, capsys):
 
     db.write_text("not a database")
     assert main(["doctor", "--offline"]) == 4          # state file unreadable
+
+
+@pytest.mark.usefixtures("env")
+def test_tts_cli_shows_compact_progress_and_eta(tmp_path, monkeypatch):
+    output = StringIO()
+    monkeypatch.setattr(
+        cli_module, "console",
+        Console(file=output, force_terminal=True, width=120, color_system=None),
+    )
+
+    class FakeRouter:
+        async def synthesize_file(self, *args, **kwargs):
+            callback = kwargs["on_event"]
+            callback(RouterEvent(
+                stage="file_progress", pct=62,
+                detail={"label": "TTS · 3/8", "eta_s": 84},
+            ))
+            callback(RouterEvent(
+                stage="file_progress", pct=100,
+                detail={"label": "Audio complete", "phase": "complete"},
+            ))
+            return SimpleNamespace(
+                path=tmp_path / "result.mp3", model="gemini-3.8-flash-tts",
+                chunks=8, tokens_in=100, key_ids=["key-id"], latency_s=12.0,
+            )
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(cli_module, "_router", lambda cfg: FakeRouter())
+    args = SimpleNamespace(
+        json=False, file=Path("story.txt"), output=None, voice=None, style=None,
+        bitrate=128, wait=None, request_id=None,
+    )
+
+    assert cli_module.cmd_tts(args) == 0
+    rendered = output.getvalue()
+    assert "TTS · 3/8 · ~1:24" in rendered
+    assert "100%" in rendered
