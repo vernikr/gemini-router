@@ -123,8 +123,12 @@ async def test_router_file_creates_one_mp3_and_preflights_quota(
                                               on_event=events.append)
         assert result.path == target and result.chunks == 1
         assert result.tokens_in == 4 and target.exists()
-        progress = [event.pct for event in events if event.stage == "file_progress"]
-        assert progress == [0, 0, 95, 95, 100]
+        progress_events = [event for event in events if event.stage == "file_progress"]
+        assert [event.pct for event in progress_events] == [0, 0, 95, 95, 100]
+        assert [event.detail["phase"] for event in progress_events] == [
+            "preflight", "synthesis", "synthesis", "encoding", "complete"]
+        assert progress_events[-1].detail["completed_chunks"] == 1
+        assert progress_events[-1].detail["total_chunks"] == 1
         dispatch = next(event for event in events if event.stage == "dispatch")
         assert dispatch.message().startswith("1/1 · dispatch")
         assert not target.with_name(f".{target.name}.wav.tmp").exists()
