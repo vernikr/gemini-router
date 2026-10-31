@@ -25,7 +25,7 @@
     <string>-o</string><string>BatchMode=yes</string>
     <string>-L</string><string>8790:127.0.0.1:8790</string>
     <string>-L</string><string>8787:127.0.0.1:8787</string>
-    <string>root@127.0.0.1</string>
+    <string>gemini-vps</string>
   </array>
   <key>RunAtLoad</key>
   <true/>

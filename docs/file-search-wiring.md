@@ -28,7 +28,18 @@ published; nothing in the firewall changes.
 
 ## 2. Mac: the tunnel
 
-Reuse the existing agent — add a second `LocalForward` rather than a second launchd job:
+Set an SSH alias locally (keep the host address and key in your private `~/.ssh/config`):
+
+```sshconfig
+Host gemini-vps
+  HostName <your-vps-hostname-or-ip>
+  User root
+  IdentityFile ~/.ssh/id_ed25519
+```
+
+The launchd plist uses this alias and forwards both services to the server loopback; the
+production address is therefore not stored in the repository. Reuse the existing agent —
+add a second `LocalForward` rather than a second launchd job:
 
 ```bash
 cp packaging/com.vernikr.gemini-tunnel.plist ~/Library/LaunchAgents/
@@ -64,7 +75,7 @@ after editing; the SDK reads the base URL when the process starts.
 Never copy the token by hand (a stray character cost days of 401s once):
 
 ```bash
-ssh root@127.0.0.1 'grep ^GEMINI_ROUTER_PROXY_TOKEN /opt/apps/gemini-mcp/.env \
+ssh gemini-vps 'grep ^GEMINI_ROUTER_PROXY_TOKEN /opt/apps/gemini-mcp/.env \
   | cut -d= -f2 | tr -d "\n"' | pbcopy
 ```
 
