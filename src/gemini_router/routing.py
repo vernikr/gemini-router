@@ -649,12 +649,16 @@ class Router:
         chunk_sizes = [max(1, count) for _, count in measured_chunks]
         total_work = sum(chunk_sizes)
         estimated_tokens_per_second = _TTS_FALLBACK_TOKENS_PER_SECOND
+        observed_chunks = 0
         completed_work = 0
         last_progress = 0.0
+        initial_eta = sum(
+            max(8.0, size / estimated_tokens_per_second) for size in chunk_sizes
+        )
         report_progress(
             0, f"TTS · 0/{len(chunks)}", phase="synthesis",
             completed_chunks=0, total_chunks=len(chunks),
-            eta_s=max(1, round(total_work / estimated_tokens_per_second)),
+            eta_s=max(1, round(initial_eta)),
         )
         target = Path(output_path) if output_path else Path(tempfile.gettempdir()) / (
             f"gemini-tts-{uuid.uuid4().hex}.mp3")
@@ -671,21 +675,33 @@ class Router:
                 chunk_started = time.monotonic()
                 chunk_index = i
                 chunk_size = chunk_sizes[i - 1]
-                later_work = sum(chunk_sizes[i:])
+                later_sizes = chunk_sizes[i:]
+                later_work = sum(later_sizes)
+                waiting_started: float | None = None
+                waiting_duration = 0.0
 
                 async def publish_chunk_progress() -> None:
                     nonlocal last_progress
                     while True:
                         await asyncio.sleep(_TTS_PROGRESS_INTERVAL_S)
-                        elapsed = max(0.05, time.monotonic() - chunk_started)
-                        expected_s = max(3.0, chunk_size / estimated_tokens_per_second)
+                        if waiting_started is not None:
+                            continue
+                        elapsed = max(
+                            0.05,
+                            time.monotonic() - chunk_started - waiting_duration,
+                        )
+                        expected_s = max(8.0, chunk_size / estimated_tokens_per_second)
                         fraction = min(0.9, 0.75 * elapsed / expected_s)
                         active_rate = max(
-                            1.0,
+                            0.1,
                             min(estimated_tokens_per_second, chunk_size * fraction / elapsed),
                         )
-                        remaining_work = chunk_size * (1.0 - fraction) + later_work
-                        eta_s = max(1, round(remaining_work / active_rate))
+                        remaining_current = chunk_size * (1.0 - fraction)
+                        future_eta = sum(
+                            max(8.0, size / estimated_tokens_per_second)
+                            for size in later_sizes
+                        )
+                        eta_s = max(1, round(remaining_current / active_rate + future_eta))
                         pct = min(
                             94.9,
                             95.0 * (completed_work + chunk_size * fraction) / total_work,
@@ -704,6 +720,13 @@ class Router:
 
                 def chunk_event(event: RouterEvent, current_chunk: int = i,
                                 total_chunks: int = len(chunks)) -> None:
+                    nonlocal waiting_started, waiting_duration
+                    if event.stage == "waiting":
+                        if waiting_started is None:
+                            waiting_started = time.monotonic()
+                    elif waiting_started is not None:
+                        waiting_duration += time.monotonic() - waiting_started
+                        waiting_started = None
                     if on_event:
                         event.detail.setdefault("chunk", current_chunk)
                         event.detail.setdefault("chunks", total_chunks)
@@ -724,15 +747,19 @@ class Router:
                         except asyncio.CancelledError:
                             pass
 
-                chunk_elapsed = max(0.1, time.monotonic() - chunk_started)
+                chunk_elapsed = max(
+                    0.1, time.monotonic() - chunk_started - waiting_duration
+                )
                 measured_rate = chunk_size / chunk_elapsed
                 estimated_tokens_per_second = max(
-                    2.0,
+                    0.1,
                     min(
                         120.0,
-                        0.35 * estimated_tokens_per_second + 0.65 * measured_rate,
+                        measured_rate if observed_chunks == 0
+                        else 0.35 * estimated_tokens_per_second + 0.65 * measured_rate,
                     ),
                 )
+                observed_chunks += 1
                 await asyncio.to_thread(assembler.append, res.audio)
                 total_tokens += res.tokens_in or estimate_tokens(chunk)
                 if res.key_id and res.key_id not in used_keys:
@@ -741,7 +768,10 @@ class Router:
                 completed_pct = 95.0 * completed_work / total_work
                 last_progress = max(last_progress, completed_pct)
                 future_eta = (
-                    max(1, round(later_work / estimated_tokens_per_second))
+                    max(1, round(sum(
+                        max(8.0, size / estimated_tokens_per_second)
+                        for size in later_sizes
+                    )))
                     if later_work else None
                 )
                 report_progress(
